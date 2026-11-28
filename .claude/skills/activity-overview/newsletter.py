@@ -3364,6 +3364,474 @@ CANNOT_CHECK = (
 
 
 
+
+# --- daily social posts (drafts for the owner to approve) ----------------------
+#
+# One post per story, at the first event a reader can act on; plumbing rolls
+# into one weekly item per theme with activity. reference/social.md has the
+# rules, the ledger and what the posting step needs. Nothing here schedules or
+# publishes anything: the outline lists what became postable on a day.
+
+SOCIAL_HOLD_DAYS = 3        # a merged story waits this many days for its release
+SOCIAL_CHANNELS = ("x", "linkedin")
+X_LIMIT = 280               # X's weighted length, a link counted as X_LINK_WEIGHT
+X_LINK_WEIGHT = 23          # every URL is shortened to a fixed-length link on X
+LINKEDIN_LIMIT = 1200       # our cap for a short LinkedIn post (plain text)
+LINKEDIN_HASHTAGS = 3
+SOCIAL_TRIGGERS = ("published", "merged_not_published", "merged_no_release",
+                   "new_module_proposed", "breaking_declared_open", "owner_added",
+                   "orphaned", "deprecated")
+
+
+def _day(ts):
+    return (ts or "")[:10] or None
+
+
+def _add_days(day, n):
+    return (datetime.date.fromisoformat(day) + datetime.timedelta(days=n)).isoformat()
+
+
+def _open_pr_breaking(view, number):
+    """Breaking changes an open PR's own commits declare: the items under a
+    `### Breaking Changes` heading its CHANGELOG patches add (a commit another
+    PR owns, `belongs_to_pr`, is not its own). [{path, items, commit, at}]."""
+    h = view.get("pr_history")
+    rows = h.get("prs") if isinstance(h, dict) else h
+    row = next((r for r in rows or [] if isinstance(r, dict) and r.get("number") == number), None)
+    if not row:
+        return []
+    commits = {c.get("sha"): c for c in row.get("commits") or [] if isinstance(c, dict)}
+    out = []
+    for q in row.get("patches") or []:
+        if "CHANGELOG" not in (q.get("path") or ""):
+            continue
+        c = commits.get(q.get("commit")) or {}
+        if c.get("belongs_to_pr") not in (None, number):
+            continue
+        added = q.get("added") or []
+        for k, line in enumerate(added):
+            if not line.strip().lower().startswith("### breaking"):
+                continue
+            items = []
+            for l2 in added[k + 1:]:
+                if l2.startswith("#"):
+                    break
+                if l2.startswith("- ") and l2.strip().lower() != "- none":
+                    items.append(l2[2:].strip())
+            if items:
+                out.append({"path": q["path"], "items": items, "commit": q.get("commit"),
+                            "at": c.get("committed_at") or c.get("authored_at")})
+    return out
+
+
+def _story_people(view, numbers, automation=()):
+    out = []
+    prs = {p.get("number"): p for p in view.get("prs") or []}
+    for n in numbers:
+        a = (prs.get(n) or {}).get("author")
+        if not a or a in [x["login"] for x in out]:
+            continue
+        if is_automation(view, a, automation):
+            row = {"login": a, "automation": True}
+            obo = on_behalf_of(view, a, n)
+            if obo:
+                row["on_behalf_of"] = obo
+        else:
+            p = _person(view, a)
+            row = {k: p.get(k) for k in ("login", "name", "affiliation", "do_not_name")
+                   if p.get(k) is not None}
+        out.append(row)
+    return out
+
+
+def social_candidates(views, hold_days=SOCIAL_HOLD_DAYS, automation=()):
+    """Every post the window's records allow, each with the day it becomes
+    postable (`day`), why (`trigger`), what it must state (`must_state`) and
+    a stable `post_id`. Stories: one post each (the earliest trigger wins).
+    Ownership and lifecycle events: one post per module and kind. Plumbing:
+    one weekly item per theme with activity (`weekly`)."""
+    views = list(views)
+    multi = len(views) > 1
+    out_l = outline(views, automation=automation)
+    sec = {x["id"]: x for x in out_l["sections"]}
+    posts, weekly = [], []
+    for v in views:
+        sl = _slug(v)
+        period = _period(v)
+        prs = {p.get("number"): p for p in v.get("prs") or []}
+        trains = {t["id"]: t for t in v.get("trains") or []}
+        declared = {x.get("area") for x in ((v.get("module_changes") or {}).get("summary") or {})
+                    .get("declared_breaking") or []}
+        for r in sec["stories"].get("all") or []:
+            if multi and r.get("repo") != sl:
+                continue
+            if r.get("group") == "plumbing" or r.get("plan") == "in_theme":
+                continue
+            t = trains.get(r["id"]) or {}
+            numbers = t.get("prs") or r.get("prs") or []
+            mods = [{"area": m["area"], "url": m.get("url"),
+                     "info": m.get("info") or module_info(v, m["area"])}
+                    for m in r.get("modules") or []]
+            base = {"post_id": "story:{}:{}".format(sl, r["id"]), "kind": "story",
+                    "story": r["key"], "group": r.get("group"), "title": r.get("title"),
+                    "url": r.get("url"), "repo": sl if multi else None}
+            options = []
+            merged = sorted(_day(prs[n].get("merged_at")) for n in numbers
+                            if (prs.get(n) or {}).get("merged") and prs[n].get("merged_at"))
+            if r.get("group") == "landed" and merged:
+                mday = merged[-1]
+                rel = [x for x in r.get("released") or [] if isinstance(x, dict)]
+                pub = sorted((x for x in rel if x.get("status") == "published" and x.get("date")
+                              and _day(x["date"]) >= mday), key=lambda x: _day(x["date"]))
+                in_hold = [x for x in pub if _day(x["date"]) <= _add_days(mday, hold_days)]
+                state = {"merged_on": mday, "breaking": "declared" if any(
+                    m["area"] in declared for m in mods) else None}
+                if in_hold:
+                    pday = _day(in_hold[0]["date"])
+                    options.append((pday, "published", dict(state, released=[
+                        {k: x.get(k) for k in ("module", "version", "url", "registry", "date")}
+                        for x in pub if _day(x["date"]) == pday])))
+                elif rel and all(x.get("status") == "no_version_change" for x in rel):
+                    options.append((mday, "merged_no_release", dict(state, release="no version change")))
+                else:
+                    later = [x for x in rel if x.get("status") in ("declared_not_published",
+                                                                   "published", "unknown")]
+                    options.append((_add_days(mday, hold_days), "merged_not_published", dict(
+                        state, release="merged, not yet published",
+                        declared=[{k: x.get(k) for k in ("module", "version", "status")}
+                                  for x in later], held_from=mday)))
+            for area in r.get("new_module_proposed") or []:
+                tree = ((v.get("module_ownership") or {}).get("proposed_modules") or {}).get(area) or {}
+                opened = [_day(prs[n].get("created_at")) for n in numbers
+                          if (prs.get(n) or {}).get("state") == "open" and prs[n].get("created_at")]
+                # not before the pull request exists: the later of the commit
+                # adding the entry file and the PR's opening
+                days = [x for x in (_day(tree.get("committed_at")),
+                                    min(opened) if opened else None) if x]
+                day = max(days) if days else None
+                if day:
+                    options.append((day, "new_module_proposed", {
+                        "module": area, "info": tree.get("info") or (r.get("module_info") or {}).get(area),
+                        "state": "proposed in an open pull request, not published"}))
+            for n in numbers:
+                if (prs.get(n) or {}).get("state") != "open":
+                    continue
+                for b in _open_pr_breaking(v, n):
+                    if b.get("at"):
+                        bday = max(_day(b["at"]), _day(prs[n].get("created_at")) or _day(b["at"]))
+                        options.append((bday, "breaking_declared_open", {
+                            "pr": n, "changelog": b["path"], "items": b["items"],
+                            "state": "declared breaking in an open pull request, not merged"}))
+            options = [o for o in options if o[0] and _in_period(o[0], period)
+                       or (o[1] == "merged_not_published" and o[0])]
+            if not options:
+                continue
+            day, trig, state = sorted(options, key=lambda o: (o[0], SOCIAL_TRIGGERS.index(o[1])))[0]
+            posts.append(dict(base, day=day, trigger=trig, must_state=dict(
+                state, modules=mods,
+                prs=[{"number": n, "url": (prs.get(n) or {}).get("url"),
+                      "state": "merged" if (prs.get(n) or {}).get("merged") else
+                      (prs.get(n) or {}).get("state"),
+                      "review_state": review_state(v, n)} for n in numbers],
+                people=_story_people(v, numbers, automation))))
+        # ownership and lifecycle events a reader can act on
+        mo = v.get("module_ownership") or {}
+        seen = set()
+        for e in mo.get("events") or []:
+            if not isinstance(e, dict) or e.get("kind") not in ("owner_added", "orphaned",
+                                                               "deprecated"):
+                continue
+            if not e.get("module") or not _in_period(e.get("date") or e.get("at"), period):
+                continue
+            pid = "{}:{}:{}:{}".format(e["kind"], sl, e["module"], e.get("date"))
+            key = (e["kind"], e["module"])
+            if key in seen:
+                continue
+            seen.add(key)
+            posts.append({"post_id": pid, "kind": "module_event", "day": _day(e.get("date") or e.get("at")),
+                          "trigger": e["kind"], "repo": sl if multi else None,
+                          "must_state": {"module": e["module"],
+                                         "module_url": module_url(v, e["module"])[0],
+                                         "info": module_info(v, e["module"]),
+                                         "people": [_person(v, x).get("name") or x
+                                                    for x in e.get("people") or []
+                                                    if not _person(v, x).get("do_not_name")],
+                                         "source": e.get("source"), "via": e.get("via"),
+                                         "marker_text": e.get("marker_text")}})
+        # plumbing: one weekly item per theme with activity, on the week's last
+        # day inside the window
+        for th in sec["plumbing"].get("themes") or []:
+            if multi and th.get("repo") != sl:
+                continue
+            weeks = {}
+            for p in th.get("prs") or []:
+                pr = prs.get(p.get("number")) or {}
+                for ts, what in ((pr.get("merged_at"), "merged"), (pr.get("created_at"), "opened")):
+                    if ts and _in_period(ts, period):
+                        d = datetime.date.fromisoformat(_day(ts))
+                        y, w, _ = d.isocalendar()
+                        weeks.setdefault((y, w), {}).setdefault(what, set()).add(p["number"])
+            for (y, w), acts in sorted(weeks.items()):
+                sunday = datetime.date.fromisocalendar(y, w, 7).isoformat()
+                day = min(sunday, period[1])
+                weekly.append({"post_id": "weekly:{}:{}:{}-W{:02d}".format(sl, th["id"], y, w),
+                               "kind": "weekly", "trigger": "weekly_theme", "day": day,
+                               "theme": th["id"], "title_hint": th.get("title_hint"),
+                               "repo": sl if multi else None,
+                               "must_state": {"merged": sorted(acts.get("merged", [])),
+                                              "opened": sorted(acts.get("opened", [])),
+                                              "week": "{}-W{:02d}".format(y, w)}})
+    return {"posts": posts, "weekly": weekly}
+
+
+def read_ledger(path_or_doc):
+    """The ledger of what is already out: {"kind": "social_ledger", "posts":
+    [{post_id, day, channels: [..], urls?: {channel: url}}]} -> set of post_ids."""
+    doc = path_or_doc
+    if isinstance(path_or_doc, str):
+        with open(path_or_doc, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    if not isinstance(doc, dict) or not isinstance(doc.get("posts"), list):
+        raise ValueError("not a social ledger: needs {\"posts\": [...]}")
+    out = set()
+    for p in doc["posts"]:
+        if not isinstance(p, dict) or not p.get("post_id"):
+            raise ValueError("a ledger row needs post_id")
+        out.add(p["post_id"])
+    return out
+
+
+def daily_outline(views, day, posted=(), hold_days=SOCIAL_HOLD_DAYS, automation=(),
+                  candidates=None):
+    """What became postable on `day`: story and module-event posts whose
+    trigger day is `day`, the weekly plumbing items due that day, the stories
+    held for their release (`held`, with the day they post), minus what the
+    ledger says is out (`already_posted`)."""
+    cand = candidates or social_candidates(views, hold_days=hold_days, automation=automation)
+    posted = set(posted or ())
+    rows = [p for p in cand["posts"] if p["day"] == day]
+    weekly = [w for w in cand["weekly"] if w["day"] == day]
+    held = [{"post_id": p["post_id"], "story": p.get("story"), "merged_on":
+             p["must_state"].get("held_from"), "posts_on": p["day"]}
+            for p in cand["posts"] if p["trigger"] == "merged_not_published"
+            and p["must_state"].get("held_from") and p["must_state"]["held_from"] <= day < p["day"]]
+    return {"kind": "daily_outline", "day": day, "hold_days": hold_days,
+            "channels": list(SOCIAL_CHANNELS),
+            "limits": {"x": X_LIMIT, "x_link_weight": X_LINK_WEIGHT,
+                       "linkedin": LINKEDIN_LIMIT, "linkedin_hashtags": LINKEDIN_HASHTAGS},
+            "posts": [p for p in rows if p["post_id"] not in posted],
+            "weekly": [w for w in weekly if w["post_id"] not in posted],
+            "held": held,
+            "already_posted": sorted(p["post_id"] for p in rows + weekly
+                                     if p["post_id"] in posted)}
+
+
+# --- the post check -------------------------------------------------------------
+
+_POST_RE = re.compile(r"<!--\s*post:\s*(\S+)\s+channel:\s*(\w+)\s+day:\s*(\d{4}-\d\d-\d\d)\s*-->"
+                      r"(.*?)<!--\s*/post\s*-->", re.S)
+_HANDLE_RE = re.compile(r"(?<![\w/.@])@([A-Za-z0-9_][A-Za-z0-9_.-]*)")
+_HASHTAG_RE = re.compile(r"(?<![\w&/])#([A-Za-z][\w]*)")
+_MARKDOWN_RE = re.compile(r"\[[^\]\n]*\]\([^)]*\)|\*\*|__|`|^\s{0,3}#{1,6}\s", re.M)
+POST_CHECK_KEYS = (
+    "urls_not_in_view", "quotes_not_in_view", "items_not_in_view", "modules_not_in_view",
+    "versions_not_in_view", "people_not_in_view", "do_not_name_named", "affiliation_mismatch",
+    "automation_as_person", "review_state_mismatch", "pr_state_mismatch",
+    "release_status_mismatch", "superseded_not_in_view", "candidates_worded_as_declared",
+    "dates_without_year", "numbers_not_in_view", "characterising_words")
+
+
+def x_length(text):
+    """X's weighted length: every URL counts X_LINK_WEIGHT; a code point in the
+    Latin / general-punctuation ranges counts 1, any other (most emoji, CJK) 2."""
+    n = 0
+    rest = _URL_RE.sub(lambda m: "\0", text)
+    n += rest.count("\0") * X_LINK_WEIGHT
+    for ch in rest.replace("\0", ""):
+        o = ord(ch)
+        n += 1 if (o <= 4351 or 8192 <= o <= 8205 or 8208 <= o <= 8223 or 8242 <= o <= 8247) \
+            else 2
+    return n
+
+
+def post_facts(text):
+    """The facts a post states, which a voice pass may not change: URLs,
+    versions, item numbers, other numbers, quotes, @handles, dates."""
+    t = text
+    urls = sorted(set(u.rstrip(".,;:") for u in _URL_RE.findall(t)))
+    t2 = _URL_RE.sub(" ", t)
+    quotes = sorted({m.group(1) or m.group(2) for m in link._QUOTE_RE.finditer(t2)})
+    dates = sorted({m.group(0) for m in link._DATE_IN_PROSE_RE.finditer(t2)})
+    t3 = link._DATE_IN_PROSE_RE.sub(" ", t2)
+    versions = sorted(set(_VERSION_RE.findall(t3)))
+    items = sorted(set(_ITEM_RE.findall(t3)))
+    t4 = _ITEM_RE.sub(" ", _VERSION_RE.sub(" ", t3))
+    numbers = sorted(set(x.replace(",", "") for x, _ in _NUMBER_RE.findall(t4)))
+    handles = sorted(set(_HANDLE_RE.findall(t2)))
+    return {"urls": urls, "quotes": quotes, "dates": dates, "versions": versions,
+            "items": items, "numbers": numbers, "handles": handles}
+
+
+def _social_numbers(obj, out):
+    """The numbers a row states: its ints and the size of each of its lists."""
+    if isinstance(obj, dict):
+        for x in obj.values():
+            _social_numbers(x, out)
+    elif isinstance(obj, list):
+        out.add(str(len(obj)))
+        for x in obj:
+            _social_numbers(x, out)
+    elif isinstance(obj, int) and not isinstance(obj, bool):
+        out.add(str(obj))
+
+
+def _confirmed_handles(registry, channel):
+    """{handle_lower} the people registry confirms for a channel:
+    people[login].social[channel] = {"handle": "...", "confirmed": true}."""
+    out = set()
+    for row in ((registry or {}).get("people") or {}).values():
+        s = ((row or {}).get("social") or {}).get(channel) if isinstance(row, dict) else None
+        if isinstance(s, dict) and s.get("confirmed") and s.get("handle"):
+            out.add(s["handle"].lstrip("@").lower())
+    return out
+
+
+def check_posts(views, text, registry=None, against=None, hold_days=SOCIAL_HOLD_DAYS,
+                automation=(), candidates=None):
+    """Check every post block of a drafts file: its limits (X weighted length,
+    LinkedIn length and hashtags, plain text), what its row says it must state
+    (module link, version and release status, breaking or not), the issue's
+    record checks on its text (quotes, items, versions, numbers, states,
+    names, do_not_name, characterising words), and @handles only where the
+    registry confirms them for the channel. `against` (an earlier version of
+    the same file) adds the voice-pass rule: the facts of each post must be
+    unchanged (`facts_changed`). Pure."""
+    views = list(views)
+    cand = candidates or social_candidates(views, hold_days=hold_days, automation=automation)
+    by_id = {p["post_id"]: p for p in cand["posts"] + cand["weekly"]}
+    registry_names = None
+    if registry:
+        registry_names = {lg: (e or {}).get("name") for lg, e in (registry.get("people") or {}).items()
+                          if isinstance(e, dict) and e.get("do_not_name")}
+    before = {}
+    if against:
+        before = {(m.group(1), m.group(2)): post_facts(m.group(4).strip())
+                  for m in _POST_RE.finditer(against)}
+    results, ok = [], True
+    blocks = list(_POST_RE.finditer(text or ""))
+    if not blocks:
+        return {"ok": False, "posts": [], "error": "no <!-- post: ID channel: C day: D --> block"}
+    for m in blocks:
+        pid, ch, day, body = m.group(1), m.group(2).lower(), m.group(3), m.group(4).strip()
+        r = {"post_id": pid, "channel": ch, "day": day}
+        row = by_id.get(pid)
+        if ch not in SOCIAL_CHANNELS:
+            r["channel_unknown"] = ch
+        if row is None:
+            r["post_unknown"] = pid
+        elif row["day"] != day:
+            r["day_mismatch"] = {"outline": row["day"], "written": day}
+        # limits and form
+        if ch == "x":
+            r["length"] = x_length(body)
+            if r["length"] > X_LIMIT:
+                r["too_long"] = {"limit": X_LIMIT, "length": r["length"]}
+        else:
+            r["length"] = len(body)
+            if r["length"] > LINKEDIN_LIMIT:
+                r["too_long"] = {"limit": LINKEDIN_LIMIT, "length": r["length"]}
+            tags = _HASHTAG_RE.findall(_URL_RE.sub(" ", body))
+            if len(tags) > LINKEDIN_HASHTAGS:
+                r["too_many_hashtags"] = tags
+        md = _MARKDOWN_RE.findall(_URL_RE.sub(" ", body))
+        if md:
+            r["markdown"] = md[:5]
+        # handles only where confirmed for this channel
+        ok_handles = _confirmed_handles(registry, ch)
+        bad = [h for h in _HANDLE_RE.findall(_URL_RE.sub(" ", body)) if h.lower() not in ok_handles]
+        if bad:
+            r["handles_not_confirmed"] = bad
+        # what the row says the post must state
+        missing = []
+        if row is not None:
+            ms = row.get("must_state") or {}
+            low = body.lower()
+            urls = set(_URL_RE.findall(body))
+            mods = ms.get("modules") or ([{"area": ms["module"], "url": ms.get("module_url")}]
+                                         if ms.get("module") else [])
+            if mods and not any(m.get("url") in urls or m["area"] in body for m in mods):
+                missing.append("the module (path or link)")
+            trig = row["trigger"]
+            if trig == "published":
+                for rel in ms.get("released") or []:
+                    if rel.get("version") and version_key(rel["version"]) not in \
+                            {version_key(x) for x in _VERSION_RE.findall(_URL_RE.sub(" ", body))}:
+                        missing.append("published version {}".format(rel["version"]))
+                if not re.search(r"\b(published|released)\b", low):
+                    missing.append("the word published / released")
+            elif trig == "merged_not_published":
+                if "not yet published" not in low and "not published yet" not in low:
+                    missing.append("'not yet published'")
+            elif trig == "merged_no_release":
+                if not re.search(r"no (new )?version|no version change|no release", low):
+                    missing.append("'no version change'")
+            elif trig in ("new_module_proposed", "breaking_declared_open"):
+                if not re.search(r"\b(open|proposed|not (yet )?merged)\b", low):
+                    missing.append("that the pull request is open / proposed")
+            if trig == "breaking_declared_open" or ms.get("breaking") == "declared":
+                if "breaking" not in low:
+                    missing.append("'breaking'")
+            elif re.search(r"\bbreak(s|ing)?\b", low):
+                r["breaking_not_declared"] = True
+            if row["kind"] != "weekly" and row.get("url") and row["url"] not in urls and \
+                    not any((p or {}).get("url") in urls for p in ms.get("prs") or []) and \
+                    not (ms.get("source") or {}).get("url") in urls and not \
+                    any(m.get("url") in urls for m in mods) and not \
+                    any(x.get("url") in urls for x in ms.get("released") or []):
+                missing.append("a link to the story, a pull request or the module")
+        if missing:
+            r["must_state_missing"] = missing
+        # the record checks of the issue, on the post's text
+        plain = _HANDLE_RE.sub("", body)
+        issue = "# post\n\nIntro.\n\n## {}\n\n{}\n".format(HEADINGS["plumbing"][0], plain)
+        full = check_newsletter(views, issue, registry_names=registry_names,
+                                automation=automation)
+        allowed = set()
+        _social_numbers(row.get("must_state") if row else None, allowed)
+        if full.get("numbers_not_in_view"):
+            # a count the row itself gives (a weekly item's PRs) is a fact too
+            full["numbers_not_in_view"] = [x for x in full["numbers_not_in_view"]
+                                           if x not in allowed]
+        for k in POST_CHECK_KEYS:
+            if full.get(k):
+                r[k] = full[k]
+        if against is not None:
+            b = before.get((pid, ch))
+            if b is None:
+                r["facts_changed"] = "no earlier version of this post"
+            else:
+                now = post_facts(body)
+                diff = {k: {"added": sorted(set(now[k]) - set(b[k])),
+                            "removed": sorted(set(b[k]) - set(now[k]))}
+                        for k in now if set(now[k]) != set(b[k])}
+                if diff:
+                    r["facts_changed"] = diff
+        fails = [k for k in r if k not in ("post_id", "channel", "day", "length")]
+        r["ok"] = not fails
+        ok = ok and r["ok"]
+        results.append(r)
+    return {"ok": ok, "posts": results,
+            "voice_pass_may_change": VOICE_PASS_MAY_CHANGE}
+
+
+VOICE_PASS_MAY_CHANGE = (
+    "wording and sentence order",
+    "person (first person plural, 'we')",
+    "greeting and closing lines that state no fact",
+    "hashtags, within the channel's limit",
+    "emoji, within the length limit")
+
+
 # --- the work package (many stories written in parallel) ---------------------
 
 WORK_PACKAGE_RULES = """
@@ -3606,6 +4074,10 @@ _USAGE = ("usage: newsletter.py VIEW.json [VIEW.json ...] --outline [--weekly|--
           "[--automation LOGIN ...]\n"
           "       newsletter.py VIEW.json [VIEW.json ...] --check-newsletter ISSUE.md "
           "[--slices DIR] [--people PEOPLE.json] [--weekly|--monthly]\n"
+          "       newsletter.py VIEW.json [VIEW.json ...] --outline --daily --day YYYY-MM-DD "
+          "[--posted LEDGER.json] [--hold-days N]\n"
+          "       newsletter.py VIEW.json [VIEW.json ...] --check-post POSTS.md "
+          "[--people PEOPLE.json] [--against EARLIER.md]\n"
           "       newsletter.py VIEW.json [VIEW.json ...] --check-theme THEME.md "
           "[--theme ID] [--people PEOPLE.json]\n"
           "       newsletter.py VIEW.json [VIEW.json ...] --work-package DIR [--weekly|--monthly] "
@@ -3660,7 +4132,8 @@ def main(argv=None):
         cadence = "month"
     opts = {}
     for flag in ("--check-newsletter", "--slices", "--people", "--work-package",
-                 "--check-theme", "--theme"):
+                 "--check-theme", "--theme", "--day", "--posted", "--hold-days",
+                 "--check-post", "--against"):
         if flag in argv:
             i = argv.index(flag)
             if i + 1 >= len(argv) or argv[i + 1].startswith("-"):
@@ -3671,7 +4144,52 @@ def main(argv=None):
     do_outline = "--outline" in argv
     if do_outline:
         argv.remove("--outline")
+    daily = "--daily" in argv
+    if daily:
+        argv.remove("--daily")
     paths = argv
+    try:
+        hold = int(opts.get("--hold-days", SOCIAL_HOLD_DAYS))
+    except ValueError:
+        sys.stderr.write(_USAGE)
+        raise SystemExit(2)
+    if daily:
+        if not do_outline or "--day" not in opts or not paths or \
+                any(x.startswith("-") for x in paths) or \
+                not re.match(r"^\d{4}-\d\d-\d\d$", opts["--day"]):
+            sys.stderr.write(_USAGE)
+            raise SystemExit(2)
+        views = [_load(x) for x in paths]
+        try:
+            posted = read_ledger(opts["--posted"]) if "--posted" in opts else set()
+        except (OSError, ValueError) as exc:
+            sys.stderr.write("newsletter.py: error: cannot read the ledger ({})\n".format(exc))
+            raise SystemExit(2)
+        json.dump(daily_outline(views, opts["--day"], posted=posted, hold_days=hold,
+                                automation=automation), sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return 0
+    if "--check-post" in opts:
+        if not paths or any(x.startswith("-") for x in paths) or do_outline:
+            sys.stderr.write(_USAGE)
+            raise SystemExit(2)
+        views = [_load(x) for x in paths]
+        try:
+            with open(opts["--check-post"], encoding="utf-8") as fh:
+                ptext = fh.read()
+            against = None
+            if "--against" in opts:
+                with open(opts["--against"], encoding="utf-8") as fh:
+                    against = fh.read()
+        except OSError as exc:
+            sys.stderr.write("newsletter.py: error: {}\n".format(exc))
+            raise SystemExit(2)
+        registry = _load(opts["--people"]) if "--people" in opts else None
+        res = check_posts(views, ptext, registry=registry, against=against, hold_days=hold,
+                          automation=automation)
+        json.dump(res, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        raise SystemExit(0 if res["ok"] else 1)
     if "--check-theme" in opts:
         if not paths or any(x.startswith("-") for x in paths) or do_outline or \
                 "--check-newsletter" in opts or "--work-package" in opts:
