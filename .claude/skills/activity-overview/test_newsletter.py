@@ -2835,7 +2835,7 @@ class TestStoryRelations(unittest.TestCase):
              "state": "open", "merged": False, "created_at": "2026-10-03T10:00:00Z"},
             {"number": 31, "title": "fix: dns follow-up", "author": "sam", "url": R + "/pull/31",
              "state": "closed", "merged": True, "merged_at": "2026-10-12T10:00:00Z",
-             "created_at": "2026-10-10T10:00:00Z"}]
+             "created_at": "2026-10-05T10:00:00Z"}]
         v["trains"] += [{"id": "train-pr-30", "outcome": "in_flight", "prs": [30], "issues": []},
                         {"id": "train-pr-31", "outcome": "shipped", "prs": [31], "issues": []}]
         k = "o/r:"
@@ -2854,6 +2854,9 @@ class TestStoryRelations(unittest.TestCase):
                                                "url": "https://github.com/x/y/issues/9"},
              "relation": "blocked_by", "external": True, "target_kind": "external",
              "basis": {"kind": "text", "quote": "wait on https://github.com/x/y/issues/9"}}]
+        for e, day in zip(edges, ("2026-10-03", "2026-10-05", "2026-10-02", "2026-10-03")):
+            e["as_of"] = day      # the day the record first states each relation
+            e.setdefault("target_kind", "other")
         v["story_graph"] = {"edges": edges, "chains": [[k + "train-pr-30", k + "train-pr-12"]],
                             "most_blocking": [{"story": k + "train-pr-12", "waiting_stories": 2,
                                                "stories": [k + "train-pr-30", k + "train-pr-31"]}],
@@ -2992,6 +2995,124 @@ class TestStoryRelations(unittest.TestCase):
             "It adds the Redis zone.", "It adds the Redis zone; it waits on #12.")
         r = newsletter.check_posts([v], post)
         self.assertTrue(r["posts"][1]["relations_not_in_view"])
+
+
+class TestRelationClaimsParsed(TestStoryRelations):
+    """Review round on PR #123: every relation a sentence asserts is parsed
+    into (subject item, kind, each target item), each reference resolved to
+    its own repository, one edge per pair, dated on or before the day, both
+    ends projected by item type."""
+
+    def test_j1_follow_ups_alone_are_a_connection(self):
+        v = self.v()
+        v["story_graph"]["edges"] = [e for e in v["story_graph"]["edges"]
+                                     if e["relation"] == "follow_up_of"]
+        v["story_graph"]["chains"], v["story_graph"]["most_blocking"] = [], []
+        v["story_graph"]["external"] = []
+        c = section(newsletter.outline([v]), "stories")["connections"]
+        self.assertIsNone(c["omit"])
+        self.assertEqual(c["counts"], {"follow_up_of": 1})
+
+    def _two(self):
+        a = self.v()
+        b = json.loads(json.dumps(view()))
+        b["meta"] = dict(b["meta"], repo="s")
+        for x in b["prs"] + b["issues"]:
+            x["url"] = x["url"].replace("/o/r/", "/o/s/")
+        b["stories"]["all"] = [{"id": "train-pr-11", "group": "landed", "state": "landed",
+                                "worthy": "x"}]
+        a["story_graph"]["edges"].append(
+            {"from": "o/r:train-pr-30", "to": {"repo": "o/s", "number": 11,
+                                                 "url": "https://github.com/o/s/pull/11"},
+             "relation": "depends_on", "external": True, "as_of": "2026-10-04",
+             "basis": {"kind": "text", "quote": "needs o/s#11"}})
+        return a, b
+
+    def test_j2_member_views_are_joined_before_reading(self):
+        a, b = self._two()
+        before = json.dumps(a, sort_keys=True)
+        st = section(newsletter.outline([a, b]), "stories")
+        row = next(r for r in st["all"] if r["key"] == "o/r:train-pr-30")
+        dep = [x for x in row["relations"] if (x.get("other") or {}).get("key") == "o/s:train-pr-11"]
+        self.assertTrue(dep and dep[0].get("cross_member"))
+        self.assertEqual(json.dumps(a, sort_keys=True), before)     # pure
+        text = ("## Stories\n\n### o/r\n\n[#30](" + R + "/pull/30) depended on "
+                "[o/s#11](https://github.com/o/s/pull/11).\n")
+        self.assertEqual(newsletter.relation_claims([a, b], text)["relations_not_in_view"], [])
+
+    def test_j3_an_edge_stated_after_the_day_does_not_count(self):
+        v = self.v()
+        v["story_graph"]["edges"][1]["as_of"] = "2026-10-20"
+        text = "## Stories\n\n[#31](" + R + "/pull/31) is a follow-up to [#11](" + R + "/pull/11).\n"
+        r = newsletter.relation_claims([v], text, as_of="2026-10-12")["relations_not_in_view"]
+        self.assertEqual(r[0]["problem"], "stated in the record only after the day")
+        self.assertEqual(newsletter.relation_claims([v], text, as_of="2026-10-21")
+                         ["relations_not_in_view"], [])
+
+    def test_j4_a_specific_cue_needs_its_kind(self):
+        self.assertTrue(self.claims("## Stories\n\n[#30](" + R + "/pull/30) is stacked on [#12]("
+                                    + R + "/pull/12).\n"))
+        self.assertTrue(self.claims("## Stories\n\n[#30](" + R + "/pull/30) was blocked by [#12]("
+                                    + R + "/pull/12).\n"))
+        self.assertEqual(self.claims("## Stories\n\n[#30](" + R + "/pull/30) waited on [#12]("
+                                     + R + "/pull/12).\n"), [])
+
+    def test_j5_url_only_and_owner_repo_references_are_resolved(self):
+        r = self.claims("## Stories\n\nhttps://github.com/o/r/pull/30 depended on "
+                        "https://github.com/o/r/pull/13.\n")
+        self.assertEqual(r[0]["target"], "o/r#13")
+        self.assertEqual(self.claims("## Stories\n\no/r#30 depended on o/r#12.\n"), [])
+
+    def test_j6_an_issue_end_is_projected_by_its_own_type(self):
+        v = self.v()
+        v["issues"][0]["closing"] = {"at": "2026-10-05T10:00:00Z", "by": "kim",
+                                     "state_reason": "completed"}
+        v["story_graph"]["edges"].append(
+            {"from": "o/r:train-pr-30", "to": "o/r:train-issue-5", "relation": "blocked_by",
+             "as_of": "2026-10-03", "waiting": True, "target_item": {"type": "issue", "number": 5},
+             "basis": {"kind": "text", "quote": "blocked by #5"}})
+        text = "## Stories\n\n[#30](" + R + "/pull/30) still waits on [#5](" + R + "/issues/5).\n"
+        r = newsletter.relation_claims([v], text)["relations_not_in_view"]
+        self.assertEqual(r[0]["problem"], "the blocker is no longer open")
+        self.assertEqual(newsletter.relation_claims([v], text, as_of="2026-10-04")
+                         ["relations_not_in_view"], [])
+        # on 6 October the issue is closed, whatever the edge's end-of-window flag says
+        r = newsletter.relation_claims([v], text, as_of="2026-10-06")["relations_not_in_view"]
+        self.assertEqual(r[0]["problem"], "the blocker is no longer open")
+
+    def test_j7_every_pair_and_every_clause(self):
+        r = self.claims("## Stories\n\n[#30](" + R + "/pull/30) depended on [#12](" + R +
+                        "/pull/12) and [#13](" + R + "/pull/13).\n")
+        self.assertEqual([x["target"] for x in r], ["o/r#13"])
+        r = self.claims("## Stories\n\n[#31](" + R + "/pull/31) is a follow-up to [#11](" + R +
+                        "/pull/11) and was caused by [#11](" + R + "/pull/11).\n")
+        self.assertEqual([x["claim"] for x in r], ["caused_by"])
+        # every subject joined before the cue is a pair of its own
+        r = self.claims("## Stories\n\n[#30](" + R + "/pull/30) and [#31](" + R + "/pull/31) "
+                        "depended on [#12](" + R + "/pull/12).\n")
+        self.assertEqual(len(r), 1)
+        # a link to a comment or a commit is evidence, not an item
+        self.assertEqual(self.claims("## Stories\n\n[#30](" + R + "/pull/30) waited on "
+                                     "[a comment](" + R + "/pull/12#issuecomment-1) and [#12](" +
+                                     R + "/pull/12).\n"), [])
+
+    def test_j8_the_in_story_quote_must_say_it_in_the_same_sentence(self):
+        v = self.v()
+        v["prs"].append({"number": 33, "title": "x", "author": "sam", "url": R + "/pull/33",
+                         "state": "open", "merged": False, "created_at": "2026-10-03T10:00:00Z"})
+        v["trains"][-2]["prs"] = [30, 33]
+        text = ("## Stories\n\n[#33](" + R + "/pull/33) is blocking [#30](" + R + "/pull/30). "
+                "The author wrote \"Some unrelated record text.\"\n")
+        self.assertTrue(newsletter.relation_claims([v], text)["relations_not_in_view"])
+        text = ("## Stories\n\n[#33](" + R + "/pull/33) is blocking [#30](" + R + "/pull/30), "
+                "\"Some unrelated record text\".\n")
+        self.assertTrue(newsletter.relation_claims([v], text)["relations_not_in_view"])
+        # with the story's inner relations, those decide
+        v["stories"]["all"][-2]["inner_relations"] = [
+            {"from_item": {"type": "pr", "number": 33}, "to_item": {"type": "pr", "number": 30},
+             "relation": "blocked_by", "basis": {"quote": "blocking #30"}}]
+        bare = "## Stories\n\n[#30](" + R + "/pull/30) is blocked by [#33](" + R + "/pull/33).\n"
+        self.assertTrue(newsletter.relation_claims([v], bare)["relations_not_in_view"])
 
 
 class TestThemeCheck(unittest.TestCase):
