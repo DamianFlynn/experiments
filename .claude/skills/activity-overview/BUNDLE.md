@@ -1791,7 +1791,8 @@ similarity (`link.build_story_relations`), as of the view's end:
 - **Text next to a reference** (`link.relation_mentions`): in a PR / issue body (the
   body as gathered: `basis.text_as_last_gathered` when it was edited after the window)
   and in comments, review comments and reviews written by the view's end. A cue right
-  before a reference — at most two words between, in the same sentence or clause —
+  before a reference — at most two words between, in the same sentence or clause (split
+  at sentence ends, line breaks and semicolons; never across) —
   gives the relation of the TEXT's item towards the referenced one: `blocked_by`
   ("blocked by / on", "wait / waiting for / on", "on hold until"), `blocks` ("blocking",
   "blocks"), `depends_on` ("depends on", "requires", "needs", "prerequisite", "built
@@ -1800,8 +1801,13 @@ similarity (`link.build_story_relations`), as of the view's end:
   ("follow-up in", "followed by", "continued in", "tracked in", "will be addressed in"),
   `caused_by` ("caused by", "regression from", "broken by", "introduced by", "due to",
   "because of"), `content_landed_in` ("superseded by", "replaced by", "consolidated
-  into"). A task-list line naming an item (`- [ ] #N`) is `depends_on`. Any other
-  reference is `mentions` — a bare reference is never a dependency. Each edge is
+  into"). A negated cue ("not blocked by #2", "no longer depends on") is no relation. A
+  cue whose subject is another reference ("#2 is blocked by #3", "#8, which is blocking
+  #9") is that item's relation, not the text's item's (`basis.subject`). A task-list line
+  naming an item (`- [ ] #N`) is `depends_on`, with `basis.task_done` (its box ticked: a
+  ticked task waits on nothing). Any other reference is `mentions` — a bare reference is
+  never a dependency. `basis.text_current` is false for a body edited after the window
+  (the store keeps the last version only: what changed is not known). Each edge is
   stored from the waiting side: `blocks` / `needed_by` / `followed_by` texts become the
   other item's `blocked_by` / `depends_on` / `follow_up_of` (`basis.inverse_of` says so).
 - **Structure**: `stacked_on` (the PR's commits belong to another PR opened first:
@@ -1816,16 +1822,31 @@ similarity (`link.build_story_relations`), as of the view's end:
   are kept as `external` edges (`to` `{repo, number, url}`, no state claimed). In a
   stream's digest (`digest.build_project_view`) `link.join_member_relations` resolves a
   reference to another MEMBER to that member's train: `to` becomes its story key
-  `owner/repo:train-id`, `cross_member: true`, with its kind and state, and the other
-  member's story row gains the inverse relation. A repository outside the stream stays
-  `external`.
+  `owner/repo:train-id`, `cross_member: true`, with its kind and state. A cue written
+  from the other side ("this blocks o/b#5") becomes the OTHER member's edge from the
+  waiting side (as the local path does); `waiting` needs both items open; each member's
+  graph and rows are rebuilt from its own edges, then every cross-member inverse is added
+  to the target member's rows in a separate pass, so the members' order does not matter.
+  `link.join_member_relations(members)` — `members` `[{"repo": "owner/repo", "bundle":
+  linked view}]` — is safe and idempotent on separately linked member views (each run
+  starts from every edge's own `ref` / `written_relation`). A repository outside the
+  stream stays `external` (kept as written: "blocks o/x#1" is this item's `blocks`).
 
 `story_graph` `{edges: [{from, to, relation, basis {kind: text | stacked_commits |
-content_landed_in, quote?, item {type, number, url}, author?, at?, url?,
-inverse_of?, text_as_last_gathered?}, as_of, target_kind, target_item?, target_state?,
-waiting?, external?, cross_member?, bases}], chains (paths of at least two waiting
-edges, as story keys), most_blocking [{story, waiting_stories, stories}], external
-[{repo, number, url, from, relation}], rule}`; story keys are `owner/repo:train-id`.
+content_landed_in, quote?, item {type, number, url}, author?, at?, url?, inverse_of?,
+subject?, task_done?, text_current?}, as_of, target_kind, target_item?, target_state?,
+waiting?, items [{from_item, to_item?, waiting?, as_of}], external?, ref?,
+written_relation?, cross_member?, bases}], chains (paths of at least two waiting edges,
+as story keys; the walk is bounded — depth `STORY_CHAIN_MAX_DEPTH` 8, at most
+`STORY_CHAIN_MAX` 200 candidate paths — and `chains_capped` says when it stopped),
+most_blocking [{story, waiting_stories, stories}], external [{repo, number, url, from,
+relation}], rule}`; story keys are `owner/repo:train-id`. A train edge keeps the item
+pairs behind it (`items`, at most 20): it waits when ANY pair still waits (both items
+open at the end, the task not ticked), and its basis / target item / state are the
+waiting pair's. Relations between items of the SAME story are `stories.all[].
+inner_relations` `[{from_item, to_item, relation, quote, author, as_of, url, waiting?,
+task_done?, text_current?, inverse_of?}]`, read by the same cue reader ("#7526 … which is
+blocking #7472" is a checked fact there).
 `target_kind` (`link.relation_target_kind`) says what the other story is:
 `new_module_proposed`, a plumbing theme id (`ci_workflows`, `pipeline_utilities`,
 `test_environment`, `docs_generation`, ...) or `plumbing`, `docs`, `module_change`,

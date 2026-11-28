@@ -65,7 +65,8 @@ class TestCues(unittest.TestCase):
     def test_task_list_items_are_dependencies(self):
         b = two(body_1="Plan:\n- [ ] #2 tests\n- [x] docs")
         self.assertEqual(edges(b)[0]["relation"], "depends_on")
-        self.assertEqual(edges(b)[0]["basis"]["quote"], "- [ ] #2")
+        self.assertEqual(edges(b)[0]["basis"]["quote"], "- [ ] #2 tests")   # the whole line
+        self.assertIs(edges(b)[0]["basis"]["task_done"], False)
 
 
 class TestStructural(unittest.TestCase):

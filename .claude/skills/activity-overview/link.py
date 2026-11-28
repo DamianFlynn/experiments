@@ -7288,7 +7288,7 @@ def _null_collections_to_empty(bundle):
 _SUPERSEDED_RE = re.compile(
     r"\b(superseded|replaced|consolidated|continued|covered|included|merged|moved|"
     r"folded|redone)\s+(?:by|in|into|with|as|via|under)\s+"
-    r"(?:[^\s#\[]+\s+){0,6}?"
+    r"(?:[^\s#\[.;!?]+[ \t]+){0,6}?"
     r"(?:(?:pull request|PR)\s+)?\[?(?:#|https://github\.com/[\w.-]+/[\w.-]+/pull/)"
     r"(\d+)", re.I)
 
@@ -7305,10 +7305,13 @@ def close_reason(bundle, pr, instant):
             if isinstance(c, dict) and c.get("body") and _not_after(c.get(ts), instant):
                 texts.append((c.get(ts) or "", c["body"], c.get("url"), c.get("author")))
     for at, body, url, who in sorted(texts, key=lambda x: x[0], reverse=True):
-        m = _SUPERSEDED_RE.search(_HTML_COMMENT_RE.sub("", body))
-        if m and int(m.group(2)) != pr.get("number"):
-            return {"superseded_by": int(m.group(2)), "named_in": url, "by": who,
-                    "quote": m.group(0)}
+        # cue and reference in ONE sentence / clause, never across
+        for clause in _clauses(_HTML_COMMENT_RE.sub("", body)):
+            m = _SUPERSEDED_RE.search(clause)
+            if m and int(m.group(2)) != pr.get("number") \
+                    and not _NEGATION_RE.search(clause[:m.start()]):
+                return {"superseded_by": int(m.group(2)), "named_in": url, "by": who,
+                        "quote": m.group(0)}
     return {"close_reason": "not stated"}
 
 
@@ -7474,8 +7477,8 @@ def annotate_labels_as_of(bundle):
 # Issue #97, the owner: work "depends on other people and artifacts that have
 # to happen sometimes as reactions to limits that have to be addressed". A
 # relation between two trains is read from the explicit record only — words
-# next to a reference, a task list, GitHub's own references, shared commits,
-# content that landed elsewhere — never from similarity.
+# next to a reference, a task list, shared commits, content that landed
+# elsewhere — never from similarity.
 
 RELATION_KINDS = ("blocked_by", "blocks", "depends_on", "needed_by", "follow_up_of",
                   "followed_by", "caused_by", "causes", "stacked_on", "stacked_under",
@@ -7488,17 +7491,26 @@ RELATION_INVERSE = {"blocked_by": "blocks", "blocks": "blocked_by",
                     "content_landed_in": "content_from",
                     "content_from": "content_landed_in",
                     "mentions": "mentioned_by", "mentioned_by": "mentions"}
+# written from the other side: stored as the other item's relation
+_WRITTEN_INVERSE = {"blocks": "blocked_by", "needed_by": "depends_on",
+                    "followed_by": "follow_up_of"}
 # the relations in which the source waits on the target
 WAITING_RELATIONS = ("blocked_by", "depends_on", "stacked_on")
 RELATION_STRENGTH = {"blocked_by": 0, "blocks": 0, "depends_on": 1, "needed_by": 1,
                      "stacked_on": 2, "caused_by": 3, "follow_up_of": 4, "followed_by": 4,
                      "content_landed_in": 5, "mentions": 9}
+# bounds of the graph summaries (every enrich computes them)
+STORY_CHAIN_MAX_DEPTH = 8
+STORY_CHAIN_MAX = 200          # candidate paths kept while walking
+STORY_CHAINS_SHOWN = 20
+STORY_EDGE_PAIRS_MAX = 20      # contributing item pairs kept per train edge
 _REL_REF = (r"(?:\[?(?:https://github\.com/[\w.-]+/[\w.-]+/(?:issues|pull)/\d+"
             r"|[\w.-]+/[\w.-]+#\d+|#\d+)\]?(?:\([^)\s]*\))?)")
-_REL_FILL = r"(?:[^\s#\[\],]+\s+){0,2}?"
+# at most two words between a cue and its reference, never a boundary
+_REL_FILL = r"(?:[^\s#\[\],.;:!?]+[ \t]+){0,2}?"
 # (relation the TEXT's item has towards the reference, cue); first match wins
-RELATION_CUES = tuple((rel, re.compile(r"(?i)\b(?:" + cue + r")\s*:?\s+" + _REL_FILL
-                                       + r"(?=" + _REL_REF + r")"))
+RELATION_CUES = tuple((rel, re.compile(r"(?i)\b(?:" + cue + r")[ \t]*:?(?:\*\*)?[ \t]+"
+                                       + _REL_FILL + r"(?=" + _REL_REF + r")"))
                       for rel, cue in (
     ("followed_by", r"follow[- ]?ups?\s+(?:is\s+|will\s+be\s+)?(?:in|at)|followed\s+by|"
                     r"continued\s+in|tracked\s+in|will\s+be\s+(?:addressed|handled|done|fixed)\s+in"),
@@ -7507,12 +7519,17 @@ RELATION_CUES = tuple((rel, re.compile(r"(?i)\b(?:" + cue + r")\s*:?\s+" + _REL_
     ("blocked_by", r"blocked\s+(?:by|on)|wait(?:ing)?\s+(?:for|on)|on\s+hold\s+(?:until|for)"),
     ("blocks", r"blocking|blocks"),
     ("needed_by", r"needed\s+by|required\s+by|prerequisite\s+(?:for|of)"),
-    ("depends_on", r"depends\s+on|dependent\s+on|requires|needs|prerequisites?|"
+    ("depends_on", r"depends\s+on|dependent\s+on|requires|needs|prerequisites?(?:\s+\w+)?|"
                    r"built\s+on|on\s+top\s+of"),
     ("caused_by", r"caused\s+by|regression\s+(?:from|in|of)|broken\s+by|introduced\s+(?:by|in)|"
                   r"due\s+to|because\s+of"),
     ("content_landed_in", r"superseded\s+by|replaced\s+by|consolidated\s+(?:in|into)")))
-_TASK_LIST_RE = re.compile(r"(?m)^\s*[-*]\s+\[[ xX]\]\s+[^\n]*?(" + _REL_REF + ")")
+_NEGATION_RE = re.compile(r"(?i)\b(?:not|no\s+longer|never|isn't|aren't|wasn't|weren't|"
+                          r"doesn't|don't|didn't|no|nor|without|un)\W*(?:\w+\W+){0,2}$")
+# a reference that is the cue's subject ("#2 is blocked by #3")
+_SUBJECT_RE = re.compile(r"(" + _REL_REF + r"),?[ \t]+(?:(?:which|that|is|are|was|were|"
+                         r"remains?|still|currently|also|now|itself)[ \t]+){0,3}$")
+_TASK_LINE_RE = re.compile(r"^\s*[-*]\s+\[([ xX])\]\s+")
 _REF_PARTS_RE = re.compile(
     r"https://github\.com/([\w.-]+/[\w.-]+)/(?:issues|pull)/(\d+)"
     r"|(?<![\w/.])([\w.-]+/[\w.-]+)#(\d+)|(?<![\w/&#])#(\d+)\b")
@@ -7536,53 +7553,78 @@ def _refs_in(text, own_slug):
     return out
 
 
+def _clauses(text):
+    """The sentences / clauses a cue and its reference must share: split at
+    sentence ends, line breaks and semicolons."""
+    return [c for c in re.split(r"(?<=[.!?])\s+|\n+|;\s*", text or "") if c.strip()]
+
+
 def relation_mentions(text, own_slug=None):
-    """[(relation, slug or None, number, quote)] — what one text says of the
-    items it references: a cue right before a reference (at most two words
-    between, in the same sentence) gives the relation of the TEXT's item
-    towards it ("blocked by #N", "blocking #N", "depends on #N", "follow-up
-    to / in #N", "caused by #N", "superseded by #N"); a task-list line naming
-    an item is `depends_on`; any other reference is a bare `mentions` (never
-    a dependency). The quote is the sentence."""
+    """[{relation, slug, number, quote, subject, task_done}] — what one text
+    says of the items it references. A cue right before a reference (at most
+    two words between, in the same clause) gives a relation: of the TEXT's
+    item (`subject` None), or of the reference right before the cue when
+    the cue has one ("#2 is blocked by #3": `subject` (slug, 2)). A negated
+    cue ("not blocked by #2") is no relation. A task-list line naming an
+    item is `depends_on`, with `task_done` (its box ticked). Any other
+    reference is a bare `mentions` (never a dependency). The quote is the
+    clause."""
     text = _HTML_COMMENT_RE.sub("", _FENCE_RE.sub("", text or ""))
     found = {}
-    for m in _TASK_LIST_RE.finditer(text):
-        for slug, n, _s in _refs_in(m.group(1), own_slug):
-            found.setdefault((slug, n), ("depends_on", m.group(0).strip()))
-    sentences = re.split(r"(?<=[.!?])\s+|\n+|;\s*", text)
-    for sent in sentences:
+
+    def keep(key, rel, quote, subject, done):
+        prev = found.get(key)
+        if prev is None or RELATION_STRENGTH.get(rel, 9) < RELATION_STRENGTH.get(prev[0], 9):
+            found[key] = (rel, quote, subject, done)
+    for clause in _clauses(text):
+        task = _TASK_LINE_RE.match(clause)
+        done = (task.group(1) in "xX") if task else None
         cued = {}
         for rel, rx in RELATION_CUES:
-            for m in rx.finditer(sent):
-                # the references chained right after the cue ("by #1 and #2")
-                tail = sent[m.end():]
-                chain = re.match(r"(" + _REL_REF + r"(?:\s*(?:,|and|&|or)\s*" + _REL_REF
-                                 + r")*)", tail)
+            for m in rx.finditer(clause):
+                before = clause[:m.start()]
+                if _NEGATION_RE.search(before):
+                    continue                      # "not blocked by #2"
+                sub = _SUBJECT_RE.search(before)
+                subject = None
+                if sub:
+                    refs = _refs_in(sub.group(1), own_slug)
+                    subject = (refs[0][0], refs[0][1]) if refs else None
+                chain = re.match(r"(" + _REL_REF + r"(?:[ \t]*(?:,|and|&|or)[ \t]*"
+                                 + _REL_REF + r")*)", clause[m.end():])
                 if not chain:
                     continue
                 for slug, n, _s in _refs_in(chain.group(1), own_slug):
-                    cued.setdefault((slug, n), rel)
-        for slug, n, _s in _refs_in(sent, own_slug):
-            key = (slug, n)
-            rel = cued.get(key, "mentions")
-            prev = found.get(key)
-            if prev is None or RELATION_STRENGTH.get(rel, 9) < RELATION_STRENGTH.get(prev[0], 9):
-                found[key] = (rel, sent.strip()[:300])
-    return [(rel, slug, n, quote) for (slug, n), (rel, quote) in found.items()]
+                    cued.setdefault((slug, n), (rel, subject))
+        for slug, n, _s in _refs_in(clause, own_slug):
+            rel, subject = cued.get((slug, n), (None, None))
+            if rel is None and task and clause.find("#") >= 0:
+                rel = "depends_on"             # a task-list line naming an item
+            if rel is None:
+                rel = "mentions"
+            if subject is not None and subject == (slug, n):
+                continue
+            key = (subject, slug, n)
+            keep(key, rel, clause.strip()[:300], subject, done)
+    return [{"relation": rel, "slug": slug, "number": n, "quote": quote,
+             "subject": subject, "task_done": done}
+            for (subject, slug, n), (rel, quote, subject_, done) in found.items()]
 
 
 def _record_texts(rec, instant, typ):
-    """[(text, at, author, url, as_last_gathered)] of an item's body and
-    its comments, review comments and reviews written by the instant."""
+    """[(text, at, author, url, text_current)] of an item's body and its
+    comments, review comments and reviews written by the instant;
+    `text_current` is False for a body edited after the window (the store
+    keeps its last version only, so what changed is not known)."""
     out = []
     if rec.get("body") and _not_after(rec.get("created_at"), instant):
         out.append((rec["body"], rec.get("created_at"), rec.get("author"), rec.get("url"),
-                    bool(rec.get("body_as_of"))))
+                    not bool(rec.get("body_as_of"))))
     for key, ts in (("comments_list", "created_at"), ("review_comments", "created_at"),
                     ("reviews", "submitted_at")):
         for c in rec.get(key) or []:
             if isinstance(c, dict) and c.get("body") and _not_after(c.get(ts), instant):
-                out.append((c["body"], c.get(ts), c.get("author"), c.get("url"), False))
+                out.append((c["body"], c.get(ts), c.get("author"), c.get("url"), True))
     return out
 
 
@@ -7626,18 +7668,55 @@ def relation_target_kind(bundle, train_id):
     return "other"
 
 
+def _text_mentions(bundle, instant):
+    """Every relation the view's texts state, item to item: [{src, written,
+    relation, ref: (slug or None, number), basis}] — `src` the item the
+    relation is of (the text's own item, or the cue's subject), `written`
+    the relation as written, `relation` stored from the waiting side."""
+    meta = bundle.get("meta") or {}
+    slug = repo_slug(meta) or ""
+    out = []
+    for typ, key in (("issue", "issues"), ("pr", "prs")):
+        for rec in bundle.get(key) or []:
+            if not isinstance(rec, dict) or rec.get("number") is None:
+                continue
+            n = rec["number"]
+            for text, at, author, url, current in _record_texts(rec, instant, typ):
+                for m in relation_mentions(text, slug):
+                    basis = {"kind": "text", "quote": m["quote"],
+                             "item": {"type": typ, "number": n, "url": rec.get("url")},
+                             "author": author, "at": at, "url": url}
+                    if not current:
+                        basis["text_current"] = False
+                    if m["task_done"] is not None:
+                        basis["task_done"] = m["task_done"]
+                    src = (None, n)
+                    if m["subject"] is not None:
+                        src = m["subject"]
+                        basis["subject"] = {"slug": src[0], "number": src[1]}
+                    out.append({"src": src, "written": m["relation"],
+                                "ref": (m["slug"], m["number"]), "basis": basis})
+    return out
+
+
 def build_story_relations(bundle):
     """The relation layer of a story-layer view (one carrying `pr_history`):
     `story_graph` {edges: [{from, to, relation, basis {kind, quote?, item
-    {type, number, url}, author?, at?, url?, text_as_last_gathered?},
-    as_of, target_state, waiting, target_kind}], chains, most_blocking,
-    external, rule} and, on every `stories.all[]` row, `relations` (from
-    that story's side). From the record only, as of the view's end: text
-    cues next to a reference (relation_mentions), task lists, stacked
-    commits (`belongs_to_pr` -> `stacked_on`), content that landed in a
-    merged PR (`closed_unmerged.content_landed_in`). A reference to another
-    repository is kept with its repository (`to` {repo, number, url},
-    `external`: true) for a group view to join (join_member_relations).
+    {type, number, url}, author?, at?, url?, text_current?, task_done?,
+    subject?, inverse_of?}, as_of, target_state, waiting, target_kind,
+    target_item, items [{from_item, to_item, waiting, basis}], bases}],
+    chains, chains_capped?, most_blocking, external, rule}; on every
+    `stories.all[]` row, `relations` (from that story's side) and
+    `inner_relations` (relations between items of the SAME story: from_item,
+    to_item, relation, quote, author, as_of, waiting, task_done?,
+    text_current?). From the record only, as of the view's end: text cues
+    next to a reference (relation_mentions), task lists, stacked commits
+    (`belongs_to_pr` -> `stacked_on`), content that landed in a merged PR
+    (`closed_unmerged.content_landed_in`). A train edge keeps the item
+    pairs behind it and waits when ANY of them still waits (both items open,
+    the task not ticked). A reference to another repository is kept with its
+    repository (`to` {repo, number, url}, `external`: true, `ref`,
+    `written_relation`) for a stream to join (join_member_relations).
     In place."""
     if "pr_history" not in bundle:
         return bundle
@@ -7657,69 +7736,90 @@ def build_story_relations(bundle):
     known = [r.get("number") for _t, r in recs.values()
              if _not_after(r.get("created_at"), instant)]
     bound = max(known) if known else None
-    edges = {}
+    edges, inner = {}, {}
 
     def key_of(tid):
         return "{}:{}".format(slug, tid)
 
-    def add(src_n, rel, target, basis, at):
+    def item_of(n):
+        typ, rec = recs.get(n, (None, None))
+        return {"type": typ, "number": n, "url": (rec or {}).get("url")}
+
+    def pair_waits(src_n, target_n, rel, basis):
+        if rel not in WAITING_RELATIONS or basis.get("task_done") is True:
+            return False
+        return _item_state(recs.get(src_n, (None, None))[1], instant) == "open" and \
+            _item_state(recs.get(target_n, (None, None))[1], instant) == "open"
+
+    def add(src_n, rel, target, basis, at, written=None):
         src_t = train_of.get(src_n)
         if src_t is None:
             return
         if isinstance(target, int):
             tgt_t = train_of.get(target)
-            if tgt_t is None or tgt_t == src_t:
+            if tgt_t is None:
+                return
+            waits = pair_waits(src_n, target, rel, basis)
+            if tgt_t == src_t:
+                # the same story: an inner relation between its items
+                ik = (src_n, target, rel)
+                if ik not in inner:
+                    row = {"from_item": item_of(src_n), "to_item": item_of(target),
+                           "relation": rel, "quote": basis.get("quote"),
+                           "author": basis.get("author"), "as_of": (at or "")[:10] or None,
+                           "url": basis.get("url")}
+                    if rel in WAITING_RELATIONS:
+                        row["waiting"] = waits
+                    for k in ("task_done", "text_current", "inverse_of"):
+                        if k in basis:
+                            row[k] = basis[k]
+                    inner.setdefault(src_t, {})[ik] = row
                 return
             to = key_of(tgt_t)
-            trec = recs.get(target, (None, None))
-            tstate = _item_state(trec[1], instant)
-            tkind = relation_target_kind(bundle, tgt_t)
-            item = {"type": trec[0], "number": target, "url": (trec[1] or {}).get("url")}
         else:
-            to = target
-            tstate, tkind, item = None, "external", None
+            to, waits = target, False
         ek = (key_of(src_t), json.dumps(to, sort_keys=True), rel)
-        if ek in edges:
-            edges[ek]["bases"] += 1
-            return
-        e = {"from": key_of(src_t), "to": to, "relation": rel, "basis": basis,
-             "as_of": (at or "")[:10] or None, "target_kind": tkind, "bases": 1}
-        if item:
-            e["target_item"] = item
-        if tstate:
-            e["target_state"] = tstate
+        pair = {"from_item": item_of(src_n), "basis": basis,
+                "as_of": (at or "")[:10] or None}
+        if isinstance(target, int):
+            pair["to_item"] = item_of(target)
+            pair["target_state"] = _item_state(recs.get(target, (None, None))[1], instant)
             if rel in WAITING_RELATIONS:
-                # waiting: the item that waits is still open, its target too
-                e["waiting"] = tstate == "open" and _item_state(
-                    (recs.get(src_n) or (None, {}))[1], instant) == "open"
-        if not isinstance(target, int):
-            e["external"] = True
-        edges[ek] = e
-    for n, (typ, rec) in sorted(recs.items()):
-        if n not in train_of:
-            continue
-        for text, at, author, url, later in _record_texts(rec, instant, typ):
-            for rel, rslug, rn, quote in relation_mentions(text, slug):
-                basis = {"kind": "text", "quote": quote,
-                         "item": {"type": typ, "number": n, "url": rec.get("url")},
-                         "author": author, "at": at, "url": url}
-                if later:
-                    basis["text_as_last_gathered"] = True
-                if rslug is None:
-                    if bound is not None and rn > bound:
-                        continue          # did not exist at the window's end
-                    if rel == "blocks":
-                        add(rn, "blocked_by", n, dict(basis, inverse_of="blocks"), at)
-                    elif rel == "needed_by":
-                        add(rn, "depends_on", n, dict(basis, inverse_of="needed_by"), at)
-                    elif rel == "followed_by":
-                        add(rn, "follow_up_of", n, dict(basis, inverse_of="followed_by"), at)
-                    else:
-                        add(n, rel, rn, basis, at)
-                else:
-                    target = {"repo": rslug, "number": rn,
-                              "url": "https://github.com/{}/issues/{}".format(rslug, rn)}
-                    add(n, rel, target, basis, at)
+                pair["waiting"] = waits
+        e = edges.get(ek)
+        if e is None:
+            e = edges[ek] = {"from": key_of(src_t), "to": to, "relation": rel, "pairs": []}
+            if isinstance(target, int):
+                e["target_kind"] = relation_target_kind(bundle, train_of[target])
+            else:
+                e["target_kind"] = "external"
+                e["external"] = True
+                e["ref"] = dict(target)
+                e["written_relation"] = written or rel
+                e["source_item"] = item_of(src_n)
+                e["source_state"] = _item_state(recs.get(src_n, (None, None))[1], instant)
+        if len(e["pairs"]) < STORY_EDGE_PAIRS_MAX:
+            e["pairs"].append(pair)
+        e["bases_total"] = e.get("bases_total", 0) + 1
+    for m in _text_mentions(bundle, instant):
+        (sslug, sn), (rslug, rn) = m["src"], m["ref"]
+        if sslug is not None or sn not in recs:
+            continue                      # the subject is not an item of this view
+        basis, at = m["basis"], m["basis"].get("at")
+        written = m["written"]
+        if rslug is None:
+            if bound is not None and rn > bound:
+                continue                  # did not exist at the window's end
+            if written in _WRITTEN_INVERSE:
+                add(rn, _WRITTEN_INVERSE[written], sn, dict(basis, inverse_of=written), at)
+            else:
+                add(sn, written, rn, basis, at)
+        else:
+            target = {"repo": rslug, "number": rn,
+                      "url": "https://github.com/{}/issues/{}".format(rslug, rn)}
+            # another repository: kept as written ("this blocks o/b#5" is
+            # this item's `blocks`); a stream join turns it to the waiting side
+            add(sn, written, target, basis, at, written)
     # stacked commits: a PR made from another PR's branch
     for row in (bundle.get("pr_history") or {}).get("prs") or []:
         if not isinstance(row, dict):
@@ -7739,47 +7839,77 @@ def build_story_relations(bundle):
             add(row.get("number"), "stacked_on", owner,
                 {"kind": "stacked_commits", "commits": len(cs),
                  "first": {"sha": first.get("sha"), "subject": first.get("subject")},
-                 "item": {"type": "pr", "number": row.get("number"),
-                          "url": (recs.get(row.get("number"), (None, {}))[1] or {}).get("url")}},
+                 "item": item_of(row.get("number"))},
                 cs[-1].get("committed_at"))
     # where a closed PR's content landed
     for n, (typ, rec) in recs.items():
         for landed in ((rec.get("closed_unmerged") or {}).get("content_landed_in") or []):
             add(n, "content_landed_in", landed.get("pr"),
                 {"kind": "content_landed_in", "basis": landed.get("basis"),
-                 "commits": landed.get("commits"),
-                 "item": {"type": typ, "number": n, "url": rec.get("url")}},
+                 "commits": landed.get("commits"), "item": item_of(n)},
                 rec.get("closed_at"))
-    out_edges = sorted(edges.values(), key=lambda e: (e["from"], json.dumps(e["to"]),
-                                                      e["relation"]))
+    out_edges = [_finish_edge(e) for e in edges.values()]
+    out_edges.sort(key=lambda e: (e["from"], json.dumps(e["to"], sort_keys=True),
+                                  e["relation"]))
     bundle["story_graph"] = story_graph(out_edges)
+    rows = {r.get("id"): r for r in (bundle.get("stories") or {}).get("all") or []}
+    for tid, rels in inner.items():
+        if tid in rows:
+            rows[tid]["inner_relations"] = [rels[k] for k in sorted(
+                rels, key=lambda k: (k[0], k[1], k[2]))]
     _story_relation_rows(bundle, out_edges)
     return bundle
 
 
+def _finish_edge(e):
+    """A train edge from its item pairs: it waits when any pair waits; its
+    basis, target item and state are the waiting pair's (else the first's)."""
+    pairs = e.pop("pairs")
+    lead = next((p for p in pairs if p.get("waiting")), pairs[0])
+    e["basis"] = lead["basis"]
+    e["as_of"] = lead["as_of"]
+    if "to_item" in lead:
+        e["target_item"] = lead["to_item"]
+    if lead.get("target_state"):
+        e["target_state"] = lead["target_state"]
+    if e["relation"] in WAITING_RELATIONS and not e.get("external"):
+        e["waiting"] = any(p.get("waiting") for p in pairs)
+    e["items"] = [{k: p[k] for k in ("from_item", "to_item", "waiting", "as_of")
+                   if k in p} for p in pairs]
+    e["bases"] = e.pop("bases_total", len(pairs))
+    return e
+
+
 def story_graph(edges):
     """{edges, chains (paths of at least two waiting edges: blocked_by /
-    depends_on / stacked_on, as story keys), most_blocking [{story,
-    waiting_stories, blocked}] (the stories most others wait on), external
-    [{repo, number, url, from}], rule}."""
+    depends_on / stacked_on, as story keys; the walk is bounded by
+    STORY_CHAIN_MAX_DEPTH and STORY_CHAIN_MAX, `chains_capped` says when it
+    stopped), most_blocking [{story, waiting_stories, stories}], external
+    [{repo, number, url, from, relation}], rule}."""
     waits = {}
     for e in edges:
         if e["relation"] in WAITING_RELATIONS and isinstance(e["to"], str):
             waits.setdefault(e["from"], set()).add(e["to"])
-    chains = []
-
-    def walk(path):
-        nxt = sorted(waits.get(path[-1], set()) - set(path))
-        if not nxt:
-            if len(path) >= 3:
-                chains.append(list(path))
-            return
-        for x in nxt:
-            walk(path + [x])
-    for start in sorted(waits):
-        walk([start])
-    chains = [c for c in chains if not any(c != o and len(o) > len(c)
-                                          and o[-len(c):] == c for o in chains)]
+    chains, capped = [], False
+    starts = sorted(set(waits) - {t for ts in waits.values() for t in ts}) or sorted(waits)
+    for start in starts:
+        stack = [[start]]
+        while stack:
+            if len(chains) >= STORY_CHAIN_MAX:
+                capped = True
+                break
+            path = stack.pop()
+            nxt = sorted(waits.get(path[-1], set()) - set(path))
+            if not nxt or len(path) >= STORY_CHAIN_MAX_DEPTH:
+                if len(path) >= 3:
+                    chains.append(path)
+                if nxt:
+                    capped = True
+                continue
+            for x in reversed(nxt):
+                stack.append(path + [x])
+        if capped and len(chains) >= STORY_CHAIN_MAX:
+            break
     chains.sort(key=lambda c: (-len(c), c))
     incoming = {}
     for e in edges:
@@ -7788,50 +7918,74 @@ def story_graph(edges):
     most = sorted(({"story": k, "waiting_stories": len(v), "stories": sorted(v)}
                    for k, v in incoming.items()), key=lambda r: (-r["waiting_stories"],
                                                                 r["story"]))
-    return {"edges": edges, "chains": chains[:20], "most_blocking": most[:10],
-            "external": [{"repo": e["to"]["repo"], "number": e["to"]["number"],
-                          "url": e["to"]["url"], "from": e["from"],
-                          "relation": e["relation"]}
-                         for e in edges if e.get("external")],
-            "rule": {"kinds": list(RELATION_KINDS),
-                     "waiting": list(WAITING_RELATIONS),
-                     "cue_window_words": 2,
-                     "note": "from explicit record only; a bare reference is `mentions`"}}
+    out = {"edges": edges, "chains": chains[:STORY_CHAINS_SHOWN],
+           "most_blocking": most[:10],
+           "external": [{"repo": e["to"]["repo"], "number": e["to"]["number"],
+                         "url": e["to"]["url"], "from": e["from"],
+                         "relation": e["relation"]}
+                        for e in edges if e.get("external")],
+           "rule": {"kinds": list(RELATION_KINDS),
+                    "waiting": list(WAITING_RELATIONS),
+                    "cue_window_words": 2,
+                    "chain_max_depth": STORY_CHAIN_MAX_DEPTH,
+                    "note": "from explicit record only; a bare reference is `mentions`"}}
+    if capped or len(chains) > STORY_CHAINS_SHOWN:
+        out["chains_capped"] = True
+    return out
+
+
+_WAITS_CLAUSE_RE = re.compile(r"; waits on (?:PR|issue) #\d+ \(blocked by it: .*$")
 
 
 def _story_relation_rows(bundle, edges):
-    """`relations` on every stories.all row, from that story's side:
-    [{relation, other, other_kind (target_kind), basis, as_of, waiting?,
-    other_state?, external?}], strongest first; and a `waits_on` clause in
-    the row's `status_reason` when it is blocked by an open item."""
+    """`relations` on every stories.all row, rebuilt from `edges` (a story
+    with none has no key): from that story's side [{relation, other,
+    other_kind, basis, as_of, waiting?, other_state?, other_item?,
+    external?, cross_member?}], strongest first — the inverse for the
+    target end when it is a story of this view; and a `waits on` clause
+    in the row's `status_reason` when it is blocked by an item still open
+    (rebuilt, never appended twice)."""
     rows = {r.get("id"): r for r in (bundle.get("stories") or {}).get("all") or []}
     slug = repo_slug(bundle.get("meta")) or ""
     by_story = {}
     for e in edges:
-        src = e["from"].split(":", 1)[-1]
-        by_story.setdefault(src, []).append(
-            {k: v for k, v in (("relation", e["relation"]), ("other", e["to"]),
-                               ("other_kind", e["target_kind"]), ("basis", e["basis"]),
-                               ("as_of", e["as_of"]), ("waiting", e.get("waiting")),
-                               ("other_state", e.get("target_state")),
-                               ("other_item", e.get("target_item")),
-                               ("external", e.get("external"))) if v is not None})
+        if e["from"].startswith(slug + ":"):
+            src = e["from"].split(":", 1)[-1]
+            by_story.setdefault(src, []).append(
+                {k: v for k, v in (("relation", e["relation"]), ("other", e["to"]),
+                                   ("other_kind", e.get("target_kind")), ("basis", e["basis"]),
+                                   ("as_of", e["as_of"]), ("waiting", e.get("waiting")),
+                                   ("other_state", e.get("target_state")),
+                                   ("other_item", e.get("target_item")),
+                                   ("external", e.get("external")),
+                                   ("cross_member", e.get("cross_member"))) if v is not None})
         if isinstance(e["to"], str) and e["to"].startswith(slug + ":"):
             dst = e["to"].split(":", 1)[-1]
             by_story.setdefault(dst, []).append(
                 {k: v for k, v in (("relation", RELATION_INVERSE[e["relation"]]),
                                    ("other", e["from"]), ("basis", e["basis"]),
-                                   ("as_of", e["as_of"])) if v is not None})
+                                   ("as_of", e["as_of"]),
+                                   ("cross_member", e.get("cross_member"))) if v is not None})
+    for tid, row in rows.items():
+        row.pop("relations", None)
+        if row.get("status_reason"):
+            row["status_reason"] = _WAITS_CLAUSE_RE.sub("", row["status_reason"])
     for tid, rels in by_story.items():
         row = rows.get(tid)
         if row is None:
             continue
-        rels.sort(key=lambda r: (RELATION_STRENGTH.get(r["relation"],
+        seen, uniq = set(), []
+        for r in rels:
+            k = (r["relation"], json.dumps(r.get("other"), sort_keys=True))
+            if k not in seen:
+                seen.add(k)
+                uniq.append(r)
+        uniq.sort(key=lambda r: (RELATION_STRENGTH.get(r["relation"],
                                                        RELATION_STRENGTH.get(
                                                            RELATION_INVERSE.get(r["relation"]), 9)),
                                  json.dumps(r.get("other"), sort_keys=True)))
-        row["relations"] = rels
-        waits = [r for r in rels if r["relation"] == "blocked_by" and r.get("waiting")]
+        row["relations"] = uniq
+        waits = [r for r in uniq if r["relation"] == "blocked_by" and r.get("waiting")]
         if waits and row.get("status_reason"):
             w = waits[0]
             item = w.get("other_item") or {}
@@ -7842,11 +7996,11 @@ def _story_relation_rows(bundle, edges):
 
 def blocked_ball(bundle, train, ball):
     """R9 blocked by an open item: a story whose train has a `blocked_by`
-    edge to an item still open at the view's end waits on THAT item — when
-    the rule that fired is R2 / R3 / R4 / R7 / R8 (failing checks, an
-    outstanding change request and a named person stand). Returns the ball
-    with state `awaiting blocker`, `waits_on` [{story, item, quote, url}]
-    and `with` empty; else the ball unchanged."""
+    edge that still waits (both items open at the view's end) waits on THAT
+    item — when the rule that fired is R2 / R3 / R4 / R7 / R8 (failing
+    checks, an outstanding change request and a named person stand).
+    Returns the ball with state `awaiting blocker`, `waits_on` [{story,
+    item, quote, url}] and `with` empty; else the ball unchanged."""
     if not ball or ball.get("rule", "").split(" ")[0] not in ("R2", "R3", "R4", "R7", "R8"):
         return ball
     slug = repo_slug(bundle.get("meta")) or ""
@@ -7865,62 +8019,125 @@ def blocked_ball(bundle, train, ball):
 
 
 def join_member_relations(members):
-    """Across the members of one stream (digest): an edge of one member
-    whose target is another member's issue / PR (`external`, {repo,
-    number}) is resolved to that member's train (`to`: the other member's
-    story key `owner/repo:train-id`, `cross_member`: true, its target kind
-    and state), and the other member gains the inverse on its story row.
-    A reference to a repository outside the stream stays `external` with
-    no state claim. In place on each member's bundle."""
+    """Join the relation layers of SEPARATELY linked member views of one
+    stream: `members` [{"repo": "owner/repo", "bundle": linked view}] (a
+    digest's members, or the member view files a newsletter reads).
+    Safe and idempotent: every run starts again from each edge's own record
+    (`ref`, `written_relation`) and drops what an earlier run added.
+    1. A member's reference to another member's issue / PR resolves to that
+       member's train: `to` its story key `owner/repo:train-id`,
+       `cross_member` true, its kind, item and state; a cue written from the
+       other side ("this blocks o/b#5") becomes the OTHER member's edge from
+       the waiting side (blocked_by / depends_on / follow_up_of), as the
+       local path does.
+    2. `waiting` requires both items open at the view's end.
+    3. Each member's graph and story rows are rebuilt from its own edges,
+       then every cross-member inverse is added to the target member's
+       rows in a separate pass (the order of members does not matter).
+    A reference to a repository outside the stream stays `external`, with
+    no state claim. Returns `members` (bundles changed in place)."""
     by_repo = {}
     for m in members:
         b = m.get("bundle") or {}
-        slug = repo_slug(b.get("meta")) or m.get("repo")
-        by_repo[(slug or "").lower()] = b
+        s = repo_slug(b.get("meta")) or m.get("repo") or ""
+        by_repo[s.lower()] = b
+    local, added = {}, {}
     for m in members:
         b = m.get("bundle") or {}
         g = b.get("story_graph")
         if not isinstance(g, dict):
             continue
-        changed = False
+        keep = []
         for e in g.get("edges") or []:
-            to = e.get("to")
-            if not isinstance(to, dict):
-                continue
-            other = by_repo.get((to.get("repo") or "").lower())
-            if other is None:
-                continue
-            tid = next((t["id"] for t in other.get("trains") or []
-                        if to.get("number") in list(t.get("issues") or [])
-                        + list(t.get("prs") or [])), None)
+            if e.get("from_other_member"):
+                continue                      # an earlier run's: rebuilt below
+            if e.get("cross_member") and e.get("ref"):
+                e = {k: v for k, v in e.items()
+                     if k not in ("cross_member", "target_item", "target_state", "waiting")}
+                e.update(to=dict(e["ref"]), external=True, target_kind="external")
+                e["relation"] = e.get("written_relation") or e["relation"]
+            keep.append(e)
+        local[id(b)] = (b, keep)
+    for bid, (b, keep) in local.items():
+        instant = window_end_instant(b.get("meta"))
+        out = []
+        for e in keep:
+            ref = e.get("ref") if e.get("external") else None
+            other = by_repo.get(((ref or {}).get("repo") or "").lower()) if ref else None
+            tid = None
+            if other is not None:
+                tid = next((t["id"] for t in other.get("trains") or []
+                            if ref["number"] in list(t.get("issues") or [])
+                            + list(t.get("prs") or [])), None)
             if tid is None:
+                out.append(e)
                 continue
-            oslug = repo_slug(other.get("meta")) or to["repo"]
-            rec = next((r for key in ("prs", "issues") for r in other.get(key) or []
-                        if r.get("number") == to["number"]), None)
-            instant = window_end_instant(b.get("meta"))
-            e["to"] = "{}:{}".format(oslug, tid)
-            e.pop("external", None)
-            e["cross_member"] = True
-            e["target_kind"] = relation_target_kind(other, tid)
-            e["target_item"] = {"type": "pr" if rec and rec in (other.get("prs") or [])
-                                else "issue", "number": to["number"],
-                                "url": (rec or {}).get("url") or to.get("url")}
-            st = _item_state(rec, instant)
-            if st:
-                e["target_state"] = st
-                if e["relation"] in WAITING_RELATIONS:
-                    e["waiting"] = st == "open"
+            oslug = repo_slug(other.get("meta")) or ref["repo"]
+            orec = next((r for key in ("prs", "issues") for r in other.get(key) or []
+                         if r.get("number") == ref["number"]), None)
+            otyp = "pr" if orec is not None and orec in (other.get("prs") or []) else "issue"
+            ostate = _item_state(orec, instant)
+            other_key = "{}:{}".format(oslug, tid)
+            written = e.get("written_relation") or e["relation"]
+            target_item = {"type": otyp, "number": ref["number"],
+                           "url": (orec or {}).get("url") or ref.get("url")}
+            if written in _WRITTEN_INVERSE:
+                # the other member's item waits on this one: its edge
+                rel = _WRITTEN_INVERSE[written]
+                ne = {"from": other_key, "to": e["from"], "relation": rel,
+                      "basis": dict(e["basis"], inverse_of=written), "as_of": e.get("as_of"),
+                      "target_kind": relation_target_kind(b, e["from"].split(":", 1)[-1]),
+                      "target_item": e.get("source_item"),
+                      "target_state": e.get("source_state"),
+                      "cross_member": True, "from_other_member": True,
+                      "bases": e.get("bases", 1), "items": e.get("items", [])}
+                if rel in WAITING_RELATIONS:
+                    ne["waiting"] = ostate == "open" and e.get("source_state") == "open"
+                added.setdefault(id(other), []).append(ne)
+                # this member keeps the edge as written, resolved (no waiting:
+                # the waiting side is the other member's edge)
+                kept = {k: v for k, v in e.items() if k not in ("external",)}
+                kept.update(to=other_key, cross_member=True,
+                            target_kind=relation_target_kind(other, tid),
+                            target_item=target_item, target_state=ostate)
+                out.append(kept)
+                continue
+            ne = {k: v for k, v in e.items() if k not in ("external",)}
+            ne.update(to=other_key, cross_member=True,
+                      target_kind=relation_target_kind(other, tid),
+                      target_item=target_item, target_state=ostate)
+            if ne["relation"] in WAITING_RELATIONS:
+                ne["waiting"] = ostate == "open" and e.get("source_state") == "open"
+            out.append(ne)
+        local[bid] = (b, out)
+    for bid, (b, out) in local.items():
+        edges = out + added.get(bid, [])
+        edges.sort(key=lambda e: (e["from"], json.dumps(e["to"], sort_keys=True),
+                                  e["relation"]))
+        old = b.get("story_graph") or {}
+        b["story_graph"] = story_graph(edges)
+        if "rule" in old:
+            b["story_graph"]["rule"] = old["rule"]
+        _story_relation_rows(b, edges)
+    # every cross-member inverse, once all rows are rebuilt
+    for bid, (b, _o) in local.items():
+        for e in b["story_graph"]["edges"]:
+            if not e.get("cross_member") or not isinstance(e["to"], str):
+                continue
+            tslug, tid = e["to"].split(":", 1)
+            other = by_repo.get(tslug.lower())
+            if other is None or other is b:
+                continue
             orow = next((r for r in (other.get("stories") or {}).get("all") or []
                          if r.get("id") == tid), None)
-            if orow is not None:
-                orow.setdefault("relations", []).append(
-                    {"relation": RELATION_INVERSE[e["relation"]], "other": e["from"],
-                     "basis": e["basis"], "as_of": e["as_of"], "cross_member": True})
-            changed = True
-        if changed:
-            b["story_graph"] = story_graph(g["edges"])
-            _story_relation_rows(b, g["edges"])
+            if orow is None:
+                continue
+            inv = {"relation": RELATION_INVERSE[e["relation"]], "other": e["from"],
+                   "basis": e["basis"], "as_of": e.get("as_of"), "cross_member": True}
+            rels = orow.setdefault("relations", [])
+            if not any(r.get("relation") == inv["relation"] and r.get("other") == inv["other"]
+                       for r in rels):
+                rels.append(inv)
     return members
 
 
