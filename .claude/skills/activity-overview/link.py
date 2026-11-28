@@ -2809,7 +2809,9 @@ def annotate_stacked_commits(bundle):
     holders = {}
     for n, row in rows.items():
         for c in row.get("commits") or []:
-            if isinstance(c, dict) and c.get("sha"):
+            # a merge of the base branch is in many branches without one
+            # being made from the other: only single-parent commits count
+            if isinstance(c, dict) and c.get("sha") and c.get("parents", 1) == 1:
                 holders.setdefault(c["sha"], []).append(n)
     for sha, ns in holders.items():
         if len(ns) < 2:
@@ -7493,7 +7495,7 @@ RELATION_STRENGTH = {"blocked_by": 0, "blocks": 0, "depends_on": 1, "needed_by":
                      "content_landed_in": 5, "mentions": 9}
 _REL_REF = (r"(?:\[?(?:https://github\.com/[\w.-]+/[\w.-]+/(?:issues|pull)/\d+"
             r"|[\w.-]+/[\w.-]+#\d+|#\d+)\]?(?:\([^)\s]*\))?)")
-_REL_FILL = r"(?:[^\s#\[\],]+\s+){0,4}?"
+_REL_FILL = r"(?:[^\s#\[\],]+\s+){0,2}?"
 # (relation the TEXT's item has towards the reference, cue); first match wins
 RELATION_CUES = tuple((rel, re.compile(r"(?i)\b(?:" + cue + r")\s*:?\s+" + _REL_FILL
                                        + r"(?=" + _REL_REF + r")"))
@@ -7502,7 +7504,7 @@ RELATION_CUES = tuple((rel, re.compile(r"(?i)\b(?:" + cue + r")\s*:?\s+" + _REL_
                     r"continued\s+in|tracked\s+in|will\s+be\s+(?:addressed|handled|done|fixed)\s+in"),
     ("follow_up_of", r"follow[- ]?ups?\s+(?:to|of|on|from)|follows\s+up\s+on|continuation\s+of|"
                      r"split\s+(?:out\s+)?(?:from|of)"),
-    ("blocked_by", r"blocked\s+(?:by|on)|waiting\s+(?:for|on)|on\s+hold\s+(?:until|for)"),
+    ("blocked_by", r"blocked\s+(?:by|on)|wait(?:ing)?\s+(?:for|on)|on\s+hold\s+(?:until|for)"),
     ("blocks", r"blocking|blocks"),
     ("needed_by", r"needed\s+by|required\s+by|prerequisite\s+(?:for|of)"),
     ("depends_on", r"depends\s+on|dependent\s+on|requires|needs|prerequisites?|"
@@ -7536,7 +7538,7 @@ def _refs_in(text, own_slug):
 
 def relation_mentions(text, own_slug=None):
     """[(relation, slug or None, number, quote)] — what one text says of the
-    items it references: a cue right before a reference (at most four words
+    items it references: a cue right before a reference (at most two words
     between, in the same sentence) gives the relation of the TEXT's item
     towards it ("blocked by #N", "blocking #N", "depends on #N", "follow-up
     to / in #N", "caused by #N", "superseded by #N"); a task-list line naming
@@ -7687,7 +7689,9 @@ def build_story_relations(bundle):
         if tstate:
             e["target_state"] = tstate
             if rel in WAITING_RELATIONS:
-                e["waiting"] = tstate == "open"
+                # waiting: the item that waits is still open, its target too
+                e["waiting"] = tstate == "open" and _item_state(
+                    (recs.get(src_n) or (None, {}))[1], instant) == "open"
         if not isinstance(target, int):
             e["external"] = True
         edges[ek] = e
@@ -7724,10 +7728,17 @@ def build_story_relations(bundle):
         for c in _pr_commits_as_of(row, instant):
             if c.get("belongs_to_pr"):
                 owners.setdefault(c["belongs_to_pr"], []).append(c)
+        src = (recs.get(row.get("number")) or (None, {}))[1] or {}
         for owner, cs in owners.items():
+            orec = (recs.get(owner) or (None, {}))[1] or {}
+            if "closed" in (_item_state(src, instant), _item_state(orec, instant)):
+                # a closed, unmerged PR on either side: its content landed in
+                # the other (content_landed_in), not a branch made from one
+                continue
+            first = next((c for c in cs if c.get("parents", 1) == 1), cs[0])
             add(row.get("number"), "stacked_on", owner,
                 {"kind": "stacked_commits", "commits": len(cs),
-                 "first": {"sha": cs[0].get("sha"), "subject": cs[0].get("subject")},
+                 "first": {"sha": first.get("sha"), "subject": first.get("subject")},
                  "item": {"type": "pr", "number": row.get("number"),
                           "url": (recs.get(row.get("number"), (None, {}))[1] or {}).get("url")}},
                 cs[-1].get("committed_at"))
@@ -7784,7 +7795,7 @@ def story_graph(edges):
                          for e in edges if e.get("external")],
             "rule": {"kinds": list(RELATION_KINDS),
                      "waiting": list(WAITING_RELATIONS),
-                     "cue_window_words": 4,
+                     "cue_window_words": 2,
                      "note": "from explicit record only; a bare reference is `mentions`"}}
 
 

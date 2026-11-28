@@ -1791,9 +1791,9 @@ similarity (`link.build_story_relations`), as of the view's end:
 - **Text next to a reference** (`link.relation_mentions`): in a PR / issue body (the
   body as gathered: `basis.text_as_last_gathered` when it was edited after the window)
   and in comments, review comments and reviews written by the view's end. A cue right
-  before a reference — at most four words between, in the same sentence or clause —
+  before a reference — at most two words between, in the same sentence or clause —
   gives the relation of the TEXT's item towards the referenced one: `blocked_by`
-  ("blocked by / on", "waiting for / on", "on hold until"), `blocks` ("blocking",
+  ("blocked by / on", "wait / waiting for / on", "on hold until"), `blocks` ("blocking",
   "blocks"), `depends_on` ("depends on", "requires", "needs", "prerequisite", "built
   on", "on top of"), `needed_by` ("needed by", "required by", "prerequisite for"),
   `follow_up_of` ("follow-up to / of", "continuation of", "split from"), `followed_by`
@@ -1805,12 +1805,13 @@ similarity (`link.build_story_relations`), as of the view's end:
   stored from the waiting side: `blocks` / `needed_by` / `followed_by` texts become the
   other item's `blocked_by` / `depends_on` / `follow_up_of` (`basis.inverse_of` says so).
 - **Structure**: `stacked_on` (the PR's commits belong to another PR opened first:
-  `belongs_to_pr`, basis `stacked_commits`), `content_landed_in` (a closed PR's
+  `belongs_to_pr`, basis `stacked_commits`; not when either PR closed unmerged — then
+  its content landed in the other), `content_landed_in` (a closed PR's
   `closed_unmerged.content_landed_in`).
 - A reference to an item created after the window's end is not used; a comment written
   after it is not read; `target_state` is the target's state at the end (`open` /
   `closed` / `merged`), and `waiting` (on `blocked_by` / `depends_on` / `stacked_on`)
-  is true only while the target is still open.
+  is true only while both the waiting item and its target are still open.
 - **Across repositories**: `owner/repo#N` and github.com links to another repository
   are kept as `external` edges (`to` `{repo, number, url}`, no state claimed). In a
   stream's digest (`digest.build_project_view`) `link.join_member_relations` resolves a

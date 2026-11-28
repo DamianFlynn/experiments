@@ -86,6 +86,7 @@ class TestStructural(unittest.TestCase):
         b2 = enriched(view([merged_pr(1, created_at="2026-05-02T00:00:00Z"),
                             pr(2, state="closed", closed_at="2026-05-10T00:00:00Z",
                                created_at="2026-05-03T00:00:00Z")], pr_history=h2))
+        self.assertEqual(edges(b2, "stacked_on"), [])     # a closed copy: content landed
         landed = edges(b2, "content_landed_in")
         self.assertEqual((landed[0]["from"], landed[0]["to"], landed[0]["basis"]["basis"]),
                          ("o/r:train-pr-2", "o/r:train-pr-1", "same commit"))
