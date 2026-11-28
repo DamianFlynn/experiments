@@ -1801,20 +1801,28 @@ similarity (`link.build_story_relations`), as of the view's end:
   before a reference — at most two words between, in the same sentence or clause (split
   at sentence ends, line breaks and semicolons; never across) —
   gives the relation of the TEXT's item towards the referenced one: `blocked_by`
-  ("blocked by / on", "wait / waiting for / on", "on hold until"), `blocks` ("blocking",
-  "blocks"), `depends_on` ("depends on", "requires", "needs", "prerequisite", "built
-  on", "on top of"), `needed_by` ("needed by", "required by", "prerequisite for"),
+  ("blocked by / on", "wait / waiting for / on", "on hold until" — a written wait is
+  stored as `blocked_by`; a reader checks it with the generic `waits_on`, below),
+  `blocks` ("blocking", "blocks"), `stacked_on` ("stacked on", "stacked on top of",
+  "built on top of", "on top of", "based on #N's branch", "based on the branch of #N"),
+  `depends_on` ("depends on", "requires", "needs", "prerequisite", "built
+  on"), `needed_by` ("needed by", "required by", "prerequisite for"),
   `follow_up_of` ("follow-up to / of", "continuation of", "split from"), `followed_by`
   ("follow-up in", "followed by", "continued in", "tracked in", "will be addressed in"),
   `caused_by` ("caused by", "regression from", "broken by", "introduced by", "due to",
   "because of"), `content_landed_in` ("superseded by", "replaced by", "consolidated
   into"). Targets are joined by commas / and / & / or and stop at the first other text.
+  An opening parenthesis may stand before a reference ("blocked by (#4)").
   A negated cue ("not blocked by #2", "no longer depends on") is no relation (a
-  `mentions` with `basis.negated`). A
-  cue whose subject is another reference ("#2 is blocked by #3", "#8, which is blocking
-  #9") is that item's relation, not the text's item's (`basis.subject`); the subject
+  `mentions` with `basis.negated`); "not blocked by #2 but by #3" affirms #3. A
+  cue whose subject is another reference ("#2 is blocked by #3", "#12 is needed by
+  #30", "#8, which is blocking #9") is that item's relation, not the text's item's
+  (`basis.subject`); subjects join like targets ("#30 and #31 depended on #12": a pair
+  for each); the subject
   carries across coordinated predicates ("#31 is a follow-up to #11 and was caused by
-  #12": both are #31's; `basis.tense` past). A task-list line
+  #12": both are #31's; `basis.tense` past). Code (fences, inline code), HTML comments
+  and quoted blocks (lines starting with `>`: someone else's words) are not read.
+  "See #N", "fixes / closes #N" are `mentions`. A task-list line
   naming an item (`- [ ] #N`, `- [ ] https://github.com/o/r/pull/N`) is `depends_on`,
   with `basis.task_done` (its box ticked: a
   ticked task waits on nothing). Any other reference is `mentions` — a bare reference is
@@ -1901,13 +1909,16 @@ One implementation each; the view's `waiting`, `status_reason`, R9 and the strea
 are computed through them, so a reader that uses them agrees with the view.
 
 `link.parse_relation_claims(text, own_slug=None, default_subject=None) -> [claim]` — the
-one reference-and-cue parser. A claim is `{subject, relation, targets, tense, negated,
-task, span, quote}`: `relation` as written (an inverse cue stays `blocks` /
-`needed_by` / `followed_by`; a bare reference is `mentions`), refs `{slug, number,
-url?}` (`slug` None: `own_slug`'s repository), `subject` the explicit reference before
-the cue (carried across coordinated predicates) else `default_subject`, `tense`
-`present` / `past`, `negated` for not / never / no longer, `task` `open` / `done` on a
-task-list line, `span` the clause's `(start, end)` in `text`.
+one reference-and-cue parser. A claim is `{subject, subjects, relation, query_kind,
+targets, tense, negated, task, span, quote}`: `relation` as written (an inverse cue
+stays `blocks` / `needed_by` / `followed_by`; a bare reference is `mentions`),
+`query_kind` the kind to pass to `relation_holds` (the relation, or the generic
+`waits_on` for "waits on / waiting for / waited on"), refs `{slug, number, url?}`
+(`slug` None: `own_slug`'s repository), `subjects` the explicit references before the
+cue (joined by and / commas; kept on a negated claim; carried across coordinated
+predicates) else `[default_subject]` — one claim per subject, `subject` its own —
+`tense` `present` / `past`, `negated` for not / never / no longer, `task` `open` /
+`done` on a task-list line, `span` the clause's `(start, end)` in `text`.
 
     link.parse_relation_claims(
         "#31 is a follow-up to [#11](https://github.com/o/r/pull/11) and was caused by o/x#12.",
@@ -1918,17 +1929,41 @@ task-list line, `span` the clause's `(start, end)` in `text`.
     #  {"subject": {"slug": None, "number": 31}, "relation": "caused_by",
     #   "targets": [{"slug": "o/x", "number": 12}], "tense": "past", ...}]
 
-`link.relation_clauses(text) -> [(start, clause)]` — the clauses the parser reads (HTML
-comments and code fences blanked; split at sentence ends, line breaks, semicolons).
+`link.relation_clauses(text) -> [(start, clause)]` — the clauses the parser reads (code
+fences, inline code, HTML comments and quoted blocks blanked; split at sentence ends,
+line breaks, semicolons).
 
     link.relation_clauses("Blocked by #2. See #3")   # [(0, "Blocked by #2."), (15, "See #3")]
 
-`link.item_state(record, day=None) -> "open" | "closed" | "merged" | "not_created" |
-None` — the one state projection of an issue / PR record at the end of `day`
-(`YYYY-MM-DD` or an instant; None: as recorded).
+`link.item_refs(text, own_slug=None) -> [ref]` — the one reference resolver (the parser's
+own): every issue / PR reference in order, `{repo, slug, number, url?, span (start,
+end), evidence, form, sha?}`. `repo` is the repository (`own_slug` for `#N`), `slug`
+None for `own_slug`'s; a Markdown link is one reference resolved from its destination
+(`form` `markdown`), bare URLs `url`, `owner/repo#N` `short`, `#N` `local`; `evidence`
+true for a link to a comment / review / event (its item's number) or a commit (`number`
+None, `sha`); a link to another host is not a reference; code, HTML comments and quoted
+blocks are not read.
 
-    link.item_state({"state": "closed", "merged": True, "merged_at": "2026-05-20T00:00:00Z",
-                     "created_at": "2026-05-01T00:00:00Z"}, "2026-05-15")   # "open"
+    link.item_refs("Blocked by [#5](https://github.com/o/b/pull/5) and #7 "
+                   "([c](https://github.com/o/r/pull/7#issuecomment-1))", "o/r")
+    # [{"repo": "o/b", "slug": "o/b", "number": 5, "span": (11, 46), "evidence": False,
+    #   "form": "markdown", "url": "https://github.com/o/b/pull/5"},
+    #  {"repo": "o/r", "slug": None, "number": 7, "span": (51, 53), "evidence": False,
+    #   "form": "local"},
+    #  {"repo": "o/r", "slug": None, "number": 7, ..., "evidence": True, "form": "markdown"}]
+
+`link.item_state(record, day=None) -> "open" | "closed" | "merged" | "not_created" |
+None` — the one state projection and lifecycle replay of an issue / PR record at the
+end of `day` (`YYYY-MM-DD` or an instant; None: as recorded): `not_created` before
+`created_at`, then the latest of its recorded lifecycle events through the day
+(`closed`, `reopened`, `merged`) and its dated fields (`closed_at` of a closed record,
+`merged_at`) — a merge is final; with no events recorded the dated fields alone decide.
+Relation ends and PR-state claims both use it.
+
+    link.item_state({"state": "open", "created_at": "2026-05-01T00:00:00Z",
+                     "lifecycle": [{"event": "closed", "created_at": "2026-05-05T00:00:00Z"},
+                                   {"event": "reopened", "created_at": "2026-05-10T00:00:00Z"}]},
+                    "2026-05-06")   # "closed" ("open" on 2026-05-12)
 
 `link.relation_holds(view_or_members, from_item, to_item, kind, day=None, present=False)
 -> {"holds": True, "evidence": [pair]} | {"holds": False, "reason", "evidence"}` — the
@@ -1937,7 +1972,12 @@ one predicate. `view_or_members`: a linked view, or a stream's members `[{"repo"
 Items: `{"repo", "number"}`, `"owner/repo#N"` or a number (the first view's repository).
 `kind` as claimed: an inverse (`blocks`, `needed_by`, `followed_by`, `causes`,
 `stacked_under`, `content_from`, `mentioned_by`) is checked from the waiting side, also
-against an external target stored as written. `day` (default: the first view's end):
+against an external target stored as written. A generic word
+(`link.GENERIC_RELATIONS`) accepts several relations: `waits_on` holds on a
+`blocked_by`, `depends_on` or `stacked_on` pair ("#7529 still waits on #7374" holds
+when the record's link is shared commits), `waited_on_by` on `blocks`, `needed_by`
+or `stacked_under` (the same pairs from the other end); every other kind accepts only
+itself (and its written inverse). `day` (default: the first view's end):
 only evidence dated on or before it. `present`: still in force on the day — not a
 ticked task, not a body edited after the window, both items open on the day by
 `item_state`. `reason`: `no_evidence`, `after_day`, `task_done`, `text_not_current`,
@@ -1969,6 +2009,23 @@ count as two.
 
     link.stream_story_graph(members)["chains"]
     # [["o/a:train-pr-1", "o/b:train-pr-2", "o/c:train-pr-3"]]
+
+`link.record_superseded(view_or_members, item, by, day=None) -> {"holds", "evidence"?,
+"reason"?}` — the one answer to "does the record say #A was superseded by #B". It reads
+the item's own close reason, `closed_unmerged.superseded_by` (`link.close_reason`: the
+item's own comments, reviews and closing event, latest first, with the wider wording
+"superseded / replaced / consolidated / continued / covered / moved ... by / in #N",
+up to six words between; `{superseded_by, named_in, by, quote, at}`); the statement
+must be written by `day` and the item closed unmerged on it. Reasons: `no_record`,
+`not_stated`, `other_item`, `after_day`, `not_closed`. How the two relate: the parser
+reads "superseded by / replaced by / consolidated in #B" anywhere as the relation
+`content_landed_in` (an edge with a text basis), and shared commits give
+`content_landed_in` too (`closed_unmerged.content_landed_in`: where content went, never
+a supersession). Only `superseded_by` says "superseded".
+
+    link.record_superseded(v, 1, 2)
+    # {"holds": True, "evidence": {"item": {"repo": "o/r", "number": 1}, "superseded_by": 2,
+    #   "quote": "Superseded by #2", "named_in": ..., "by": "m", "at": "2026-05-10T00:00:00Z"}}
 
 `link.relation_mentions(text, own_slug=None)` remains: `parse_relation_claims` flattened
 per target (negated claims as `mentions`).

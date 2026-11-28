@@ -7311,7 +7311,7 @@ def close_reason(bundle, pr, instant):
             if m and int(m.group(2)) != pr.get("number") \
                     and not _NEGATION_RE.search(clause[:m.start()]):
                 return {"superseded_by": int(m.group(2)), "named_in": url, "by": who,
-                        "quote": m.group(0)}
+                        "quote": m.group(0), "at": at or None}
     return {"close_reason": "not stated"}
 
 
@@ -7522,14 +7522,19 @@ _URL_RE = re.compile(r"https?://[^\s)\]>\"'`]+")
 _ITEM_URL_RE = re.compile(r"^" + _ITEM_URL + r"/?$")
 _EVIDENCE_URL_RE = re.compile(r"^(?:" + _ITEM_URL + r"(?:/(?:commits?|files|checks)\b"
                               r"|#(?:issuecomment|pullrequestreview|discussion_r|event)-?[\w-]*)"
-                              r"|https://github\.com/[\w.-]+/[\w.-]+/commit/[0-9a-f]{7,40})")
+                              r"|https://github\.com/([\w.-]+/[\w.-]+)/commit/([0-9a-f]{7,40}))")
 _LABEL_REF_RE = re.compile(r"^\s*(?:([\w.-]+/[\w.-]+))?#(\d+)\s*$")
 _SHORT_REF_RE = re.compile(r"(?<![\w/.])([\w.-]+/[\w.-]+)#(\d+)\b|(?<![\w/&#])#(\d+)\b")
-_R0, _R1, _EV = "\ue000", "\ue001", "\ue002"
+_INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+_BLOCKQUOTE_RE = re.compile(r"(?m)^[ \t]*>.*$")
+# private-use markers the parser puts in place of references (never in text)
+_R0, _R1, _EV, _OTHER = chr(0xE000), chr(0xE001), chr(0xE002), chr(0xE003)
 _MREF = _R0 + r"(\d+)" + _R1
+_MREF_NC = _R0 + r"\d+" + _R1
 _MEV = r"(?:[ \t]*\(?[ \t]*" + _EV + r"[ \t]*\)?)*"
 _MCONN = r"[ \t]*(?:,|and|&|or)[ \t]*"
-_MCHAIN = _MREF + _MEV + r"(?:" + _MCONN + _MREF + _MEV + r")*"
+_MCHAIN = r"\(?[ \t]*" + _MREF + _MEV + r"(?:" + _MCONN + _MREF + _MEV + r")*"
+_MCHAIN_NC = _MREF_NC + _MEV + r"(?:" + _MCONN + _MREF_NC + _MEV + r")*"
 # cue phrases by the relation they state of their subject, as written
 RELATION_CUE_PHRASES = (
     ("followed_by", r"follow[- ]?ups?\s+(?:is\s+|will\s+be\s+)?(?:in|at)|followed\s+by|"
@@ -7540,25 +7545,38 @@ RELATION_CUE_PHRASES = (
                    r"on\s+hold\s+(?:until|for)"),
     ("blocks", r"blocking|blocks"),
     ("needed_by", r"needed\s+by|required\s+by|prerequisite\s+(?:for|of)"),
+    ("stacked_on", r"stacked\s+on(?:\s+top\s+of)?|(?:built\s+)?on\s+top\s+of|"
+                   r"based\s+on\s+the\s+branch\s+of|"
+                   r"based\s+on(?=[ \t]*\(?" + _MREF_NC + r"(?:'s)?[ \t]+branch)"),
     ("depends_on", r"depend(?:s|ed)?\s+on|dependent\s+on|requires|needs|"
-                   r"prerequisites?(?:\s+\w+)?|built\s+on|on\s+top\s+of"),
+                   r"prerequisites?(?:\s+\w+)?|built\s+on"),
     ("caused_by", r"caused\s+by|regression\s+(?:from|in|of)|broken\s+by|introduced\s+(?:by|in)|"
                   r"due\s+to|because\s+of"),
     ("content_landed_in", r"superseded\s+by|replaced\s+by|consolidated\s+(?:in|into)"))
-_FILL = r"(?:[^\s\ue000-\ue002,.;:!?]+[ \t]+){0,2}?"
+# the generic words a reader may claim with, and the relations each accepts
+# (relation_holds): "waits on / waiting for" is any waiting relation in force
+GENERIC_RELATIONS = {"waits_on": WAITING_RELATIONS,
+                     "waited_on_by": tuple(RELATION_INVERSE[k] for k in WAITING_RELATIONS)}
+_WAIT_WORD_RE = re.compile(r"(?i)^wait")
+_FILL = r"(?:[^\s" + _R0 + "-" + _OTHER + r",.;:!?]+[ \t]+){0,2}?"
 _CUE_RES = tuple((rel, re.compile(r"(?i)\b(?:" + cue + r")[ \t]*:?(?:\*\*)?[ \t]*" + _FILL
-                                  + r"(?=" + _R0 + r")"))
+                                  + r"(?=\(?[ \t]*" + _R0 + r")"))
                  for rel, cue in RELATION_CUE_PHRASES)
 _NEGATION_RE = re.compile(r"(?i)\b(?:not|no\s+longer|never|isn't|aren't|wasn't|weren't|"
                           r"doesn't|don't|didn't|no|nor|without|un)\W*(?:\w+\W+){0,2}$")
 _NEG_RE = re.compile(r"(?i)\b(?:not|never|no\s+longer|isn't|aren't|wasn't|weren't|doesn't|"
-                     r"don't|didn't|nor)\b[ \t]*(?:\w+[ \t]+){0,2}$")
-_PAST_RE = re.compile(r"(?i)\b(?:was|were|had|had\s+been|has\s+been)\b[ \t]*(?:\w+[ \t]+){0,1}$")
+                     r"don't|didn't|hasn't|haven't|nor)\b[ \t]*(?:\w+[ \t]+){0,2}$")
+_PAST_RE = re.compile(r"(?i)\b(?:was|were|had|had\s+been|has\s+been)\b[ \t]*(?:\w+[ \t]+){0,2}$")
 _PAST_CUE_RE = re.compile(r"(?i)^(?:depended|waited)\b")
-_SUBJ_RE = re.compile(_MREF + _MEV + r",?[ \t]+(?:(?:which|that|is|are|was|were|has|have|"
-                      r"been|remains?|still|currently|also|now|itself|a)[ \t]+){0,4}$")
+_SUBJ_WORDS = (r"which|that|is|are|was|were|has|have|had|been|remains?|still|currently|also|"
+               r"now|itself|a|not|never|no|longer|does|do|did|isn't|aren't|wasn't|weren't|"
+               r"doesn't|don't|didn't|hasn't|haven't|both")
+_SUBJ_RE = re.compile(r"(?i)(" + _MCHAIN_NC + r"),?[ \t]+(?:(?:" + _SUBJ_WORDS
+                      + r")[ \t]+){0,5}$")
 _CARRY_RE = re.compile(r"(?i)^" + _MEV + r"[ \t]*(?:,|and|but)?[ \t]*(?:(?:is|was|are|were|"
-                       r"has|have|been|also|then|still|a)[ \t]+){0,4}$")
+                       r"has|have|been|also|then|still|a|not|never|no|longer)[ \t]+){0,4}$")
+_BUT_RE = re.compile(r"(?i)^[ \t]*,?[ \t]*but[ \t]+(?:(?:by|on|for|of|to|in|from|into)[ \t]+)?"
+                     r"(?=\(?[ \t]*" + _R0 + r")")
 _TASK_RE = re.compile(r"^\s*[-*]\s+\[([ xX])\]\s+")
 
 
@@ -7571,12 +7589,23 @@ def _ref_of(slug, number, own_slug, url=None):
     return out
 
 
+def _blank_unread(text):
+    """The text with what is never a claim blanked to spaces (positions
+    kept): code fences, inline code, HTML comments, quoted blocks (lines
+    starting with `>`: someone else's words)."""
+    sp = lambda m: re.sub(r"[^\n]", " ", m.group(0))   # noqa: E731
+    text = _FENCE_RE.sub(sp, text or "")
+    text = _HTML_COMMENT_RE.sub(sp, text)
+    text = _INLINE_CODE_RE.sub(sp, text)
+    return _BLOCKQUOTE_RE.sub(sp, text)
+
+
 def relation_clauses(text):
-    """The clauses a cue and its references must share: the text (HTML
-    comments and code fences removed) split at sentence ends, line breaks
-    and semicolons. [(start, clause)]."""
-    text = _HTML_COMMENT_RE.sub(lambda m: " " * len(m.group(0)),
-                                _FENCE_RE.sub(lambda m: " " * len(m.group(0)), text or ""))
+    """The clauses a cue and its references must share: the text (code
+    fences, inline code, HTML comments and quoted blocks blanked) split at
+    sentence ends, line breaks and semicolons. [(start, clause)], `start`
+    the clause's offset in `text`."""
+    text = _blank_unread(text)
     out, pos = [], 0
     for m in re.finditer(r"(?<=[.!?])\s+|\n+|;\s*", text):
         if text[pos:m.start()].strip():
@@ -7587,27 +7616,26 @@ def relation_clauses(text):
     return out
 
 
-def _mask(clause, own_slug):
-    """The clause with every item reference replaced by an atomic marker
-    and every evidence link by a transparent one: a Markdown link to an
-    item is ONE reference resolved from its destination (its label is
-    never scanned); a Markdown or bare link to a comment, review, commit or
-    event is evidence — unless the link's label names that same item
-    ("[#7486](.../pull/7486#issuecomment-1)": the item, from the
-    destination); a link to any other host is a plain word; owner/repo#N
-    and #N are references. (masked, refs)."""
-    refs, pos = [], 0
+def _scan_refs(text, own_slug):
+    """THE reference resolver: every reference span of `text` in order,
+    [{start, end, kind: item | evidence | other_link, slug, number, url?,
+    form: markdown | url | short | local, sha?}]. A Markdown link is ONE
+    span resolved from its destination (its label is never scanned): an
+    item URL is the item; a comment / review / commit / event link is
+    evidence (its item's slug and number, a commit's sha) — unless its label
+    names that same item ("[#7486](.../pull/7486#issuecomment-1)": the
+    item); a link to any other host is `other_link`. Bare URLs likewise;
+    owner/repo#N and #N outside links are items (`slug` None: own_slug's
+    repository)."""
     spans = []
-    for m in _MD_LINK_RE.finditer(clause):
-        spans.append((m.start(), m.end(), m.group(2), m.group(1)))
-    for m in _URL_RE.finditer(clause):
-        if not any(a <= m.start() < b for a, b, _u, _l in spans):
+    for m in _MD_LINK_RE.finditer(text):
+        spans.append((m.start(), m.end(), m.group(2), m.group(1), "markdown"))
+    for m in _URL_RE.finditer(text):
+        if not any(a <= m.start() < b for a, b, _u, _l, _f in spans):
             url = m.group(0).rstrip(".,;:!?")
-            spans.append((m.start(), m.start() + len(url), url, None))
-    spans.sort()
+            spans.append((m.start(), m.start() + len(url), url, None, "url"))
     out = []
-    for a, b, url, label in spans:
-        out.append(clause[pos:a])
+    for a, b, url, label, form in spans:
         item = _ITEM_URL_RE.match(url)
         anchored = _EVIDENCE_URL_RE.match(url)
         named = _LABEL_REF_RE.match(label or "")
@@ -7617,58 +7645,128 @@ def _mask(clause, own_slug):
             item = anchored         # the label names the anchor's own item
             url = "https://github.com/{}/{}/{}".format(*anchored.group(1, 2, 3))
         if item:
-            refs.append(_ref_of(item.group(1), item.group(3), own_slug, url))
-            out.append(_R0 + str(len(refs) - 1) + _R1)
+            out.append(dict(_ref_of(item.group(1), item.group(3), own_slug, url),
+                            start=a, end=b, kind="item", form=form))
         elif anchored:
+            ev = {"start": a, "end": b, "kind": "evidence", "form": form, "url": url}
+            if anchored.group(3):
+                ev.update(_ref_of(anchored.group(1), anchored.group(3), own_slug))
+            else:
+                ev.update(_ref_of(anchored.group(4), 0, own_slug), number=None,
+                          sha=anchored.group(5))
+            out.append(ev)
+        else:
+            out.append({"start": a, "end": b, "kind": "other_link", "form": form,
+                        "url": url, "slug": None, "number": None})
+    blanked = list(text)
+    for a, b, _u, _l, _f in spans:
+        blanked[a:b] = " " * (b - a)
+    for m in _SHORT_REF_RE.finditer("".join(blanked)):
+        if m.group(1):
+            r = _ref_of(m.group(1), m.group(2), own_slug)
+            form = "short"
+        else:
+            r = _ref_of(None, m.group(3), own_slug)
+            form = "local"
+        out.append(dict(r, start=m.start(), end=m.end(), kind="item", form=form))
+    out.sort(key=lambda r: r["start"])
+    return out
+
+
+def item_refs(text, own_slug=None):
+    """Every issue / PR reference a text makes, by THE resolver the parser
+    uses (code fences, inline code, HTML comments and quoted blocks are not
+    read): [{repo, slug, number, url?, span (start, end), evidence, form,
+    sha?}] in order — `repo` the repository (own_slug for #N and own links;
+    None when unknown), `slug` None for own_slug's repository, `evidence`
+    true for a link to a comment, review, commit or event (its item's
+    number, None for a commit link: then `sha`), `form` markdown | url |
+    short | local. A link to another host is not a reference."""
+    out = []
+    for r in _scan_refs(_blank_unread(text), own_slug):
+        if r["kind"] == "other_link":
+            continue
+        row = {"repo": r["slug"] or own_slug, "slug": r["slug"], "number": r["number"],
+               "span": (r["start"], r["end"]), "evidence": r["kind"] == "evidence",
+               "form": r["form"]}
+        for k in ("url", "sha"):
+            if r.get(k):
+                row[k] = r[k]
+        out.append(row)
+    return out
+
+
+def _mask(clause, own_slug):
+    """The clause with every item reference (_scan_refs) replaced by an
+    atomic marker, every evidence link by a transparent one and any other
+    link by a plain word. (masked, refs)."""
+    refs, out, pos = [], [], 0
+    for r in _scan_refs(clause, own_slug):
+        out.append(clause[pos:r["start"]])
+        if r["kind"] == "item":
+            refs.append({k: r[k] for k in ("slug", "number", "url") if k in r})
+            out.append(_R0 + str(len(refs) - 1) + _R1)
+        elif r["kind"] == "evidence":
             out.append(_EV)
         else:
-            out.append(" \ue003 ")      # any other link: a word, not a connector
-        pos = b
+            out.append(" " + _OTHER + " ")
+        pos = r["end"]
     out.append(clause[pos:])
-    text = "".join(out)
-
-    def short(m):
-        if m.group(1):
-            refs.append(_ref_of(m.group(1), m.group(2), own_slug))
-        else:
-            refs.append(_ref_of(None, m.group(3), own_slug))
-        return _R0 + str(len(refs) - 1) + _R1
-    return _SHORT_REF_RE.sub(short, text), refs
+    return "".join(out), refs
 
 
 def parse_relation_claims(text, own_slug=None, default_subject=None):
     """THE reference-and-cue parser: the relation claims a text makes.
 
-    Per clause (relation_clauses): references are atomic (_mask); a cue
+    Per clause (relation_clauses — code, HTML comments and quoted blocks
+    are not read): references are atomic (_scan_refs); a cue
     (RELATION_CUE_PHRASES) right before a reference — at most two words
-    between — states a relation of its subject towards the references that
-    follow it, joined by commas / and / & / or (evidence links between them
-    are transparent), stopping at the first other text. The subject is the
-    reference right before the cue ("#2 is blocked by #3"), carried across
+    between, an opening parenthesis allowed — states a relation of its
+    subjects towards the references that follow it, joined by commas / and
+    / & / or (evidence links between them are transparent), stopping at
+    the first other text. The subjects are the references right before the
+    cue, joined the same way ("#30 and #31 depended on #12": one claim per
+    subject; "#12 is needed by #30"; "#8, which blocks #9"), carried across
     coordinated predicates ("#31 is a follow-up to #11 and was caused by
     #12" keeps #31), else `default_subject` (the text's own item). A cue
-    preceded by not / never / no longer is `negated`; was / were / had
-    (been) before it, or a past cue word, make `tense` "past". On a
-    task-list line every reference no cue claims is the line subject's
-    `depends_on` (`task` "open" / "done"). Any other reference is a
-    `mentions` claim. Returns [{subject, relation (as written), targets
-    [ref], tense, negated, task, span (start, end), quote}], refs as
-    {slug (None: this repository), number, [url]}; `subject` None means
-    `default_subject`."""
+    preceded by not / never / no longer is `negated` (its explicit subject
+    kept); "not blocked by #2 but by #3" also affirms the relation to #3.
+    was / were / had (been) before it, or a past cue word, make `tense`
+    "past". On a task-list line every reference no cue claims is the line
+    subject's `depends_on` (`task` "open" / "done"). Any other reference is
+    a `mentions` claim ("see #N", "fixes #N": never a dependency).
+
+    Returns [{subject, subjects, relation (as written), query_kind,
+    targets [ref], tense, negated, task, span (start, end), quote}]: refs
+    {slug (None: this repository), number, [url]}; `subject` one of
+    `subjects` (one claim per subject); `query_kind` the kind to check the
+    claim with in relation_holds — the relation, or the generic "waits_on"
+    for "waits on / waiting for / waited on" (any waiting relation)."""
     claims = []
     for start, clause in relation_clauses(text):
         masked, refs = _mask(clause, own_slug)
         task = _TASK_RE.match(masked)
         task_state = ("done" if task.group(1) in "xX" else "open") if task else None
-        claimed, prev_end, prev_subject = set(), None, None
-        quote = clause.strip()[:300]
+        claimed, prev_end, prev_subjects = set(), None, None
+        span = (start, start + len(clause))
+        quote = (text or "")[span[0]:span[1]].strip()[:300]     # the words as written
         cues = []
         for rel, rx in _CUE_RES:
             for m in rx.finditer(masked):
-                cues.append((m.start(), m.end(), rel, m))
+                cues.append((m.start(), m.end(), rel))
         cues.sort(key=lambda c: (c[0], -c[1]))
         taken = []
-        for a, b, rel, m in cues:
+
+        def emit(subjects, rel, targets, tense, negated, generic):
+            for s in subjects or [None]:
+                claims.append({"subject": refs[s] if s is not None else default_subject,
+                               "subjects": [refs[x] for x in subjects] if subjects
+                               else [default_subject],
+                               "relation": rel, "query_kind": generic or rel,
+                               "targets": [refs[i] for i in targets], "tense": tense,
+                               "negated": negated, "task": task_state, "span": span,
+                               "quote": quote})
+        for a, b, rel in cues:
             if any(x <= a < y for x, y in taken):
                 continue
             chain = re.match(_MCHAIN, masked[b:])
@@ -7678,30 +7776,38 @@ def parse_relation_claims(text, own_slug=None, default_subject=None):
             before = masked[:a]
             subj = _SUBJ_RE.search(before)
             if subj:
-                subject = int(subj.group(1))
+                subjects = [int(i) for i in re.findall(_MREF, subj.group(1))]
             elif prev_end is not None and _CARRY_RE.match(masked[prev_end:a]):
-                subject = prev_subject
+                subjects = prev_subjects
             else:
-                subject = None
+                subjects = []
             negated = bool(_NEG_RE.search(before))
             tense = "past" if (_PAST_RE.search(before) or _PAST_CUE_RE.match(masked[a:b])) \
                 else "present"
-            claims.append({"subject": refs[subject] if subject is not None else default_subject,
-                           "relation": rel, "targets": [refs[i] for i in targets],
-                           "tense": tense, "negated": negated, "task": task_state,
-                           "span": (start, start + len(clause)), "quote": quote})
+            generic = "waits_on" if rel == "blocked_by" and _WAIT_WORD_RE.match(masked[a:b]) \
+                else None
+            emit(subjects, rel, targets, tense, negated, generic)
+            end = b + chain.end()
             claimed.update(targets)
-            if subject is not None:
-                claimed.add(subject)
-            taken.append((a, b + chain.end()))
-            prev_end, prev_subject = b + chain.end(), subject
+            claimed.update(subjects)
+            but = _BUT_RE.match(masked[end:]) if negated else None
+            if but:
+                more = re.match(_MCHAIN, masked[end + but.end():])
+                if more:
+                    extra = [int(i) for i in re.findall(_MREF, more.group(0))]
+                    emit(subjects, rel, extra, tense, False, generic)
+                    claimed.update(extra)
+                    end += but.end() + more.end()
+            taken.append((a, end))
+            prev_end, prev_subjects = end, subjects
         for i, r in enumerate(refs):
             if i in claimed:
                 continue
             rel = "depends_on" if task else "mentions"
-            claims.append({"subject": default_subject, "relation": rel, "targets": [r],
+            claims.append({"subject": default_subject, "subjects": [default_subject],
+                           "relation": rel, "query_kind": rel, "targets": [r],
                            "tense": "present", "negated": False, "task": task_state,
-                           "span": (start, start + len(clause)), "quote": quote})
+                           "span": span, "quote": quote})
     return claims
 
 
@@ -7731,10 +7837,14 @@ def relation_mentions(text, own_slug=None):
 # -- states ---------------------------------------------------------------------
 
 def item_state(rec, day=None):
-    """THE state projection: an issue / PR record's state at the end of
-    `day` (YYYY-MM-DD or an instant; None: as recorded): `merged` (merged
-    by then), `closed` (closed by then), `open` (created by then, not yet
-    closed), `not_created` (created later); None without a record."""
+    """THE state projection and lifecycle replay of an issue / PR record at
+    the end of `day` (YYYY-MM-DD or an instant; None: as recorded):
+    `not_created` before `created_at`; then the latest of its recorded
+    lifecycle events through the day (closed, reopened, merged) and its
+    dated fields (`closed_at` for a closed record, `merged_at`) — a merge is
+    final; `open` when nothing closed it by then. One of open, closed,
+    merged, not_created; None without a record. Every reader of an item's
+    state on a day (relation ends, PR state claims) uses this."""
     if not rec:
         return None
     instant = day + "T23:59:59Z" if day and len(day) == 10 else day
@@ -7742,10 +7852,22 @@ def item_state(rec, day=None):
         return "not_created"
     if rec.get("merged") and rec.get("merged_at") and _not_after(rec["merged_at"], instant):
         return "merged"
-    if rec.get("state") == "closed" and _not_after(rec.get("closed_at") or rec.get("merged_at"),
-                                                   instant):
-        return "closed"
-    return "open"
+    seen = []
+    for e in rec.get("lifecycle") or []:
+        if isinstance(e, dict) and e.get("event") in ("closed", "reopened", "merged") \
+                and e.get("created_at") and _not_after(e["created_at"], instant):
+            if e["event"] == "merged":
+                return "merged"
+            seen.append((_parse_ts(e["created_at"]), 1 if e["event"] == "reopened" else 0,
+                         e["event"]))
+    closed_at = rec.get("closed_at") or rec.get("merged_at")
+    if rec.get("state") == "closed" and _not_after(closed_at, instant):
+        seen.append((_parse_ts(closed_at), 0, "closed"))
+    seen = [x for x in seen if x[0] is not None] or seen
+    if not seen:
+        return "open"
+    last = max(seen, key=lambda x: (x[0] is not None, x[0] or 0, x[1]))
+    return "open" if last[2] == "reopened" else "closed"
 
 
 _item_state = item_state
@@ -7841,6 +7963,9 @@ def relation_holds(view_or_members, from_item, to_item, kind, day=None, present=
     or a number (the first view's repository). `kind`: a relation as claimed
     — an inverse ("blocks", "needed_by", "followed_by", ...) is checked from
     the waiting side, also against an external target stored as written.
+    A generic word (GENERIC_RELATIONS) is any of its relations: "waits_on"
+    holds on a blocked_by, depends_on or stacked_on pair ("#7529 still waits
+    on #7374" holds on shared commits), "waited_on_by" on their inverses.
     `day`: evidence dated on or before it (default: the first view's end).
     `present`: the relation still in force on the day (not a ticked task,
     not a body edited after the window, both items open on the day by
@@ -7854,7 +7979,14 @@ def relation_holds(view_or_members, from_item, to_item, kind, day=None, present=
     meta = views[0].get("meta") or {}
     default = repo_slug(meta)
     day = day or (window_end_instant(meta) or "")[:10] or None
-    a, b, k = _normalise(_item_key(from_item, default), _item_key(to_item, default), kind)
+    fk, tk = _item_key(from_item, default), _item_key(to_item, default)
+    if kind == "waited_on_by":
+        fk, tk, kind = tk, fk, "waits_on"
+    if kind in GENERIC_RELATIONS:
+        a, b, kinds = fk, tk, set(GENERIC_RELATIONS[kind])
+    else:
+        a, b, k = _normalise(fk, tk, kind)
+        kinds = {k}
     recs = _record_index(views)
 
     def state_of(item):
@@ -7864,7 +7996,7 @@ def relation_holds(view_or_members, from_item, to_item, kind, day=None, present=
     for p in _all_evidence(views):
         pa, pb, pk = _normalise(_item_key(p["from_item"], default),
                                 _item_key(p["to_item"], default), p["relation"])
-        if (pa, pb, pk) != (a, b, k):
+        if (pa, pb) != (a, b) or pk not in kinds:
             continue
         ok, why = evidence_holds(p, day, present, state_of)
         if ok:
@@ -7879,6 +8011,42 @@ def relation_holds(view_or_members, from_item, to_item, kind, day=None, present=
         why = sorted(reasons, key=lambda r: order.index(r[0]))[-1][0]
         return {"holds": False, "reason": why, "evidence": [p for _w, p in reasons]}
     return {"holds": False, "reason": "no_evidence", "evidence": []}
+
+
+def record_superseded(view_or_members, item, by, day=None):
+    """Does the record say `item` was superseded by `by`? The ONE answer,
+    from the item's own close reason (`closed_unmerged.superseded_by`:
+    link.close_reason over its own comments, reviews and closing event — the
+    wider "superseded / replaced / consolidated / continued / moved ... by
+    / in #N" wording), never from shared commits (`content_landed_in` evidence
+    is where content went, not a supersession). Items as in relation_holds;
+    `day` (default: the first view's end): the statement written by then and
+    the item closed unmerged on the day. {"holds": True, "evidence":
+    {item, superseded_by, quote, named_in, by, at}} or {"holds": False,
+    "reason": no_record | not_stated | other_item | after_day | not_closed}."""
+    views = _views(view_or_members)
+    meta = (views[0].get("meta") or {}) if views else {}
+    default = repo_slug(meta)
+    day = day or (window_end_instant(meta) or "")[:10] or None
+    recs = _record_index(views)
+    ik, bk = _item_key(item, default), _item_key(by, default)
+    rec = recs.get(ik)
+    if rec is None:
+        return {"holds": False, "reason": "no_record"}
+    cu = rec[1].get("closed_unmerged") or {}
+    if not cu.get("superseded_by"):
+        return {"holds": False, "reason": "not_stated"}
+    ev = {"item": {"repo": ik[0], "number": ik[1]}, "superseded_by": cu["superseded_by"]}
+    for k in ("quote", "named_in", "by", "at"):
+        if cu.get(k):
+            ev[k] = cu[k]
+    if (ik[0], int(cu["superseded_by"])) != bk:
+        return {"holds": False, "reason": "other_item", "evidence": ev}
+    if day and cu.get("at") and cu["at"][:10] > day[:10]:
+        return {"holds": False, "reason": "after_day", "evidence": ev}
+    if item_state(rec[1], day) != "closed":
+        return {"holds": False, "reason": "not_closed", "evidence": ev}
+    return {"holds": True, "evidence": ev}
 
 
 # -- building -------------------------------------------------------------------
