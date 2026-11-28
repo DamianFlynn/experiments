@@ -6734,6 +6734,13 @@ def story_outcome(bundle, train, items, history, instant, texts, activity=None):
             out["ball"] = dict(main["ball"], pr=main["number"])
     elif open_issue_balls:
         out["ball"] = open_issue_balls[-1]
+    if out.get("ball"):
+        out["ball"] = blocked_ball(bundle, train, out["ball"])
+    # how this story depends on others (its stories.all row's relations)
+    rels = next((r.get("relations") for r in (bundle.get("stories") or {}).get("all") or []
+                 if r.get("id") == train.get("id")), None)
+    if rels:
+        out["relations"] = rels
     if waits:
         out["owner_response_requested"] = waits   # waits on the module owner
     linked, more = _linked_items(bundle, texts, own)
@@ -7279,7 +7286,8 @@ def _null_collections_to_empty(bundle):
 _SUPERSEDED_RE = re.compile(
     r"\b(superseded|replaced|consolidated|continued|covered|included|merged|moved|"
     r"folded|redone)\s+(?:by|in|into|with|as|via|under)\s+"
-    r"(?:(?:pull request|PR)\s+)?(?:#|https://github\.com/[\w.-]+/[\w.-]+/pull/)"
+    r"(?:[^\s#\[]+\s+){0,6}?"
+    r"(?:(?:pull request|PR)\s+)?\[?(?:#|https://github\.com/[\w.-]+/[\w.-]+/pull/)"
     r"(\d+)", re.I)
 
 
@@ -7311,9 +7319,12 @@ def content_landed_in(bundle, pr, instant):
     `named in the merge commit message`),
     commits [{sha, subject}]}]."""
     history = _pr_history_index(bundle)
-    mine = [c for c in _pr_content_commits_as_of(history.get(pr.get("number")), instant)
+    content = _pr_content_commits_as_of(history.get(pr.get("number")), instant)
+    # a subject match needs a subject long enough to mean something; the
+    # very same commit needs none
+    mine = [c for c in content
             if (c.get("subject") or "").strip() and len(c["subject"].strip()) >= 12]
-    if not mine:
+    if not content:
         return []
     merged = [p for p in bundle.get("prs") or [] if isinstance(p, dict) and p.get("merged")
               and p.get("number") != pr.get("number")
@@ -7331,7 +7342,7 @@ def content_landed_in(bundle, pr, instant):
         theirs = {(c.get("subject") or "").strip() for c in their_commits}
         shas = {c.get("sha") for c in their_commits}
         text = "\n".join(messages.get(p.get("number")) or [])
-        same_commit = [c for c in mine if c.get("sha") in shas]
+        same_commit = [c for c in content if c.get("sha") in shas]
         same = [c for c in mine if c not in same_commit and c["subject"].strip() in theirs]
         named = [c for c in mine if c not in same_commit and c not in same
                  and c["subject"].strip() in text]
@@ -7454,6 +7465,452 @@ def annotate_labels_as_of(bundle):
         if later:
             p["labels_as_of"]["changed_after"] = sorted(set(later))
     return bundle
+
+
+# --- How stories depend on each other: the relation layer ---------------------
+#
+# Issue #97, the owner: work "depends on other people and artifacts that have
+# to happen sometimes as reactions to limits that have to be addressed". A
+# relation between two trains is read from the explicit record only — words
+# next to a reference, a task list, GitHub's own references, shared commits,
+# content that landed elsewhere — never from similarity.
+
+RELATION_KINDS = ("blocked_by", "blocks", "depends_on", "needed_by", "follow_up_of",
+                  "followed_by", "caused_by", "causes", "stacked_on", "stacked_under",
+                  "content_landed_in", "content_from", "mentions", "mentioned_by")
+RELATION_INVERSE = {"blocked_by": "blocks", "blocks": "blocked_by",
+                    "depends_on": "needed_by", "needed_by": "depends_on",
+                    "follow_up_of": "followed_by", "followed_by": "follow_up_of",
+                    "caused_by": "causes", "causes": "caused_by",
+                    "stacked_on": "stacked_under", "stacked_under": "stacked_on",
+                    "content_landed_in": "content_from",
+                    "content_from": "content_landed_in",
+                    "mentions": "mentioned_by", "mentioned_by": "mentions"}
+# the relations in which the source waits on the target
+WAITING_RELATIONS = ("blocked_by", "depends_on", "stacked_on")
+RELATION_STRENGTH = {"blocked_by": 0, "blocks": 0, "depends_on": 1, "needed_by": 1,
+                     "stacked_on": 2, "caused_by": 3, "follow_up_of": 4, "followed_by": 4,
+                     "content_landed_in": 5, "mentions": 9}
+_REL_REF = (r"(?:\[?(?:https://github\.com/[\w.-]+/[\w.-]+/(?:issues|pull)/\d+"
+            r"|[\w.-]+/[\w.-]+#\d+|#\d+)\]?(?:\([^)\s]*\))?)")
+_REL_FILL = r"(?:[^\s#\[\],]+\s+){0,4}?"
+# (relation the TEXT's item has towards the reference, cue); first match wins
+RELATION_CUES = tuple((rel, re.compile(r"(?i)\b(?:" + cue + r")\s*:?\s+" + _REL_FILL
+                                       + r"(?=" + _REL_REF + r")"))
+                      for rel, cue in (
+    ("followed_by", r"follow[- ]?ups?\s+(?:is\s+|will\s+be\s+)?(?:in|at)|followed\s+by|"
+                    r"continued\s+in|tracked\s+in|will\s+be\s+(?:addressed|handled|done|fixed)\s+in"),
+    ("follow_up_of", r"follow[- ]?ups?\s+(?:to|of|on|from)|follows\s+up\s+on|continuation\s+of|"
+                     r"split\s+(?:out\s+)?(?:from|of)"),
+    ("blocked_by", r"blocked\s+(?:by|on)|waiting\s+(?:for|on)|on\s+hold\s+(?:until|for)"),
+    ("blocks", r"blocking|blocks"),
+    ("needed_by", r"needed\s+by|required\s+by|prerequisite\s+(?:for|of)"),
+    ("depends_on", r"depends\s+on|dependent\s+on|requires|needs|prerequisites?|"
+                   r"built\s+on|on\s+top\s+of"),
+    ("caused_by", r"caused\s+by|regression\s+(?:from|in|of)|broken\s+by|introduced\s+(?:by|in)|"
+                  r"due\s+to|because\s+of"),
+    ("content_landed_in", r"superseded\s+by|replaced\s+by|consolidated\s+(?:in|into)")))
+_TASK_LIST_RE = re.compile(r"(?m)^\s*[-*]\s+\[[ xX]\]\s+[^\n]*?(" + _REL_REF + ")")
+_REF_PARTS_RE = re.compile(
+    r"https://github\.com/([\w.-]+/[\w.-]+)/(?:issues|pull)/(\d+)"
+    r"|(?<![\w/.])([\w.-]+/[\w.-]+)#(\d+)|(?<![\w/&#])#(\d+)\b")
+WAITING_LABEL_RE = re.compile(r"(?i)\bblocked\b|on\s+hold|needs:\s*external|waiting")
+
+
+def _refs_in(text, own_slug):
+    """[(slug or None for this repository, number, start)] of the issue / PR
+    references in `text` (#N, owner/repo#N, a github.com link)."""
+    out = []
+    for m in _REF_PARTS_RE.finditer(text or ""):
+        if m.group(1):
+            slug, n = m.group(1), int(m.group(2))
+        elif m.group(3):
+            slug, n = m.group(3), int(m.group(4))
+        else:
+            slug, n = None, int(m.group(5))
+        if slug and own_slug and slug.lower() == own_slug.lower():
+            slug = None
+        out.append((slug, n, m.start()))
+    return out
+
+
+def relation_mentions(text, own_slug=None):
+    """[(relation, slug or None, number, quote)] — what one text says of the
+    items it references: a cue right before a reference (at most four words
+    between, in the same sentence) gives the relation of the TEXT's item
+    towards it ("blocked by #N", "blocking #N", "depends on #N", "follow-up
+    to / in #N", "caused by #N", "superseded by #N"); a task-list line naming
+    an item is `depends_on`; any other reference is a bare `mentions` (never
+    a dependency). The quote is the sentence."""
+    text = _HTML_COMMENT_RE.sub("", _FENCE_RE.sub("", text or ""))
+    found = {}
+    for m in _TASK_LIST_RE.finditer(text):
+        for slug, n, _s in _refs_in(m.group(1), own_slug):
+            found.setdefault((slug, n), ("depends_on", m.group(0).strip()))
+    sentences = re.split(r"(?<=[.!?])\s+|\n+|;\s*", text)
+    for sent in sentences:
+        cued = {}
+        for rel, rx in RELATION_CUES:
+            for m in rx.finditer(sent):
+                # the references chained right after the cue ("by #1 and #2")
+                tail = sent[m.end():]
+                chain = re.match(r"(" + _REL_REF + r"(?:\s*(?:,|and|&|or)\s*" + _REL_REF
+                                 + r")*)", tail)
+                if not chain:
+                    continue
+                for slug, n, _s in _refs_in(chain.group(1), own_slug):
+                    cued.setdefault((slug, n), rel)
+        for slug, n, _s in _refs_in(sent, own_slug):
+            key = (slug, n)
+            rel = cued.get(key, "mentions")
+            prev = found.get(key)
+            if prev is None or RELATION_STRENGTH.get(rel, 9) < RELATION_STRENGTH.get(prev[0], 9):
+                found[key] = (rel, sent.strip()[:300])
+    return [(rel, slug, n, quote) for (slug, n), (rel, quote) in found.items()]
+
+
+def _record_texts(rec, instant, typ):
+    """[(text, at, author, url, as_last_gathered)] of an item's body and
+    its comments, review comments and reviews written by the instant."""
+    out = []
+    if rec.get("body") and _not_after(rec.get("created_at"), instant):
+        out.append((rec["body"], rec.get("created_at"), rec.get("author"), rec.get("url"),
+                    bool(rec.get("body_as_of"))))
+    for key, ts in (("comments_list", "created_at"), ("review_comments", "created_at"),
+                    ("reviews", "submitted_at")):
+        for c in rec.get(key) or []:
+            if isinstance(c, dict) and c.get("body") and _not_after(c.get(ts), instant):
+                out.append((c["body"], c.get(ts), c.get("author"), c.get("url"), False))
+    return out
+
+
+def _item_state(rec, instant):
+    if not rec:
+        return None
+    if rec.get("merged") and _not_after(rec.get("merged_at"), instant):
+        return "merged"
+    if rec.get("state") == "closed" and _not_after(rec.get("closed_at"), instant):
+        return "closed"
+    return "open"
+
+
+def relation_target_kind(bundle, train_id):
+    """What kind of thing a related story is, for "waits on the pipeline
+    change #N" / "needs the X module, proposed in #M": `new_module_proposed`
+    (its PRs propose a module), a plumbing theme id (ci_workflows,
+    pipeline_utilities, test_environment, docs_generation, ...) or
+    `plumbing`, `docs`, `module_change` (it changes modules), `issue_request`
+    (an issue with no PR), else `other`."""
+    t = next((x for x in bundle.get("trains") or [] if x.get("id") == train_id), None)
+    if t is None:
+        return "other"
+    row = next((r for r in (bundle.get("stories") or {}).get("all") or []
+                if r.get("id") == train_id), {})
+    if row.get("new_module_proposed"):
+        return "new_module_proposed"
+    if row.get("group") == "plumbing" or (not row and _train_plumbing(
+            t, bundle.get("module_changes"), bundle)):
+        prs = set(t.get("prs") or [])
+        for th in bundle.get("plumbing_themes") or []:
+            if prs & {p.get("number") for p in th.get("prs") or []}:
+                return th.get("id") or "plumbing"
+        return "plumbing"
+    if t.get("kind") == "docs":
+        return "docs"
+    if t.get("modules") or row.get("modules"):
+        return "module_change"
+    if not t.get("prs"):
+        return "issue_request"
+    return "other"
+
+
+def build_story_relations(bundle):
+    """The relation layer of a story-layer view (one carrying `pr_history`):
+    `story_graph` {edges: [{from, to, relation, basis {kind, quote?, item
+    {type, number, url}, author?, at?, url?, text_as_last_gathered?},
+    as_of, target_state, waiting, target_kind}], chains, most_blocking,
+    external, rule} and, on every `stories.all[]` row, `relations` (from
+    that story's side). From the record only, as of the view's end: text
+    cues next to a reference (relation_mentions), task lists, stacked
+    commits (`belongs_to_pr` -> `stacked_on`), content that landed in a
+    merged PR (`closed_unmerged.content_landed_in`). A reference to another
+    repository is kept with its repository (`to` {repo, number, url},
+    `external`: true) for a group view to join (join_member_relations).
+    In place."""
+    if "pr_history" not in bundle:
+        return bundle
+    meta = bundle.get("meta") or {}
+    slug = repo_slug(meta) or ""
+    instant = window_end_instant(meta)
+    trains = bundle.get("trains") or []
+    train_of = {}
+    for t in trains:
+        for n in list(t.get("issues") or []) + list(t.get("prs") or []):
+            train_of.setdefault(n, t["id"])
+    recs = {}
+    for typ, key in (("issue", "issues"), ("pr", "prs")):
+        for r in bundle.get(key) or []:
+            if isinstance(r, dict) and r.get("number") is not None:
+                recs[r["number"]] = (typ, r)
+    known = [r.get("number") for _t, r in recs.values()
+             if _not_after(r.get("created_at"), instant)]
+    bound = max(known) if known else None
+    edges = {}
+
+    def key_of(tid):
+        return "{}:{}".format(slug, tid)
+
+    def add(src_n, rel, target, basis, at):
+        src_t = train_of.get(src_n)
+        if src_t is None:
+            return
+        if isinstance(target, int):
+            tgt_t = train_of.get(target)
+            if tgt_t is None or tgt_t == src_t:
+                return
+            to = key_of(tgt_t)
+            trec = recs.get(target, (None, None))
+            tstate = _item_state(trec[1], instant)
+            tkind = relation_target_kind(bundle, tgt_t)
+            item = {"type": trec[0], "number": target, "url": (trec[1] or {}).get("url")}
+        else:
+            to = target
+            tstate, tkind, item = None, "external", None
+        ek = (key_of(src_t), json.dumps(to, sort_keys=True), rel)
+        if ek in edges:
+            edges[ek]["bases"] += 1
+            return
+        e = {"from": key_of(src_t), "to": to, "relation": rel, "basis": basis,
+             "as_of": (at or "")[:10] or None, "target_kind": tkind, "bases": 1}
+        if item:
+            e["target_item"] = item
+        if tstate:
+            e["target_state"] = tstate
+            if rel in WAITING_RELATIONS:
+                e["waiting"] = tstate == "open"
+        if not isinstance(target, int):
+            e["external"] = True
+        edges[ek] = e
+    for n, (typ, rec) in sorted(recs.items()):
+        if n not in train_of:
+            continue
+        for text, at, author, url, later in _record_texts(rec, instant, typ):
+            for rel, rslug, rn, quote in relation_mentions(text, slug):
+                basis = {"kind": "text", "quote": quote,
+                         "item": {"type": typ, "number": n, "url": rec.get("url")},
+                         "author": author, "at": at, "url": url}
+                if later:
+                    basis["text_as_last_gathered"] = True
+                if rslug is None:
+                    if bound is not None and rn > bound:
+                        continue          # did not exist at the window's end
+                    if rel == "blocks":
+                        add(rn, "blocked_by", n, dict(basis, inverse_of="blocks"), at)
+                    elif rel == "needed_by":
+                        add(rn, "depends_on", n, dict(basis, inverse_of="needed_by"), at)
+                    elif rel == "followed_by":
+                        add(rn, "follow_up_of", n, dict(basis, inverse_of="followed_by"), at)
+                    else:
+                        add(n, rel, rn, basis, at)
+                else:
+                    target = {"repo": rslug, "number": rn,
+                              "url": "https://github.com/{}/issues/{}".format(rslug, rn)}
+                    add(n, rel, target, basis, at)
+    # stacked commits: a PR made from another PR's branch
+    for row in (bundle.get("pr_history") or {}).get("prs") or []:
+        if not isinstance(row, dict):
+            continue
+        owners = {}
+        for c in _pr_commits_as_of(row, instant):
+            if c.get("belongs_to_pr"):
+                owners.setdefault(c["belongs_to_pr"], []).append(c)
+        for owner, cs in owners.items():
+            add(row.get("number"), "stacked_on", owner,
+                {"kind": "stacked_commits", "commits": len(cs),
+                 "first": {"sha": cs[0].get("sha"), "subject": cs[0].get("subject")},
+                 "item": {"type": "pr", "number": row.get("number"),
+                          "url": (recs.get(row.get("number"), (None, {}))[1] or {}).get("url")}},
+                cs[-1].get("committed_at"))
+    # where a closed PR's content landed
+    for n, (typ, rec) in recs.items():
+        for landed in ((rec.get("closed_unmerged") or {}).get("content_landed_in") or []):
+            add(n, "content_landed_in", landed.get("pr"),
+                {"kind": "content_landed_in", "basis": landed.get("basis"),
+                 "commits": landed.get("commits"),
+                 "item": {"type": typ, "number": n, "url": rec.get("url")}},
+                rec.get("closed_at"))
+    out_edges = sorted(edges.values(), key=lambda e: (e["from"], json.dumps(e["to"]),
+                                                      e["relation"]))
+    bundle["story_graph"] = story_graph(out_edges)
+    _story_relation_rows(bundle, out_edges)
+    return bundle
+
+
+def story_graph(edges):
+    """{edges, chains (paths of at least two waiting edges: blocked_by /
+    depends_on / stacked_on, as story keys), most_blocking [{story,
+    waiting_stories, blocked}] (the stories most others wait on), external
+    [{repo, number, url, from}], rule}."""
+    waits = {}
+    for e in edges:
+        if e["relation"] in WAITING_RELATIONS and isinstance(e["to"], str):
+            waits.setdefault(e["from"], set()).add(e["to"])
+    chains = []
+
+    def walk(path):
+        nxt = sorted(waits.get(path[-1], set()) - set(path))
+        if not nxt:
+            if len(path) >= 3:
+                chains.append(list(path))
+            return
+        for x in nxt:
+            walk(path + [x])
+    for start in sorted(waits):
+        walk([start])
+    chains = [c for c in chains if not any(c != o and len(o) > len(c)
+                                          and o[-len(c):] == c for o in chains)]
+    chains.sort(key=lambda c: (-len(c), c))
+    incoming = {}
+    for e in edges:
+        if e["relation"] in WAITING_RELATIONS and isinstance(e["to"], str):
+            incoming.setdefault(e["to"], set()).add(e["from"])
+    most = sorted(({"story": k, "waiting_stories": len(v), "stories": sorted(v)}
+                   for k, v in incoming.items()), key=lambda r: (-r["waiting_stories"],
+                                                                r["story"]))
+    return {"edges": edges, "chains": chains[:20], "most_blocking": most[:10],
+            "external": [{"repo": e["to"]["repo"], "number": e["to"]["number"],
+                          "url": e["to"]["url"], "from": e["from"],
+                          "relation": e["relation"]}
+                         for e in edges if e.get("external")],
+            "rule": {"kinds": list(RELATION_KINDS),
+                     "waiting": list(WAITING_RELATIONS),
+                     "cue_window_words": 4,
+                     "note": "from explicit record only; a bare reference is `mentions`"}}
+
+
+def _story_relation_rows(bundle, edges):
+    """`relations` on every stories.all row, from that story's side:
+    [{relation, other, other_kind (target_kind), basis, as_of, waiting?,
+    other_state?, external?}], strongest first; and a `waits_on` clause in
+    the row's `status_reason` when it is blocked by an open item."""
+    rows = {r.get("id"): r for r in (bundle.get("stories") or {}).get("all") or []}
+    slug = repo_slug(bundle.get("meta")) or ""
+    by_story = {}
+    for e in edges:
+        src = e["from"].split(":", 1)[-1]
+        by_story.setdefault(src, []).append(
+            {k: v for k, v in (("relation", e["relation"]), ("other", e["to"]),
+                               ("other_kind", e["target_kind"]), ("basis", e["basis"]),
+                               ("as_of", e["as_of"]), ("waiting", e.get("waiting")),
+                               ("other_state", e.get("target_state")),
+                               ("other_item", e.get("target_item")),
+                               ("external", e.get("external"))) if v is not None})
+        if isinstance(e["to"], str) and e["to"].startswith(slug + ":"):
+            dst = e["to"].split(":", 1)[-1]
+            by_story.setdefault(dst, []).append(
+                {k: v for k, v in (("relation", RELATION_INVERSE[e["relation"]]),
+                                   ("other", e["from"]), ("basis", e["basis"]),
+                                   ("as_of", e["as_of"])) if v is not None})
+    for tid, rels in by_story.items():
+        row = rows.get(tid)
+        if row is None:
+            continue
+        rels.sort(key=lambda r: (RELATION_STRENGTH.get(r["relation"],
+                                                       RELATION_STRENGTH.get(
+                                                           RELATION_INVERSE.get(r["relation"]), 9)),
+                                 json.dumps(r.get("other"), sort_keys=True)))
+        row["relations"] = rels
+        waits = [r for r in rels if r["relation"] == "blocked_by" and r.get("waiting")]
+        if waits and row.get("status_reason"):
+            w = waits[0]
+            item = w.get("other_item") or {}
+            row["status_reason"] += "; waits on {} #{} (blocked by it: \"{}\")".format(
+                "PR" if item.get("type") == "pr" else "issue", item.get("number"),
+                (w["basis"].get("quote") or "")[:120])
+
+
+def blocked_ball(bundle, train, ball):
+    """R9 blocked by an open item: a story whose train has a `blocked_by`
+    edge to an item still open at the view's end waits on THAT item — when
+    the rule that fired is R2 / R3 / R4 / R7 / R8 (failing checks, an
+    outstanding change request and a named person stand). Returns the ball
+    with state `awaiting blocker`, `waits_on` [{story, item, quote, url}]
+    and `with` empty; else the ball unchanged."""
+    if not ball or ball.get("rule", "").split(" ")[0] not in ("R2", "R3", "R4", "R7", "R8"):
+        return ball
+    slug = repo_slug(bundle.get("meta")) or ""
+    me = "{}:{}".format(slug, train.get("id"))
+    waits = [e for e in (bundle.get("story_graph") or {}).get("edges") or []
+             if e["from"] == me and e["relation"] == "blocked_by" and e.get("waiting")]
+    if not waits:
+        return ball
+    out = dict(ball, state="awaiting blocker", rule="R9 blocked by an open item",
+               replaces_rule=ball.get("rule"))
+    out["with"] = []
+    out["waits_on"] = [{"story": e["to"], "item": e.get("target_item"),
+                        "quote": (e["basis"].get("quote") or "")[:200],
+                        "url": e["basis"].get("url")} for e in waits]
+    return out
+
+
+def join_member_relations(members):
+    """Across the members of one stream (digest): an edge of one member
+    whose target is another member's issue / PR (`external`, {repo,
+    number}) is resolved to that member's train (`to`: the other member's
+    story key `owner/repo:train-id`, `cross_member`: true, its target kind
+    and state), and the other member gains the inverse on its story row.
+    A reference to a repository outside the stream stays `external` with
+    no state claim. In place on each member's bundle."""
+    by_repo = {}
+    for m in members:
+        b = m.get("bundle") or {}
+        slug = repo_slug(b.get("meta")) or m.get("repo")
+        by_repo[(slug or "").lower()] = b
+    for m in members:
+        b = m.get("bundle") or {}
+        g = b.get("story_graph")
+        if not isinstance(g, dict):
+            continue
+        changed = False
+        for e in g.get("edges") or []:
+            to = e.get("to")
+            if not isinstance(to, dict):
+                continue
+            other = by_repo.get((to.get("repo") or "").lower())
+            if other is None:
+                continue
+            tid = next((t["id"] for t in other.get("trains") or []
+                        if to.get("number") in list(t.get("issues") or [])
+                        + list(t.get("prs") or [])), None)
+            if tid is None:
+                continue
+            oslug = repo_slug(other.get("meta")) or to["repo"]
+            rec = next((r for key in ("prs", "issues") for r in other.get(key) or []
+                        if r.get("number") == to["number"]), None)
+            instant = window_end_instant(b.get("meta"))
+            e["to"] = "{}:{}".format(oslug, tid)
+            e.pop("external", None)
+            e["cross_member"] = True
+            e["target_kind"] = relation_target_kind(other, tid)
+            e["target_item"] = {"type": "pr" if rec and rec in (other.get("prs") or [])
+                                else "issue", "number": to["number"],
+                                "url": (rec or {}).get("url") or to.get("url")}
+            st = _item_state(rec, instant)
+            if st:
+                e["target_state"] = st
+                if e["relation"] in WAITING_RELATIONS:
+                    e["waiting"] = st == "open"
+            orow = next((r for r in (other.get("stories") or {}).get("all") or []
+                         if r.get("id") == tid), None)
+            if orow is not None:
+                orow.setdefault("relations", []).append(
+                    {"relation": RELATION_INVERSE[e["relation"]], "other": e["from"],
+                     "basis": e["basis"], "as_of": e["as_of"], "cross_member": True})
+            changed = True
+        if changed:
+            b["story_graph"] = story_graph(g["edges"])
+            _story_relation_rows(b, g["edges"])
+    return members
 
 
 def annotate_pr_forks(bundle):
@@ -7583,6 +8040,8 @@ def enrich(bundle, priority_patterns=(), path_rules=(), people_source=None):
     # plumbing themes; omit-when-absent.
     build_story_list(bundle)
     build_plumbing_themes(bundle)
+    # how stories depend on each other (from the record only)
+    build_story_relations(bundle)
     annotate_issue_closing(bundle)
     annotate_module_ownership(bundle)
     annotate_module_lifecycle(bundle)

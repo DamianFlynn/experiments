@@ -1783,6 +1783,70 @@ derived once in link and carried on every row that needs it:
   removed}]}` — what a PR changed as a whole (gather `pr_net_files`), beside its
   description.
 
+### How stories depend on each other: `story_graph`, `stories.all[].relations`
+
+A relation between two trains comes from the explicit record only, never from
+similarity (`link.build_story_relations`), as of the view's end:
+
+- **Text next to a reference** (`link.relation_mentions`): in a PR / issue body (the
+  body as gathered: `basis.text_as_last_gathered` when it was edited after the window)
+  and in comments, review comments and reviews written by the view's end. A cue right
+  before a reference — at most four words between, in the same sentence or clause —
+  gives the relation of the TEXT's item towards the referenced one: `blocked_by`
+  ("blocked by / on", "waiting for / on", "on hold until"), `blocks` ("blocking",
+  "blocks"), `depends_on` ("depends on", "requires", "needs", "prerequisite", "built
+  on", "on top of"), `needed_by` ("needed by", "required by", "prerequisite for"),
+  `follow_up_of` ("follow-up to / of", "continuation of", "split from"), `followed_by`
+  ("follow-up in", "followed by", "continued in", "tracked in", "will be addressed in"),
+  `caused_by` ("caused by", "regression from", "broken by", "introduced by", "due to",
+  "because of"), `content_landed_in` ("superseded by", "replaced by", "consolidated
+  into"). A task-list line naming an item (`- [ ] #N`) is `depends_on`. Any other
+  reference is `mentions` — a bare reference is never a dependency. Each edge is
+  stored from the waiting side: `blocks` / `needed_by` / `followed_by` texts become the
+  other item's `blocked_by` / `depends_on` / `follow_up_of` (`basis.inverse_of` says so).
+- **Structure**: `stacked_on` (the PR's commits belong to another PR opened first:
+  `belongs_to_pr`, basis `stacked_commits`), `content_landed_in` (a closed PR's
+  `closed_unmerged.content_landed_in`).
+- A reference to an item created after the window's end is not used; a comment written
+  after it is not read; `target_state` is the target's state at the end (`open` /
+  `closed` / `merged`), and `waiting` (on `blocked_by` / `depends_on` / `stacked_on`)
+  is true only while the target is still open.
+- **Across repositories**: `owner/repo#N` and github.com links to another repository
+  are kept as `external` edges (`to` `{repo, number, url}`, no state claimed). In a
+  stream's digest (`digest.build_project_view`) `link.join_member_relations` resolves a
+  reference to another MEMBER to that member's train: `to` becomes its story key
+  `owner/repo:train-id`, `cross_member: true`, with its kind and state, and the other
+  member's story row gains the inverse relation. A repository outside the stream stays
+  `external`.
+
+`story_graph` `{edges: [{from, to, relation, basis {kind: text | stacked_commits |
+content_landed_in, quote?, item {type, number, url}, author?, at?, url?,
+inverse_of?, text_as_last_gathered?}, as_of, target_kind, target_item?, target_state?,
+waiting?, external?, cross_member?, bases}], chains (paths of at least two waiting
+edges, as story keys), most_blocking [{story, waiting_stories, stories}], external
+[{repo, number, url, from, relation}], rule}`; story keys are `owner/repo:train-id`.
+`target_kind` (`link.relation_target_kind`) says what the other story is:
+`new_module_proposed`, a plumbing theme id (`ci_workflows`, `pipeline_utilities`,
+`test_environment`, `docs_generation`, ...) or `plumbing`, `docs`, `module_change`,
+`issue_request`, `other`, `external`. Every `stories.all[]` row with any relation
+carries `relations` `[{relation, other, other_kind?, basis, as_of, waiting?,
+other_state?, other_item?, external?, cross_member?}]` from its own side (the inverse
+for the other end: `blocks`, `needed_by`, `followed_by`, `causes`, `stacked_under`,
+`content_from`, `mentioned_by`), strongest first; a slice's `outcome.relations` is the
+same list. A story blocked by an item still open at the end adds "waits on PR / issue
+#N (blocked by it: "<quote>")" to its `status_reason`, and its outcome ball follows
+**R9 blocked by an open item** — when the rule that fired is R2 / R3 / R4 / R7 / R8,
+`awaiting blocker` with `waits_on` `[{story, item, quote, url}]` and `replaces_rule`
+(failing checks, an outstanding change request and a named person stand). Group
+assignment does not change. `validate.story_graph_problem(view)` checks the shapes.
+
+What the store holds today: bodies, comments, review comments and reviews (text cues,
+task lists), closing and cross references (`closes`, `crossref_issues`: they join
+trains, so they relate items of one train), PR label history, PR histories (stacked
+commits), closed PRs' landed content. Not gathered: GitHub's tracked-by / sub-issue
+links (a gather change and a re-gather would add them); labels meaning "blocked" give
+no edge without a text naming the item.
+
 ### What a story can name (story-layer views)
 
 - **Linked items outside the window** — the per-window fact `linked_items`
