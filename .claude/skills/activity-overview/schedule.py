@@ -257,14 +257,34 @@ def _check_token_settings(value):
         return {}
     if not isinstance(value, dict):
         raise ConfigError("streams file: 'token' must be an object")
-    allowed = {"store", "env_file", "keychain_service", "probe_repo"}
+    allowed = {"store", "env_file", "keychain_service", "probe_repo", "app_id",
+               "client_id", "installation_id", "private_key_file",
+               "private_key_keychain_service"}
     extra = sorted(set(value) - allowed)
     if extra:
         raise ConfigError("streams file: token: unknown key(s) {} (allowed: {}; the "
-                          "token itself never goes in this file)".format(
+                          "token or key itself never goes in this file)".format(
                               ", ".join(extra), ", ".join(sorted(allowed))))
-    if value.get("store", "auto") not in ("auto", "keychain", "env-file"):
-        raise ConfigError("streams file: token.store must be auto, keychain or env-file")
+    if value.get("store", "auto") not in ("auto", "keychain", "env-file", "app"):
+        raise ConfigError("streams file: token.store must be auto, keychain, env-file "
+                          "or app")
+    for key in ("app_id", "installation_id"):
+        if key in value and (isinstance(value[key], bool)
+                             or not isinstance(value[key], int) or value[key] < 1):
+            raise ConfigError("streams file: token.{} must be a positive integer".format(key))
+    for key in ("client_id", "private_key_file", "private_key_keychain_service"):
+        if key in value and (not isinstance(value[key], str) or not value[key].strip()):
+            raise ConfigError("streams file: token.{} must be a non-empty string".format(key))
+    if "private_key_file" in value and "BEGIN" in value["private_key_file"]:
+        raise ConfigError("streams file: token.private_key_file is the PATH of the key "
+                          "file; the key itself never goes in this file")
+    if value.get("store") == "app":
+        if not (value.get("app_id") or value.get("client_id")):
+            raise ConfigError("streams file: token.store app needs token.client_id (or "
+                              "token.app_id)")
+        if not (value.get("private_key_file") or value.get("private_key_keychain_service")):
+            raise ConfigError("streams file: token.store app needs token.private_key_file "
+                              "or token.private_key_keychain_service")
     for key in ("env_file", "keychain_service", "probe_repo"):
         if key in value and (not isinstance(value[key], str) or not value[key].strip()):
             raise ConfigError("streams file: token.{} must be a non-empty string".format(key))
@@ -893,8 +913,16 @@ def manifest_project(stream):
     return raw.get("project") if isinstance(raw, dict) else None
 
 
+def manifest_failed_members(stderr_text):
+    """How many members a manifest gather reported failed (its summary line
+    `gather: N of M member(s) failed ...`), else None."""
+    m = re.search(r"^gather: (\d+) of \d+ member\(s\) failed", stderr_text or "", re.M)
+    return int(m.group(1)) if m else None
+
+
 def run_window(cfg, stream, win, log, env, run=run_subprocess, now=utc_now,
-               clock=time.monotonic, gather_script=None, commands=None):
+               clock=time.monotonic, gather_script=None, commands=None,
+               token_source=None):
     """Gather one window into a copy of its store, validate the copy, swap it
     in. Returns the attempt record (result 'ok' or the failing step).
     `commands` [(part, from, to, ref_date, argv with TMP_STORE)] replaces the
@@ -905,7 +933,7 @@ def run_window(cfg, stream, win, log, env, run=run_subprocess, now=utc_now,
     started, t0 = now(), clock()
     attempt = {"at": iso(started), "result": None, "reason": win["reason"],
                "from": win["from"], "to": win["to"], "ref_date": win["ref_date"],
-               "gathers": [], "validate": None, "error": None}
+               "gathers": [], "validate": None, "error": None, "auth_error": None}
     secrets = secrets_of(env)
     all_err = []
     try:
@@ -934,22 +962,67 @@ def run_window(cfg, stream, win, log, env, run=run_subprocess, now=utc_now,
             if argv is None:
                 argv = gather_argv(cfg, stream, frm, to, ref_date, tmp, mpath,
                                    gather_script=gather_script)
-            log("gather {} {} [{}..{}]: {}".format(stream["id"], part, frm, to,
-                                                   shlex.join(argv)))
-            g0 = clock()
-            code, out, err = run(argv, env)
-            out, err = redact(out, secrets), redact(err, secrets)
-            all_err.append(err)
-            for text in (out, err):
-                if text:
-                    log("\n".join("  | " + ln for ln in text.splitlines()), raw=True)
-            attempt["gathers"].append({"part": part, "from": frm, "to": to,
-                                       "ref_date": ref_date, "exit": code,
-                                       "duration_s": round(clock() - g0, 1)})
+            # With the app route, a manifest gather that fails only some members
+            # (e.g. ones reached after the installation token's hour) is
+            # resumed with a fresh token (`gather --resume` re-gathers just the
+            # members not ok for the window, with the whole member list), as
+            # long as each pass leaves fewer members failed.
+            run_argv, label, previous_failed, resumes = argv, part, None, 0
+            while True:
+                log("gather {} {} [{}..{}]: {}".format(stream["id"], label, frm, to,
+                                                       shlex.join(run_argv)))
+                step_env = env
+                if token_source is not None and commands is None:
+                    try:
+                        minted = token_source.mint()
+                    except AuthError as exc:
+                        attempt["result"] = "token_failed"
+                        attempt["error"] = "no installation token for the gather"
+                        attempt["auth_error"] = str(exc)
+                        return attempt
+                    step_env = dict(env)
+                    step_env.pop("GH_TOKEN", None)
+                    step_env["GITHUB_TOKEN"] = minted["token"]
+                    attempt["token"] = {"kind": "app",
+                                        "minted": (attempt.get("token") or {}).get(
+                                            "minted", 0) + 1,
+                                        "expires_at": minted.get("expires_at"),
+                                        "installation_id": minted.get("installation_id")}
+                    secrets = sorted(set(secrets) | set(secrets_of(step_env)),
+                                     key=len, reverse=True)
+                g0 = clock()
+                code, out, err = run(run_argv, step_env)
+                took = clock() - g0
+                out, err = redact(out, secrets), redact(err, secrets)
+                all_err.append(err)
+                for text in (out, err):
+                    if text:
+                        log("\n".join("  | " + ln for ln in text.splitlines()), raw=True)
+                attempt["gathers"].append({"part": label, "from": frm, "to": to,
+                                           "ref_date": ref_date, "exit": code,
+                                           "duration_s": round(took, 1)})
+                failed = manifest_failed_members(err) if code == 1 else None
+                if (token_source is not None and commands is None
+                        and stream["kind"] == "manifest" and failed
+                        and resumes < MAX_MANIFEST_RESUMES
+                        and (previous_failed is None or failed < previous_failed)):
+                    previous_failed, resumes = failed, resumes + 1
+                    run_argv = argv + ["--resume"]
+                    label = "{} (resume {})".format(part, resumes)
+                    log("gather {}: {} member(s) failed; resuming with a fresh "
+                        "installation token".format(stream["id"], failed))
+                    continue
+                break
             if code != 0:
                 attempt["result"] = "gather_failed"
                 attempt["error"] = "gather exited {} ({} {}..{})".format(
-                    code, part, frm, to)
+                    code, label, frm, to)
+                auth = auth_failure(err)
+                if auth and token_source is not None and took >= 55 * 60:
+                    auth += ("; the gather ran {:.0f} minutes, longer than the "
+                             "installation token's hour (docs/SCHEDULING.md 7)".format(
+                                 took / 60))
+                attempt["auth_error"] = auth
                 return attempt
         vargv = validate_argv(stream, tmp, project)
         log("validate {}: {}".format(stream["id"], shlex.join(vargv)))
@@ -989,8 +1062,9 @@ def run_window(cfg, stream, win, log, env, run=run_subprocess, now=utc_now,
         if attempt["result"] != "ok":
             _remove(tmp)
         attempt["notes"] = gather_notes("\n".join(all_err))
-        attempt["auth_error"] = auth_failure("\n".join(all_err)) \
-            if attempt["result"] == "gather_failed" else None
+        if attempt.get("auth_error") is None:
+            attempt["auth_error"] = auth_failure("\n".join(all_err)) \
+                if attempt["result"] == "gather_failed" else None
         attempt["duration_s"] = round(clock() - t0, 1)
         attempt["finished_at"] = iso(now())
 
@@ -1077,7 +1151,8 @@ def select_streams(cfg, ids):
 
 def cmd_run(cfg, args, run=run_subprocess, now=utc_now, clock=time.monotonic,
             version_of=code_version, gather_script=None, base_env=None,
-            isdir=os.path.isdir, http_get=None):
+            isdir=os.path.isdir, http_get=None, api=None, sign=None, security=None,
+            **_ignored):
     started = now()
     today = args.today or started.date()
     streams = select_streams(cfg, args.stream)
@@ -1111,7 +1186,15 @@ def cmd_run(cfg, args, run=run_subprocess, now=utc_now, clock=time.monotonic,
         return EXIT_OK
 
     env = dict(os.environ if base_env is None else base_env)
-    if not (env.get("GITHUB_TOKEN") or env.get("GH_TOKEN")):
+    settings = token_settings(cfg)
+    token_source = None
+    if settings["store"] == "app":
+        # a fresh installation token per gather; none is needed in the environment
+        token_source = AppTokens(settings, api=api, now=now, sign=sign,
+                                 security=security, isdir=isdir)
+        env.pop("GITHUB_TOKEN", None)
+        env.pop("GH_TOKEN", None)
+    elif not (env.get("GITHUB_TOKEN") or env.get("GH_TOKEN")):
         sys.stderr.write("schedule.py: error: set GITHUB_TOKEN (or GH_TOKEN) for the "
                          "gather (docs/SCHEDULING.md \"The token\")\n")
         return EXIT_USAGE
@@ -1136,9 +1219,14 @@ def cmd_run(cfg, args, run=run_subprocess, now=utc_now, clock=time.monotonic,
             log("warning: " + w)
         # One identity call: the token's expiry (and an early word when GitHub
         # refuses it). A failure here never stops the run: gather decides.
-        token = check_token(env.get("GITHUB_TOKEN") or env.get("GH_TOKEN"),
-                            http_get or default_http_get, now=now)
+        if token_source is not None:
+            token = app_token_status(token_source, now=now)
+        else:
+            token = check_token(env.get("GITHUB_TOKEN") or env.get("GH_TOKEN"),
+                                http_get or default_http_get, now=now)
+            token["kind"] = "personal"
         rollup["token"] = token
+        rollup["token_kind"] = token["kind"]
         rollup["token_expires_at"] = token.get("expires_at")
         rollup["token_days_left"] = token.get("days_left")
         log("token: " + describe_token(token))
@@ -1159,7 +1247,8 @@ def cmd_run(cfg, args, run=run_subprocess, now=utc_now, clock=time.monotonic,
                     log("stream {} window {} ({})".format(s["id"], win["month"],
                                                           win["reason"]))
                     attempt = run_window(cfg, s, win, log, senv, run=run, now=now,
-                                         clock=clock, gather_script=gather_script)
+                                         clock=clock, gather_script=gather_script,
+                                         token_source=token_source)
                     log("stream {} window {}: {}{} in {}s".format(
                         s["id"], win["month"], attempt["result"],
                         " - " + attempt["error"] if attempt.get("error") else "",
@@ -1327,6 +1416,14 @@ def check_token(token, http_get, probe=None, now=utc_now):
 
 
 def describe_token(info):
+    if info.get("kind") == "app":
+        who = "app {} installation {}{}".format(
+            info.get("client_id") or info.get("app_id"), info.get("installation_id"),
+            " on " + info["account"] if info.get("account") else "")
+        if info.get("error"):
+            return "{}: {}".format(who, info["error"])
+        return "{} - installation token minted, expires {} (one hour; a new one is " \
+               "minted for every gather)".format(who, info.get("expires_at"))
     if info.get("error"):
         return info["error"]
     if info.get("expires_at"):
@@ -1339,6 +1436,12 @@ def token_warning(info):
     """A one-line warning when the token is refused or expires within
     TOKEN_WARN_DAYS days, else None."""
     if not info:
+        return None
+    if info.get("kind") == "app":
+        # no expiry to warn about: every gather mints its own one-hour token
+        if info.get("error"):
+            return "the app could not mint a token: {} - run `schedule.py token " \
+                   "app-check` (docs/SCHEDULING.md 7)".format(info["error"])
         return None
     if info.get("error") and "refused" in info["error"]:
         return "the token was refused: {} - run `schedule.py token renew`".format(
@@ -1361,7 +1464,14 @@ def token_settings(cfg, args=None):
             "env_file": os.path.expanduser(getattr(args, "env_file", None)
                                            or t.get("env_file") or DEFAULT_ENV_FILE),
             "keychain_service": t.get("keychain_service") or DEFAULT_KEYCHAIN_SERVICE,
-            "account": os.environ.get("USER") or os.environ.get("LOGNAME") or "user"}
+            "account": os.environ.get("USER") or os.environ.get("LOGNAME") or "user",
+            # the app route (store "app"): ids and where the key is, never the key
+            "app_id": t.get("app_id"), "client_id": t.get("client_id"),
+            "installation_id": t.get("installation_id"),
+            "private_key_file": os.path.expanduser(t["private_key_file"])
+            if t.get("private_key_file") else None,
+            "private_key_keychain_service": t.get("private_key_keychain_service"),
+            "workspace": cfg.get("workspace")}
 
 
 def run_security(argv, stdin_text=None):
@@ -1464,12 +1574,412 @@ def default_spawn(argv, env):
                      start_new_session=True)
 
 
+# --- the app route: installation tokens minted per gather ---------------------------
+#
+# A GitHub App installed on the owner's own account (docs/SCHEDULING.md 7)
+# needs no weekly step: for every gather the runner signs a short JWT with
+# the app's private key (RS256, through the system `openssl`, so no package
+# is needed), finds the installation, and asks for an installation token
+# narrowed to read access. The token lasts one hour (GitHub's documented
+# lifetime), so one is minted per gather invocation, never per run. The key
+# stays in its mode-600 file (or the keychain) and goes to openssl as a file
+# path or through a pipe; neither the key, the JWT nor a token reaches an
+# argv, a log or a status file.
+
+JWT_BACKDATE_S = 60       # GitHub: set iat 60 seconds in the past (clock drift)
+JWT_LIFETIME_S = 540      # GitHub: exp no more than 10 minutes ahead; 9 leaves margin
+MAX_MANIFEST_RESUMES = 4  # fresh-token `--resume` passes after a manifest gather
+
+
+class AuthError(Exception):
+    """The app could not produce a token; the message is plain and safe to
+    record (it never holds the key, the JWT or a token)."""
+
+
+def b64url(data):
+    import base64
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def jwt_claims(issuer, now_epoch):
+    return {"iat": int(now_epoch) - JWT_BACKDATE_S,
+            "exp": int(now_epoch) + JWT_LIFETIME_S, "iss": str(issuer)}
+
+
+def openssl_sign(key, data):
+    """RS256 signature of `data` with `openssl dgst -sha256 -sign` (documented
+    by OpenSSL and by LibreSSL, which macOS ships). `key` is ("file", path),
+    or ("pem", bytes) handed to openssl through a pipe (/dev/fd/N), so the key
+    is never written to disk or put on a command line."""
+    try:
+        if key[0] == "file":
+            proc = subprocess.run(["openssl", "dgst", "-sha256", "-sign", key[1]],
+                                  input=data, capture_output=True)
+        else:
+            r, w = os.pipe()
+            try:
+                os.write(w, key[1])
+                os.close(w)
+                w = None
+                proc = subprocess.run(["openssl", "dgst", "-sha256", "-sign",
+                                       "/dev/fd/{}".format(r)], input=data,
+                                      capture_output=True, pass_fds=(r,))
+            finally:
+                os.close(r)
+                if w is not None:
+                    os.close(w)
+    except FileNotFoundError:
+        raise AuthError("the app route needs the `openssl` command; none was found")
+    except OSError as exc:
+        raise AuthError("openssl could not be run: {}".format(exc))
+    if proc.returncode != 0 or not proc.stdout:
+        first = (proc.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        raise AuthError("openssl could not sign with the app's private key (exit {}{})"
+                        .format(proc.returncode, ": " + first[0][:200] if first else ""))
+    return proc.stdout
+
+
+def make_jwt(issuer, key, now_epoch, sign=openssl_sign):
+    header = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")))
+    payload = b64url(json.dumps(jwt_claims(issuer, now_epoch), separators=(",", ":")))
+    signing_input = "{}.{}".format(header, payload)
+    return "{}.{}".format(signing_input, b64url(sign(key, signing_input.encode("ascii"))))
+
+
+def _inside(path, folder):
+    try:
+        return os.path.commonpath([os.path.realpath(path),
+                                   os.path.realpath(folder)]) == os.path.realpath(folder)
+    except ValueError:
+        return False
+
+
+def load_app_key(settings, security=run_security, isdir=os.path.isdir):
+    """Where the app's private key is, checked: ("file", path) for a mode-600
+    PEM file outside the workspace and any synced folder, or ("pem", bytes)
+    from the keychain item (base64 of the PEM, see `token app-key`)."""
+    path = settings.get("private_key_file")
+    if path:
+        if not os.path.isfile(path):
+            raise AuthError("the app's private key file {} does not exist".format(path))
+        mode = os.stat(path).st_mode & 0o777
+        if mode & 0o077:
+            raise AuthError("the app's private key file {} is mode {:o}; it must be "
+                            "600 (chmod 600 it)".format(path, mode))
+        if settings.get("workspace") and _inside(path, settings["workspace"]):
+            raise AuthError("the app's private key file {} is inside the workspace; "
+                            "keep it outside (e.g. ~/.config/activity-overview/)".format(path))
+        reasons = synced_folder_reasons(os.path.dirname(path), isdir=isdir)
+        if reasons:
+            raise AuthError("the app's private key file {} looks synced ({}); keep it "
+                            "on a local, non-synced disk".format(path, "; ".join(reasons)))
+        try:
+            with open(path, "rb") as fh:
+                head = fh.read(64)
+        except OSError as exc:
+            raise AuthError("the app's private key file {} cannot be read: {}".format(
+                path, exc.strerror or exc))
+        if b"PRIVATE KEY" not in head:
+            raise AuthError("{} is not a PEM private key".format(path))
+        return ("file", path)
+    svc = settings.get("private_key_keychain_service")
+    if not svc:
+        raise AuthError("no app private key configured (token.private_key_file or "
+                        "token.private_key_keychain_service)")
+    import base64
+    import binascii
+    code, out = security(["security", "find-generic-password", "-a",
+                          settings["account"], "-s", svc, "-w"])
+    if code != 0 or not out.strip():
+        raise AuthError("no app private key in the keychain item {!r}".format(svc))
+    try:
+        pem = base64.b64decode(out.strip(), validate=True)
+    except (binascii.Error, ValueError):
+        raise AuthError("the keychain item {!r} does not hold a key stored by "
+                        "`token app-key`".format(svc))
+    if b"PRIVATE KEY" not in pem:
+        raise AuthError("the keychain item {!r} does not hold a PEM private key".format(svc))
+    return ("pem", pem)
+
+
+def default_api(method, url, bearer, body=None, timeout=30):
+    """One request to api.github.com with a Bearer credential (a JWT or a
+    token): (status, headers, body text); (None, {}, reason) when it could
+    not be sent."""
+    import urllib.error
+    import urllib.request
+    if not url.startswith(API + "/"):
+        raise ValueError("credentials are only sent to " + API)
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "Authorization": "Bearer " + bearer, "Accept": "application/vnd.github+json",
+        "User-Agent": "activity-overview-schedule", "X-GitHub-Api-Version": "2022-11-28",
+        **({"Content-Type": "application/json"} if data is not None else {})})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return (resp.status, {k.lower(): v for k, v in resp.headers.items()},
+                    resp.read(262144).decode("utf-8", "replace"))
+    except urllib.error.HTTPError as err:
+        return (err.code, {k.lower(): v for k, v in (err.headers or {}).items()},
+                err.read(65536).decode("utf-8", "replace"))
+    except (OSError, ValueError) as exc:
+        return None, {}, str(exc)
+
+
+def _refusal(what, status, body):
+    if status is None:
+        return "{}: GitHub could not be reached ({})".format(what, body)
+    msg = _api_message(body)
+    return "{} ({}{})".format(what, status, ": " + msg if msg else "")
+
+
+class AppTokens:
+    """Mints installation tokens for the configured app. `mint()` returns
+    {token, expires_at, app_id, client_id, installation_id, account,
+    permissions}; `public(info)` is the same without the token."""
+
+    def __init__(self, settings, api=None, now=utc_now, sign=None, security=None,
+                 isdir=os.path.isdir):
+        self.settings = settings
+        self.api = api or default_api
+        self.now = now
+        self.sign = sign or openssl_sign
+        self.security = security or run_security
+        self.isdir = isdir
+        self.minted = 0
+
+    def jwt(self):
+        key = load_app_key(self.settings, self.security, self.isdir)
+        issuer = self.settings.get("client_id") or self.settings.get("app_id")
+        return make_jwt(issuer, key, self.now().timestamp(), self.sign)
+
+    def installation(self, jwt):
+        inst_id = self.settings.get("installation_id")
+        if inst_id:
+            status, _h, body = self.api("GET", "{}/app/installations/{}".format(
+                API, inst_id), jwt)
+            if status == 404:
+                raise AuthError("installation {} was not found for this app (is it "
+                                "installed, and is token.installation_id right?)".format(
+                                    inst_id))
+            if status != 200:
+                raise AuthError(_refusal("GitHub refused the app's JWT", status, body)
+                                + "; check token.client_id / app_id, the key and the clock")
+            return json.loads(body)
+        status, _h, body = self.api("GET", API + "/app/installations?per_page=100", jwt)
+        if status != 200:
+            raise AuthError(_refusal("GitHub refused the app's JWT", status, body)
+                            + "; check token.client_id / app_id, the key and the clock")
+        installs = json.loads(body) or []
+        if len(installs) != 1:
+            raise AuthError(
+                "the app is not installed anywhere: install it on your account"
+                if not installs else
+                "the app has {} installations ({}); set token.installation_id".format(
+                    len(installs), ", ".join("{} on {}".format(
+                        i.get("id"), (i.get("account") or {}).get("login"))
+                        for i in installs)))
+        return installs[0]
+
+    def mint(self):
+        jwt = self.jwt()
+        inst = self.installation(jwt)
+        # read access only: every permission the installation holds, at `read`
+        perms = {k: "read" for k in sorted(inst.get("permissions") or {})} \
+            or {"metadata": "read"}
+        status, _h, body = self.api("POST", "{}/app/installations/{}/access_tokens".format(
+            API, inst["id"]), jwt, {"permissions": perms})
+        if status != 201:
+            raise AuthError(_refusal("GitHub refused the installation token", status, body))
+        data = json.loads(body)
+        if not data.get("token"):
+            raise AuthError("GitHub answered without an installation token")
+        self.minted += 1
+        return {"token": data["token"], "expires_at": data.get("expires_at"),
+                "app_id": self.settings.get("app_id") or inst.get("app_id"),
+                "client_id": self.settings.get("client_id"),
+                "installation_id": inst.get("id"),
+                "account": (inst.get("account") or {}).get("login"),
+                "permissions": data.get("permissions") or perms}
+
+    @staticmethod
+    def public(info):
+        return {k: v for k, v in info.items() if k != "token"}
+
+
+def app_token_status(source, now=utc_now):
+    """Mint once, keep only what is not secret: the status `token` entry."""
+    out = {"kind": "app", "ok": False, "checked_at": iso(now()), "error": None,
+           "app_id": source.settings.get("app_id"),
+           "client_id": source.settings.get("client_id"),
+           "installation_id": source.settings.get("installation_id"),
+           "account": None, "expires_at": None, "days_left": None}
+    try:
+        info = source.mint()
+    except AuthError as exc:
+        out["error"] = str(exc)
+        return out
+    out.update(AppTokens.public(info))
+    out["ok"] = True
+    return out
+
+
+def app_check(source, probe, api, now=utc_now):
+    """Mint an installation token and prove it against the real target:
+    rate limit, a REST read, a GraphQL read and a search of `probe`. Prints
+    what GitHub answered for each, never the token. Usable = minted, and the
+    REST and GraphQL reads succeed (search only feeds the newcomers check)."""
+    out = sys.stdout.write
+    try:
+        info = source.mint()
+    except AuthError as exc:
+        out("installation token: FAILED - {}\n".format(exc))
+        out("RESULT: NOT USABLE (no installation token; see docs/SCHEDULING.md 7)\n")
+        return EXIT_FAILED
+    token = info.pop("token")
+    out("installation token: minted for app {} installation {} on {}, expires {}, "
+        "permissions {}\n".format(info.get("client_id") or info.get("app_id"),
+                                  info.get("installation_id"), info.get("account"),
+                                  info.get("expires_at"),
+                                  json.dumps(info.get("permissions"), sort_keys=True)))
+    owner, _sep, name = probe.partition("/")
+    results = {}
+
+    def report(label, status, body, ok, detail):
+        results[label] = ok
+        out("{}: {} - {}\n".format(label, "OK" if ok else "FAILED",
+                                   "HTTP {}; {}".format(status, detail)
+                                   if status is not None else detail))
+
+    status, _h, body = api("GET", API + "/rate_limit", token)
+    try:
+        res = (json.loads(body) or {}).get("resources") or {}
+        detail = ", ".join("{} {}/{}".format(k, res[k].get("remaining"), res[k].get("limit"))
+                           for k in ("core", "graphql", "search") if k in res) \
+            or _api_message(body)
+    except (ValueError, AttributeError):
+        detail = _api_message(body) or str(body)[:200]
+    report("rate limit (REST GET /rate_limit)", status, body, status == 200, detail)
+
+    status, _h, body = api("GET", "{}/repos/{}".format(API, probe), token)
+    try:
+        data = json.loads(body) or {}
+    except ValueError:
+        data = {}
+    ok = status == 200 and data.get("full_name", "").lower() == probe.lower()
+    report("REST read (GET /repos/{})".format(probe), status, body, ok,
+           "{} ({}, default branch {})".format(data.get("full_name"), data.get("visibility"),
+                                               data.get("default_branch"))
+           if ok else _api_message(body) or str(body)[:200])
+
+    query = ("query($owner:String!,$name:String!){repository(owner:$owner,name:$name)"
+             "{nameWithOwner defaultBranchRef{name} pullRequests(states:MERGED){totalCount}}"
+             " rateLimit{limit remaining}}")
+    status, _h, body = api("POST", API + "/graphql", token,
+                           {"query": query, "variables": {"owner": owner, "name": name}})
+    try:
+        data = json.loads(body) or {}
+    except ValueError:
+        data = {}
+    repo = (data.get("data") or {}).get("repository") or {}
+    ok = status == 200 and not data.get("errors") and bool(repo)
+    report("GraphQL read (repository {})".format(probe), status, body, ok,
+           "{}: {} merged PRs; rate limit {}/{}".format(
+               repo.get("nameWithOwner"), (repo.get("pullRequests") or {}).get("totalCount"),
+               ((data.get("data") or {}).get("rateLimit") or {}).get("remaining"),
+               ((data.get("data") or {}).get("rateLimit") or {}).get("limit"))
+           if ok else "; ".join(e.get("message", "") for e in data.get("errors") or [])
+           or _api_message(body) or str(body)[:200])
+
+    status, _h, body = api("GET", "{}/search/issues?q=repo:{}+is:pr&per_page=1".format(
+        API, probe), token)
+    try:
+        total = (json.loads(body) or {}).get("total_count")
+    except ValueError:
+        total = None
+    report("search (GET /search/issues, newcomers check only)", status, body,
+           status == 200, "{} PRs".format(total) if status == 200
+           else _api_message(body) or str(body)[:200])
+    usable = all(v for k, v in results.items() if k.startswith(("REST read", "GraphQL")))
+    out("RESULT: {}\n".format(
+        "USABLE - the nightly run can use the app route" if usable else
+        "NOT USABLE - keep the personal token (token renew, docs/SCHEDULING.md 7.2)"))
+    return EXIT_OK if usable else EXIT_FAILED
+
+
+def app_key_import(settings, path, security=run_security):
+    """Put the app's PEM private key into the keychain item
+    token.private_key_keychain_service, base64-encoded on one line, through
+    `security -i` (stdin), then read it back and compare."""
+    import base64
+    svc = settings.get("private_key_keychain_service")
+    if not svc:
+        sys.stderr.write("schedule.py: error: set token.private_key_keychain_service in "
+                         "the streams file first\n")
+        return EXIT_USAGE
+    try:
+        with open(os.path.expanduser(path), "rb") as fh:
+            pem = fh.read()
+    except OSError as exc:
+        sys.stderr.write("token app-key: cannot read {}: {}\n".format(path, exc.strerror))
+        return EXIT_FAILED
+    if b"PRIVATE KEY" not in pem:
+        sys.stderr.write("token app-key: {} is not a PEM private key\n".format(path))
+        return EXIT_FAILED
+    acct = settings["account"]
+    for name, value in (("account", acct), ("keychain service", svc)):
+        if not re.fullmatch(r"[A-Za-z0-9._@-]+", value):
+            sys.stderr.write("token app-key: the {} {!r} must be letters, digits, '.', "
+                             "'_', '@' or '-'\n".format(name, value))
+            return EXIT_FAILED
+    value = base64.b64encode(pem).decode("ascii")
+    code, _out = security(["security", "-i"], "add-generic-password -U -a {} -s {} -T "
+                          "/usr/bin/security -w {}\n".format(acct, svc, value))
+    back = security(["security", "find-generic-password", "-a", acct, "-s", svc, "-w"])
+    if code != 0 or back[0] != 0 or back[1].strip() != value:
+        sys.stderr.write("token app-key: the keychain item {!r} could not be stored and "
+                         "read back; keep using token.private_key_file\n".format(svc))
+        return EXIT_FAILED
+    sys.stderr.write("token app-key: stored in the keychain item {!r}. Remove "
+                     "token.private_key_file from the streams file to use it, and keep "
+                     "or delete {} as you see fit\n".format(svc, path))
+    return EXIT_OK
+
+
 def cmd_token(cfg, args, http_get=None, prompt=None, open_browser=None,
-              security=None, spawn=None, now=utc_now, **_ignored):
+              security=None, spawn=None, now=utc_now, api=None, sign=None,
+              **_ignored):
     http_get = http_get or default_http_get
     security = security or run_security
     settings = token_settings(cfg, args)
     out = sys.stdout.write
+    if args.token_cmd == "kind":
+        out(settings["store"] + "\n")
+        return EXIT_OK
+    if args.token_cmd in ("app-check", "app-key") or (
+            settings["store"] == "app" and args.token_cmd == "status"):
+        if not (settings.get("client_id") or settings.get("app_id")) and \
+                args.token_cmd != "app-key":
+            sys.stderr.write("schedule.py: error: the streams file's token block has no "
+                             "client_id / app_id (docs/SCHEDULING.md 7)\n")
+            return EXIT_USAGE
+        source = AppTokens(settings, api=api, now=now, sign=sign, security=security)
+        if args.token_cmd == "app-key":
+            return app_key_import(settings, args.import_path, security)
+        if args.token_cmd == "status":
+            info = app_token_status(source, now=now)
+            out("token: {}\n".format(describe_token(info)))
+            return EXIT_OK if info["ok"] else EXIT_FAILED
+        return app_check(source, probe_repo(cfg) or "Azure/bicep-registry-modules",
+                         api or default_api, now=now)
+    if settings["store"] == "app" and args.token_cmd == "renew" and not args.store:
+        sys.stderr.write("token renew: the streams file uses the app route (token.store "
+                         "app), which needs no weekly renewal. For the personal-token "
+                         "fallback pass --store keychain (or env-file) and set "
+                         "token.store to match (docs/SCHEDULING.md 7.2)\n")
+        return EXIT_USAGE
     if args.token_cmd == "status":
         token = read_stored_token(settings, security)
         if not token:
@@ -1917,6 +2427,9 @@ commands:
                [--classic] [--no-browser] [--kick] [--kick-here]
   token status --streams FILE [--store keychain|env-file] [--env-file PATH]
   token remind --streams FILE
+  token kind   --streams FILE
+  token app-check --streams FILE
+  token app-key   --streams FILE --import PEM
 """
 
 
@@ -1979,7 +2492,14 @@ def parse_args(argv):
                                  "prompt, check it, then store it"),
                        ("status", "the stored token's login, expiry and days left"),
                        ("remind", "print a one-line reminder when the token expires "
-                                  "within 2 days or was refused (no network)")):
+                                  "within 2 days or was refused (no network)"),
+                       ("kind", "print where the token comes from: app, keychain "
+                                "or env-file (for the wrappers)"),
+                       ("app-check", "mint an installation token and prove it: rate "
+                                     "limit, REST, GraphQL and search reads of "
+                                     "token.probe_repo"),
+                       ("app-key", "store the app's PEM private key in the keychain "
+                                   "item token.private_key_keychain_service")):
         t = tks.add_parser(name, parents=[common], help=text)
         t.add_argument("--store", choices=("keychain", "env-file"), default=None,
                        help="where the token is kept (default: the streams file's "
@@ -1998,6 +2518,9 @@ def parse_args(argv):
             t.add_argument("--kick-here", action="store_true",
                            help="with --kick on macOS: start the run from this "
                                 "process, not through the scheduled job")
+        if name == "app-key":
+            t.add_argument("--import", dest="import_path", required=True, metavar="PEM",
+                           help="the private key file downloaded from the app's page")
     args = p.parse_args(argv)
     if args.cmd == "token" and args.token_cmd == "renew" and not 1 <= args.days <= 366:
         p.error("--days must be between 1 and 366")

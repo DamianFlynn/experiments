@@ -31,13 +31,18 @@ TOKEN_FILE="${HOME}/.config/activity-overview/token.env"
 PATH="/usr/local/bin:/usr/bin:/bin"
 export PATH
 
-if [ "$(stat -c %a "$TOKEN_FILE" 2>/dev/null || stat -f %Lp "$TOKEN_FILE")" != "600" ]; then
-  echo "activity-gather: $TOKEN_FILE must be mode 600" >&2
-  exit 2
+# The app route (token.store "app") mints its own token for every gather from
+# the app's private key: no env file is read.
+KIND="$(python3 "$SKILL_DIR/schedule.py" token kind --streams "$STREAMS" 2>/dev/null || echo env-file)"
+if [ "$KIND" != "app" ]; then
+  if [ "$(stat -c %a "$TOKEN_FILE" 2>/dev/null || stat -f %Lp "$TOKEN_FILE")" != "600" ]; then
+    echo "activity-gather: $TOKEN_FILE must be mode 600" >&2
+    exit 2
+  fi
+  set -a
+  . "$TOKEN_FILE"
+  set +a
 fi
-set -a
-. "$TOKEN_FILE"
-set +a
 
 rc=0
 nice -n 10 python3 "$SKILL_DIR/schedule.py" run --streams "$STREAMS" "$@" || rc=$?

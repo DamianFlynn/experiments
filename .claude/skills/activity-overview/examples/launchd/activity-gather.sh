@@ -48,13 +48,19 @@ if ! "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'; t
 fi
 command -v git >/dev/null 2>&1 || { echo "activity-gather: git not found" >&2; exit 2; }
 
-GITHUB_TOKEN="$(security find-generic-password -a "$USER" -s "$KEYCHAIN_SERVICE" -w 2>/dev/null || true)"
-if [ -z "$GITHUB_TOKEN" ]; then
-  echo "activity-gather: no token in the keychain item '$KEYCHAIN_SERVICE' (is the login keychain unlocked?)" >&2
-  notify "No token in the keychain: run schedule.py token renew"
-  exit 2
+# The app route (token.store "app") mints its own token for every gather from
+# the app's private key: nothing to read here. Otherwise the personal token
+# comes from the keychain, for this process only.
+KIND="$("$PY" "$SKILL_DIR/schedule.py" token kind --streams "$STREAMS" 2>/dev/null || echo keychain)"
+if [ "$KIND" != "app" ]; then
+  GITHUB_TOKEN="$(security find-generic-password -a "$USER" -s "$KEYCHAIN_SERVICE" -w 2>/dev/null || true)"
+  if [ -z "$GITHUB_TOKEN" ]; then
+    echo "activity-gather: no token in the keychain item '$KEYCHAIN_SERVICE' (is the login keychain unlocked?)" >&2
+    notify "No token in the keychain: run schedule.py token renew"
+    exit 2
+  fi
+  export GITHUB_TOKEN
 fi
-export GITHUB_TOKEN
 
 # Low priority; any extra arguments (e.g. --stream ID, --dry-run) pass through.
 rc=0

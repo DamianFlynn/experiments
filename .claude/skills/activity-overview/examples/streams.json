@@ -13,10 +13,12 @@
     "TF_PLUGIN_CACHE_DIR": ".tfcache"
   },
   "token": {
-    "store": "auto",
+    "store": "app",
+    "client_id": "REPLACE-WITH-THE-APP-CLIENT-ID",
+    "private_key_file": "~/.config/activity-overview/app.pem",
+    "probe_repo": "Azure/bicep-registry-modules",
     "env_file": "~/.config/activity-overview/token.env",
-    "keychain_service": "activity-gh-token",
-    "probe_repo": "Azure/bicep-registry-modules"
+    "keychain_service": "activity-gh-token"
   },
   "streams": [
     {
