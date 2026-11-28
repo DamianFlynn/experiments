@@ -516,7 +516,11 @@ Under the app route the advice is never `token renew`, which refuses while
     on the app's page.
   - LibreSSL, which macOS ships, documents `openssl dgst [-digest] -sign file` with
     standard input when no file is given (the OpenBSD manual).
-- *Tested here* (Linux, OpenSSL 3.0, the network and `security` replaced by seams):
+- *Tested here* (Linux, OpenSSL 3.0, the network and `security` replaced by seams; the
+  whole suite run both as root and as an ordinary user (uid 1001, on a checkout it owns,
+  with `/tmp` sticky and world-writable as on CI). Foreign ownership is simulated through
+  one ownership seam, so those cases run as either user. Their real-`chown` twins need
+  root and are reported as skipped otherwise, never as passes):
   - JWTs signed with a real throwaway RSA key (PKCS#8, and the PKCS#1 form GitHub
     downloads), from the file and through the pipe; signatures verified with
     `openssl dgst -verify`; claims checked;

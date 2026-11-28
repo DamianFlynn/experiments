@@ -2358,6 +2358,10 @@ class TestWrappersFollowTheSettings(Case):
         self.assertIsNone(got)
 
 
+FOREIGN_UID = 54321
+AS_ROOT = hasattr(os, "getuid") and os.getuid() == 0
+
+
 class SecretFolderCase(AppCase):
     """The folder holding the token file or the app key: tightened on write
     when it is the user's own private folder, refused on every path when
@@ -2382,6 +2386,20 @@ class SecretFolderCase(AppCase):
                                  http_get=FakeAPI(), prompt=lambda t: NEW_TOKEN,
                                  now=FakeClock().now)
         return code, err.getvalue()
+
+    def owned_as(self, overrides):
+        """Simulate ownership for a few folders only, through the one seam
+        (schedule.owner_of): the test runs as a fake user who owns everything
+        the real runner owns (so /tmp's sticky rule and every other ancestor
+        keep their real relation), and each path in `overrides` is reported
+        with the given owner. The same on a root and a non-root runner."""
+        real, fake = os.getuid(), 4242
+
+        def owner(path, st):
+            if path in overrides:
+                return overrides[path]
+            return fake if st.st_uid == real else st.st_uid
+        return mock.patch.multiple(schedule, owner_of=owner, _uid=lambda: fake)
 
 
 class TestSecretFolders(SecretFolderCase):
@@ -2441,9 +2459,11 @@ class TestSecretFolders(SecretFolderCase):
             self.assertIn(os.path.realpath("/tmp"), shared)
 
     def test_a_folder_that_is_not_ours_is_never_chmodded(self):
+        # Not ours but a trusted owner (root): passes the path check, so the
+        # folder rule decides; it never chmods it.
         readable = self.folder("theirs", 0o755)
         writable = self.folder("theirs-w", 0o777)
-        with mock.patch.object(schedule.os, "getuid", lambda: os.stat(readable).st_uid + 1):
+        with self.owned_as({readable: 0, writable: 0}):
             notes = schedule.secure_secret_dir(readable)
             self.assertIn("not your own folder", notes[0])
             self.assertEqual(self.mode(readable), 0o755)
@@ -2451,6 +2471,19 @@ class TestSecretFolders(SecretFolderCase):
                 schedule.secure_secret_dir(writable)
             self.assertIn("put the file in a private folder", str(cm.exception))
             self.assertEqual(self.mode(writable), 0o777)
+        # Not ours and not root: refused by the path check, never chmod-ed.
+        foreign = self.folder("foreign", 0o755)
+        with self.owned_as({foreign: FOREIGN_UID}):
+            with self.assertRaises(schedule.SecretDirError) as cm:
+                schedule.secure_secret_dir(foreign)
+            self.assertIn("{} is owned by uid {} (neither you nor root)".format(
+                foreign, FOREIGN_UID), str(cm.exception))
+            self.assertEqual(self.mode(foreign), 0o755)
+            # ... and the ancestors kept their real relation: our own folder next
+            # to it, created on the way, passes
+            notes = schedule.secure_secret_dir(os.path.join(self.tmp, "ours"))
+            self.assertEqual(notes, [])
+            self.assertEqual(self.mode(os.path.join(self.tmp, "ours")), 0o700)
 
     def test_app_key_import_tightens_the_key_folder(self):
         d = self.folder("keys2", 0o755)
@@ -2530,10 +2563,6 @@ class TestSecretFolders(SecretFolderCase):
         self.assertEqual((code, out.strip()), (0, target))
         self.assertIn("readable by group or others", err)
         self.assertEqual(self.mode(d), 0o755)               # reads never chmod
-
-
-FOREIGN_UID = 54321
-AS_ROOT = hasattr(os, "getuid") and os.getuid() == 0
 
 
 class TestSecretChain(SecretFolderCase):
@@ -2730,6 +2759,61 @@ class TestSecretChain(SecretFolderCase):
         schedule.write_env_file(os.path.join(links, "cfg", "token.env"), NEW_TOKEN)
         self.assertTrue(os.path.isfile(os.path.join(safe, "token.env")))
         self.assertTrue(os.path.islink(os.path.join(links, "cfg")))
+
+
+class TestSecretChainOwnersBySeam(SecretFolderCase):
+    """The foreign-ownership cases of TestSecretChain through the ownership
+    seam, so they also run where chown is not allowed (a non-root runner, as
+    in CI); the real-chown versions above run as root and skip otherwise."""
+
+    def test_the_sticky_exception_needs_the_entry_to_be_ours(self):
+        sticky = self.folder("sticky", 0o1777)
+        theirs = os.path.join(sticky, "private")
+        os.makedirs(theirs)
+        os.chmod(theirs, 0o700)
+        with self.owned_as({theirs: FOREIGN_UID}):
+            with self.assertRaises(schedule.SecretDirError) as cm:
+                schedule.check_secret_dir(theirs)
+        self.assertIn("protects only entries owned by you or root, but {} is owned by "
+                      "uid {}".format(theirs, FOREIGN_UID), str(cm.exception))
+        with self.owned_as({}):
+            self.assertIsNone(schedule.check_secret_dir(theirs))     # ours: accepted
+
+    def test_a_foreign_ancestor(self):
+        theirs = self.folder("theirs", 0o755)
+        mine = os.path.join(theirs, "mine")
+        os.makedirs(mine)
+        os.chmod(mine, 0o700)
+        with self.owned_as({theirs: FOREIGN_UID}):
+            with self.assertRaises(schedule.SecretDirError) as cm:
+                schedule.check_secret_dir(mine)
+        self.assertIn("{} is owned by uid {} (neither you nor root)".format(
+            theirs, FOREIGN_UID), str(cm.exception))
+
+    def test_a_foreign_secret_file(self):
+        safe = self.folder("safe", 0o700)
+        target = os.path.join(safe, "token.env")
+        with open(target, "w") as fh:
+            fh.write("GITHUB_TOKEN={}\n".format(NEW_TOKEN))
+        os.chmod(target, 0o600)
+        with self.owned_as({target: FOREIGN_UID}):
+            with self.assertRaises(schedule.SecretDirError) as cm:
+                schedule.open_secret_file(target)
+            self.assertIn("owned by uid {}, not you".format(FOREIGN_UID),
+                          str(cm.exception))
+            with self.assertRaises(schedule.SecretDirError):
+                schedule.env_file_for_wrapper(target)
+
+    def test_a_foreign_symlink(self):
+        safe = self.folder("safe", 0o700)
+        links = self.folder("links", 0o700)
+        link = os.path.join(links, "cfg")
+        os.symlink(safe, link)
+        with self.owned_as({link: FOREIGN_UID}):
+            with self.assertRaises(schedule.SecretDirError) as cm:
+                schedule.check_secret_dir(link)
+        self.assertIn("{} is a symlink owned by uid {}".format(link, FOREIGN_UID),
+                      str(cm.exception))
 
 
 class TestOwnersStreams(unittest.TestCase):

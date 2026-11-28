@@ -1597,8 +1597,15 @@ def _uid():
     return os.getuid() if hasattr(os, "getuid") else None
 
 
-def _owner_ok(st, uid):
-    return st.st_uid in (uid, 0)
+def owner_of(path, st):
+    """The owner (uid) of `path` as lstat/fstat reported it in `st`. The one
+    seam for ownership: a test makes a single folder look foreign here while
+    every other component keeps its real owner."""
+    return st.st_uid
+
+
+def _owner_ok(path, st, uid):
+    return owner_of(path, st) in (uid, 0)
 
 
 def _chain_error(what, path, message):
@@ -1626,8 +1633,9 @@ def verify_secret_chain(path, what="the token", allow_missing=False):
     pending = [p for p in original.split(os.sep) if p]
     cur = os.sep
     st_cur = os.lstat(cur)
-    if not _owner_ok(st_cur, uid):
-        raise _chain_error(what, original, "/ is owned by uid {}".format(st_cur.st_uid))
+    if not _owner_ok(cur, st_cur, uid):
+        raise _chain_error(what, original, "/ is owned by uid {}".format(
+            owner_of(cur, st_cur)))
     links = 0
     st = st_cur
     while pending:
@@ -1656,22 +1664,22 @@ def verify_secret_chain(path, what="the token", allow_missing=False):
             sticky = bool(dmode & statmod.S_ISVTX)
             if not sticky:
                 raise _swappable(what, original, cur, dmode, nxt)
-            if not _owner_ok(st, uid):
+            if not _owner_ok(nxt, st, uid):
                 raise _chain_error(
                     what, original,
                     "{} is writable by others with the sticky bit, which protects only "
                     "entries owned by you or root, but {} is owned by uid {}".format(
-                        cur, nxt, st.st_uid))
+                        cur, nxt, owner_of(nxt, st)))
         if statmod.S_ISLNK(st.st_mode):
             links += 1
             if links > MAX_SYMLINKS:
                 raise _chain_error(what, original, "too many symlinks")
-            if not _owner_ok(st, uid):
+            if not _owner_ok(nxt, st, uid):
                 raise _chain_error(
                     what, original,
                     "{} is a symlink owned by uid {} (neither you nor root): its owner "
                     "can point it anywhere. Fix: use the real path, or a link you own".format(
-                        nxt, st.st_uid))
+                        nxt, owner_of(nxt, st)))
             target = os.readlink(nxt)
             if not os.path.isabs(target):
                 target = os.path.join(cur, target)
@@ -1682,12 +1690,12 @@ def verify_secret_chain(path, what="the token", allow_missing=False):
             continue
         if pending and not statmod.S_ISDIR(st.st_mode):
             raise _chain_error(what, original, "{} is not a directory".format(nxt))
-        if statmod.S_ISDIR(st.st_mode) and not _owner_ok(st, uid):
+        if statmod.S_ISDIR(st.st_mode) and not _owner_ok(nxt, st, uid):
             raise _chain_error(
                 what, original,
                 "{} is owned by uid {} (neither you nor root), who could replace "
                 "everything below it. Fix: keep the file under folders owned by you or "
-                "root".format(nxt, st.st_uid))
+                "root".format(nxt, owner_of(nxt, st)))
         cur, st_cur = nxt, st
     return cur, st
 
@@ -1712,9 +1720,9 @@ def open_secret_file(path, what="the token"):
         if (st.st_dev, st.st_ino) != (seen.st_dev, seen.st_ino) or \
                 not statmod.S_ISREG(st.st_mode):
             raise _chain_error(what, path, "{} changed while it was being checked".format(real))
-        if st.st_uid != _uid():
+        if owner_of(real, st) != _uid():
             raise _chain_error(what, path, "{} is owned by uid {}, not you".format(
-                real, st.st_uid))
+                real, owner_of(real, st)))
         chunks = []
         while True:
             block = os.read(fd, 65536)
@@ -1736,9 +1744,9 @@ def env_file_for_wrapper(path):
     if st is not None:
         if not statmod.S_ISREG(st.st_mode):
             raise _chain_error("the token", path, "{} is not a regular file".format(real))
-        if st.st_uid != _uid():
+        if owner_of(real, st) != _uid():
             raise _chain_error("the token", path, "{} is owned by uid {}, not you".format(
-                real, st.st_uid))
+                real, owner_of(real, st)))
     return real
 
 
@@ -1787,7 +1795,7 @@ def secure_secret_dir(directory, workspace=None, what="the token"):
     if not mode & 0o077:
         return []
     shared = directory in _shared_locations(workspace)
-    mine = st.st_uid == _uid()
+    mine = owner_of(directory, st) == _uid()
     if mine and not shared:
         os.chmod(directory, 0o700)
         return ["tightened {} from mode {:o} to 700 (it holds {})".format(
