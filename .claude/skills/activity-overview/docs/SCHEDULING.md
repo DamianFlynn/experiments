@@ -387,8 +387,17 @@ repositories, by REST and by GraphQL. `app-check` answers it on the first run. I
 read is refused (a 403 naming an organisation policy, or a GraphQL error), go back to the
 personal token: set `"store": "keychain"` (or `env-file`) in the token block, run
 `python3 $AO/schedule.py token renew --streams $W/streams.json` (§7.2), and keep the app in
-case the policy changes. The wrappers read `token.store` (`schedule.py token kind`) and
-fetch the personal token only when it is not `app`.
+case the policy changes. The wrappers ask `schedule.py token where` (below) and fetch a
+personal token only when the store is not `app`.
+
+**Where the wrappers look.** Both wrappers (launchd and cron) take every credential
+location from the streams file's token block, through
+`schedule.py token where --streams FILE --field store|env-file|keychain-service|account`.
+That prints one setting, never the token, and they are the settings `token renew` writes
+to. Nothing about the location is fixed in a wrapper. Each wrapper handles all three stores:
+`app` (reads nothing), `keychain` (the item `token.keychain_service`), and `env-file` (the
+mode-600 file `token.env_file`). If `token renew` is pointed elsewhere with `--store` or
+`--env-file`, it warns that the wrappers will not look there until the streams file says so.
 
 **Gathers longer than the hour.** The token's hour starts just before its gather starts.
 - *Single repository.* The monorepo's month takes about 29 minutes, so it fits with room to
@@ -450,8 +459,12 @@ Under the app route the advice is never `token renew`, which refuses while
   - a fresh token per gather, and none in validate's environment or in any file or output;
   - the manifest `--resume` passes, stopping when no progress is made, and no resume on the
     personal-token path;
-  - the over-an-hour `auth_error`; `app-check` output and exit codes; `token kind`;
-  - both wrappers' app / personal switch (the cron one run with a stub runner).
+  - the over-an-hour `auth_error`; `app-check` output and exit codes; `token kind` and
+    `token where`;
+  - both wrappers, run by the test suite with a stub runner, finding the token where the
+    streams file says: a non-default env file, a non-default keychain item (a stand-in
+    `security` on Linux), and nothing on the app route;
+  - the keychain write's restore and its messages (a stand-in `security`).
 - *Not tested (no Mac, no real app):*
   - whether the Azure enterprise accepts the installation token (`app-check` on the Mac
     answers that);
@@ -533,11 +546,23 @@ python3 $AO/schedule.py token renew --streams $W/streams.json --kick
    which reads its commands from standard input (security(1): "Run security in interactive
    mode … commands on stdin"), so the token goes through a pipe, not into `security`'s
    argument list or the process listing; the item is then read back with
-   `find-generic-password -w` and compared. The env file is written as a new mode-600 file
-   in a mode-700 directory, fsynced and renamed over the old one.
+   `find-generic-password -w` and compared. `add-generic-password -U` replaces the item
+   before that read-back can tell whether the write is right, so the previous value is read
+   first. If the read-back differs, the previous value is written back the same way (stdin)
+   and read back again. The message then says exactly what the item holds:
+   - unchanged (security refused before anything changed);
+   - restored (the previous token, read back);
+   - possibly a different or partial value, to check with `token status`.
+
+   It never claims the old token is still there unless that was read back. `token app-key`
+   writes the app's key the same way. The env file is written as a new mode-600 file in a
+   mode-700 directory, fsynced and renamed over the old one: until that rename, the old file
+   is untouched.
 5. `--kick` then starts a run: on macOS `launchctl kickstart gui/<uid>/local.activity-overview.gather`
-   (the scheduled job, which reads the new token from the keychain); elsewhere a background
-   `schedule.py run` with the token in its environment only.
+   (the scheduled job, which reads the new token where the streams file says). If
+   `launchctl` exits non-zero, `token renew` says the job was **not** started (e.g. it is not
+   installed) and exits 1. Elsewhere it starts a background `schedule.py run` with the token
+   in its environment only.
 
 ```bash
 python3 $AO/schedule.py token status --streams $W/streams.json   # login, expiry, days left (one API call)

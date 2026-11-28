@@ -22,8 +22,10 @@ set -eu
 
 SKILL_DIR="__SKILL_DIR__"                        # the skill directory (USAGE 2: $AO)
 STREAMS="__WORKSPACE__/streams.json"             # your streams file
-KEYCHAIN_SERVICE="activity-gh-token"
 NOTIFY="${NOTIFY:-1}"
+# Where the token is (keychain item, env file) comes from the streams file's
+# token block through `schedule.py token where`, the settings `token renew`
+# writes to; nothing about it is fixed in this script.
 
 notify() {
   [ "$NOTIFY" = "1" ] || return 0
@@ -32,9 +34,10 @@ notify() {
     -e 'end run' "$1" >/dev/null 2>&1 || true
 }
 
-# launchd starts jobs with a minimal PATH: add Homebrew (Apple silicon, Intel)
-# so python3 and git resolve the same way they do in Terminal.
-PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# launchd starts jobs with a minimal PATH: put Homebrew (Apple silicon, Intel)
+# and the system directories first so python3 and git resolve the same way
+# they do in Terminal.
+PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 export PATH
 
 PY="$(command -v python3 || true)"
@@ -48,24 +51,45 @@ if ! "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'; t
 fi
 command -v git >/dev/null 2>&1 || { echo "activity-gather: git not found" >&2; exit 2; }
 
-# The app route (token.store "app") mints its own token for every gather from
-# the app's private key: nothing to read here. Otherwise the personal token
-# comes from the keychain, for this process only.
-KIND="$("$PY" "$SKILL_DIR/schedule.py" token kind --streams "$STREAMS" 2>/dev/null || echo keychain)"
-if [ "$KIND" != "app" ]; then
-  GITHUB_TOKEN="$(security find-generic-password -a "$USER" -s "$KEYCHAIN_SERVICE" -w 2>/dev/null || true)"
-  if [ -z "$GITHUB_TOKEN" ]; then
-    echo "activity-gather: no token in the keychain item '$KEYCHAIN_SERVICE' (is the login keychain unlocked?)" >&2
-    notify "No token in the keychain: run schedule.py token renew"
-    exit 2
-  fi
-  export GITHUB_TOKEN
+# The token, for this process only, from where the streams file says:
+#   app       the runner mints its own token for every gather: nothing to read
+#   keychain  the keychain item token.keychain_service (account: token where)
+#   env-file  the mode-600 file token.env_file
+where() { "$PY" "$SKILL_DIR/schedule.py" token where --streams "$STREAMS" --field "$1"; }
+if ! KIND="$(where store)"; then
+  echo "activity-gather: cannot read the token settings of $STREAMS" >&2
+  notify "Activity gather: the streams file cannot be read"
+  exit 2
 fi
+case "$KIND" in
+  app) ;;
+  keychain)
+    SVC="$(where keychain-service)"; ACCT="$(where account)"
+    GITHUB_TOKEN="$(security find-generic-password -a "$ACCT" -s "$SVC" -w 2>/dev/null || true)"
+    if [ -z "$GITHUB_TOKEN" ]; then
+      echo "activity-gather: no token in the keychain item '$SVC' (is the login keychain unlocked?)" >&2
+      notify "No token in the keychain item $SVC: run schedule.py token renew"
+      exit 2
+    fi
+    export GITHUB_TOKEN ;;
+  env-file)
+    TOKEN_FILE="$(where env-file)"
+    # GNU stat first: BSD `stat -f` means something else there and succeeds
+    if [ "$(stat -c %a "$TOKEN_FILE" 2>/dev/null || stat -f %Lp "$TOKEN_FILE" 2>/dev/null)" != "600" ]; then
+      echo "activity-gather: $TOKEN_FILE is missing or not mode 600" >&2
+      notify "The token file is missing or not mode 600: run schedule.py token renew"
+      exit 2
+    fi
+    set -a; . "$TOKEN_FILE"; set +a ;;
+  *)
+    echo "activity-gather: unknown token store '$KIND'" >&2
+    exit 2 ;;
+esac
 
 # Low priority; any extra arguments (e.g. --stream ID, --dry-run) pass through.
 rc=0
 nice -n 10 "$PY" "$SKILL_DIR/schedule.py" run --streams "$STREAMS" "$@" || rc=$?
-unset GITHUB_TOKEN
+unset GITHUB_TOKEN GH_TOKEN
 MSG="$("$PY" "$SKILL_DIR/schedule.py" token remind --streams "$STREAMS" 2>/dev/null || true)"
 if [ -n "$MSG" ]; then
   echo "activity-gather: $MSG" >&2

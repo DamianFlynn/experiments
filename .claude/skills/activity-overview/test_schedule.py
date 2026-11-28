@@ -1261,7 +1261,10 @@ class FakeSecurity:
         return 1, ""
 
 
-class TestTokenRenew(Case):
+class TokenCliCase(Case):
+    """A streams file with an env-file token, and `token …` run with every
+    seam replaced."""
+
     def setUp(self):
         super().setUp()
         self.env_file = os.path.join(self.tmp, "cfg", "token.env")
@@ -1270,8 +1273,12 @@ class TestTokenRenew(Case):
         self.clock = FakeClock(start=T("2026-11-28T10:00:00Z"))
 
     def token_cli(self, *argv, api=None, prompt=NEW_TOKEN, security=None, browser=True,
-                  spawn=None):
-        self.opened, self.prompts, self.spawned = [], [], []
+                  spawn=None, launch_code=0):
+        self.opened, self.prompts, self.spawned, self.launched = [], [], [], []
+
+        def launch(a):
+            self.launched.append(a)
+            return launch_code
         out, err = io.StringIO(), io.StringIO()
 
         def ask(text):
@@ -1287,7 +1294,7 @@ class TestTokenRenew(Case):
                                  open_browser=open_browser,
                                  security=security or FakeSecurity(),
                                  spawn=spawn or (lambda a, e: self.spawned.append((a, e))),
-                                 now=self.clock.now)
+                                 launch=launch, now=self.clock.now)
         self.assertNotIn(NEW_TOKEN, out.getvalue() + err.getvalue())
         self.assertNotIn(OLD_TOKEN, out.getvalue() + err.getvalue())
         return code, out.getvalue(), err.getvalue()
@@ -1299,6 +1306,8 @@ class TestTokenRenew(Case):
         with open(self.env_file, encoding="utf-8") as fh:
             return fh.read()
 
+
+class TestTokenRenew(TokenCliCase):
     def test_page_url_uses_only_documented_parameters(self):
         url = schedule.token_page_url()
         base, _sep, query = url.partition("?")
@@ -1388,10 +1397,21 @@ class TestTokenRenew(Case):
         self.assertNotIn(NEW_TOKEN, " ".join(argv))
         self.assertEqual(env["GITHUB_TOKEN"], NEW_TOKEN)
         with mock.patch.object(schedule.sys, "platform", "darwin"):
-            self.token_cli("renew", "--kick")
-        (argv, _env), = self.spawned
+            code, _out, err = self.token_cli("renew", "--kick")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.spawned, [])
+        argv, = self.launched
         self.assertEqual(argv[:2], ["launchctl", "kickstart"])
         self.assertTrue(argv[2].endswith("/local.activity-overview.gather"))
+        self.assertIn("started the scheduled job", err)
+
+    def test_a_failed_kickstart_is_not_reported_as_started(self):
+        with mock.patch.object(schedule.sys, "platform", "darwin"):
+            code, _out, err = self.token_cli("renew", "--kick", launch_code=113)
+        self.assertEqual(code, 1)
+        self.assertIn("kickstart exited 113", err)
+        self.assertIn("was NOT started", err)
+        self.assertNotIn("started the scheduled job (", err)
 
     def test_status_shows_expiry_and_warns_near_the_end(self):
         self.write_old()
@@ -2036,6 +2056,227 @@ class TestReviewFindings(AppCase):
                                  now=FakeClock().now)
         self.assertEqual(code, 0, err.getvalue())
         self.assertTrue(os.path.isfile(os.path.join(self.tmp, "renewed.env")))
+
+
+class FlakySecurity(FakeSecurity):
+    """A keychain whose writes go wrong: the first `bad_writes` puts store a
+    garbled value (or, with `fail_exit`, exit non-zero and store nothing)."""
+
+    def __init__(self, stored=None, bad_writes=1, fail_exit=False):
+        super().__init__(stored=stored)
+        self.bad_writes, self.fail_exit = bad_writes, fail_exit
+
+    def __call__(self, argv, stdin_text=None):
+        if argv == ["security", "-i"] and self.bad_writes:
+            self.bad_writes -= 1
+            self.calls.append((list(argv), stdin_text))
+            if self.fail_exit:
+                return 1, ""
+            self.items[stdin_text.split()[stdin_text.split().index("-s") + 1]] = "garbled"
+            return 0, ""
+        return super().__call__(argv, stdin_text)
+
+
+class TestKeychainWriteFailures(TokenCliCase):
+    """Review: a keychain read-back failure must not claim the old token is
+    still there — `-U` has already replaced it."""
+
+    def setUp(self):
+        super().setUp()
+        self.path = streams_file(self.tmp, token={"store": "keychain"})
+
+    def test_the_previous_token_is_written_back(self):
+        sec = FlakySecurity(stored=OLD_TOKEN)
+        code, _out, err = self.token_cli("renew", security=sec)
+        self.assertEqual(code, 1)
+        self.assertEqual(sec.items["activity-gh-token"], OLD_TOKEN)
+        self.assertIn("the previous value was written back and reads back correctly", err)
+        self.assertNotIn("stays in place", err.split("storing failed")[-1])
+        for argv, _stdin in sec.calls:
+            self.assertNotIn(OLD_TOKEN, " ".join(argv))
+            self.assertNotIn(NEW_TOKEN, " ".join(argv))
+
+    def test_when_restoring_fails_too_it_says_to_check(self):
+        sec = FlakySecurity(stored=OLD_TOKEN, bad_writes=2)
+        code, _out, err = self.token_cli("renew", security=sec)
+        self.assertEqual(code, 1)
+        self.assertIn("may now hold a different or partial value: check it", err)
+        self.assertNotIn("stays in place", err.split("storing failed")[-1])
+
+    def test_a_first_store_that_fails(self):
+        code, _out, err = self.token_cli("renew", security=FlakySecurity())
+        self.assertEqual(code, 1)
+        self.assertIn("check it", err)
+        self.assertNotIn("stays in place", err.split("storing failed")[-1])
+
+    def test_a_refused_write_that_changed_nothing(self):
+        sec = FlakySecurity(stored=OLD_TOKEN, fail_exit=True)
+        code, _out, err = self.token_cli("renew", security=sec)
+        self.assertEqual(code, 1)
+        self.assertEqual(sec.items["activity-gh-token"], OLD_TOKEN)
+        self.assertIn("security could not store it (exit 1); the item still holds its "
+                      "previous value", err)
+
+    def test_app_key_import_restores_the_previous_key_too(self):
+        import base64
+        key = os.path.join(self.tmp, "k.pem")
+        with open(key, "w") as fh:
+            fh.write("-----BEGIN RSA PRIVATE KEY-----\nnew\n-----END RSA PRIVATE KEY-----\n")
+        old = base64.b64encode(b"-----BEGIN RSA PRIVATE KEY-----\nold\n").decode()
+        sec = FlakySecurity()
+        sec.items["app-key"] = old
+        self.path = streams_file(self.tmp, token={
+            "store": "app", "client_id": "x", "private_key_keychain_service": "app-key"})
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = schedule.main(["token", "app-key", "--streams", self.path,
+                                  "--import", key], security=sec)
+        self.assertEqual(code, 1)
+        self.assertEqual(sec.items["app-key"], old)
+        self.assertIn("previous value was written back", err.getvalue())
+
+
+class TestTokenWhere(Case):
+    def where(self, path, field):
+        code, out, _err = self.run_cli(["token", "where", "--streams", path,
+                                        "--field", field])
+        self.assertEqual(code, 0)
+        return out.strip()
+
+    def test_the_settings_renewal_uses(self):
+        custom = os.path.join(self.tmp, "secrets", "gh.env")
+        path = streams_file(self.tmp, token={"store": "env-file", "env_file": custom,
+                                             "keychain_service": "my-gh"})
+        self.assertEqual(self.where(path, "store"), "env-file")
+        self.assertEqual(self.where(path, "env-file"), custom)
+        self.assertEqual(self.where(path, "keychain-service"), "my-gh")
+        cfg = schedule.load_streams(path)
+        self.assertEqual(self.where(path, "account"),
+                         schedule.token_settings(cfg)["account"])
+
+    def test_renewing_somewhere_the_wrappers_do_not_read_is_flagged(self):
+        env_file = os.path.join(self.tmp, "cfg", "token.env")
+        path = streams_file(self.tmp, token={"store": "env-file", "env_file": env_file})
+        for extra, flagged in (([], False),
+                               (["--env-file", os.path.join(self.tmp, "other.env")], True),
+                               (["--store", "keychain"], True)):
+            with self.subTest(extra=extra):
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    code = schedule.main(["token", "renew", "--streams", path,
+                                          "--no-browser", *extra],
+                                         http_get=FakeAPI(), prompt=lambda t: NEW_TOKEN,
+                                         security=FakeSecurity(), now=FakeClock().now)
+                self.assertEqual(code, 0, err.getvalue())
+                self.assertEqual("the wrappers" in err.getvalue(), flagged, err.getvalue())
+
+
+WRAPPER_SHIM = """\
+import os, sys
+sys.path.insert(0, {skill!r})
+if sys.argv[1] == "token":
+    import schedule
+    sys.exit(schedule.main(sys.argv[1:]))
+if sys.argv[1] == "run":
+    with open(os.environ["AO_SEEN"], "w") as fh:
+        fh.write(os.environ.get("GITHUB_TOKEN", "<none>"))
+"""
+
+FAKE_SECURITY = """#!/bin/sh
+# find-generic-password -a ACCT -s SVC -w: the value for exactly that item
+[ "$1" = find-generic-password ] || exit 1
+[ "$3" = "{acct}" ] && [ "$5" = "{svc}" ] && {{ echo "{value}"; exit 0; }}
+exit 44
+"""
+
+
+@unittest.skipUnless(shutil.which("sh") and shutil.which("git"), "needs sh and git")
+class TestWrappersFollowTheSettings(Case):
+    """Review: both wrappers find the token where the streams file says (the
+    settings `token renew` writes to), not at a fixed path or item name."""
+
+    VALUE = "fakevalue123456789"
+
+    def wrapper(self, which, token_block):
+        skill = os.path.join(self.tmp, "skill")
+        os.makedirs(skill)
+        with open(os.path.join(skill, "schedule.py"), "w") as fh:
+            fh.write(WRAPPER_SHIM.format(skill=HERE))
+        os.makedirs(self.ws)
+        path = streams_file(self.tmp, token=token_block)
+        with open(os.path.join(HERE, "examples", which, "activity-gather.sh")) as fh:
+            text = fh.read().replace("__SKILL_DIR__", skill)
+        text = text.replace("__WORKSPACE__/streams.json", path)
+        script = os.path.join(self.tmp, "w.sh")
+        with open(script, "w") as fh:
+            fh.write(text)
+        return script
+
+    def run_wrapper(self, script, extra_path=None):
+        seen = os.path.join(self.tmp, "seen")
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("GITHUB_TOKEN", "GH_TOKEN")}
+        env.update(HOME=self.tmp, AO_SEEN=seen, NOTIFY="0",
+                   USER=env.get("USER") or "tester")
+        if extra_path:
+            env["PATH"] = env.get("PATH", "") + os.pathsep + extra_path
+        proc = subprocess.run(["sh", script], env=env, capture_output=True, text=True)
+        got = None
+        if os.path.exists(seen):
+            with open(seen) as fh:
+                got = fh.read()
+        return proc, got
+
+    def test_env_file_from_the_streams_file(self):
+        custom = os.path.join(self.tmp, "secrets", "gh.env")
+        schedule.write_env_file(custom, self.VALUE)
+        for which in ("cron", "launchd"):
+            with self.subTest(wrapper=which):
+                shutil.rmtree(self.ws, ignore_errors=True)
+                shutil.rmtree(os.path.join(self.tmp, "skill"), ignore_errors=True)
+                script = self.wrapper(which, {"store": "env-file", "env_file": custom})
+                proc, got = self.run_wrapper(script)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(got, self.VALUE)
+
+    @unittest.skipIf(os.path.exists("/usr/bin/security"),
+                     "a real keychain tool is on this machine")
+    def test_keychain_item_from_the_streams_file(self):
+        acct = os.environ.get("USER") or "tester"
+        bindir = os.path.join(self.tmp, "bin")
+        os.makedirs(bindir)
+        fake = os.path.join(bindir, "security")
+        with open(fake, "w") as fh:
+            fh.write(FAKE_SECURITY.format(acct=acct, svc="my-gh", value=self.VALUE))
+        os.chmod(fake, 0o755)
+        for which in ("cron", "launchd"):
+            with self.subTest(wrapper=which):
+                shutil.rmtree(self.ws, ignore_errors=True)
+                shutil.rmtree(os.path.join(self.tmp, "skill"), ignore_errors=True)
+                script = self.wrapper(which, {"store": "keychain",
+                                              "keychain_service": "my-gh"})
+                proc, got = self.run_wrapper(script, extra_path=bindir)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(got, self.VALUE)
+
+    def test_the_app_route_reads_nothing(self):
+        for which in ("cron", "launchd"):
+            with self.subTest(wrapper=which):
+                shutil.rmtree(self.ws, ignore_errors=True)
+                shutil.rmtree(os.path.join(self.tmp, "skill"), ignore_errors=True)
+                script = self.wrapper(which, {"store": "app", "client_id": "x",
+                                              "private_key_file": "~/k.pem"})
+                proc, got = self.run_wrapper(script)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(got, "<none>")
+
+    def test_a_missing_env_file_stops_with_its_name(self):
+        missing = os.path.join(self.tmp, "nowhere", "gh.env")
+        script = self.wrapper("cron", {"store": "env-file", "env_file": missing})
+        proc, got = self.run_wrapper(script)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn(missing, proc.stderr)
+        self.assertIsNone(got)
 
 
 class TestOwnersStreams(unittest.TestCase):

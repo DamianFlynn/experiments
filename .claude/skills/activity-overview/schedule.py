@@ -1540,18 +1540,62 @@ def store_token(settings, token, security=run_security):
     if settings["store"] == "env-file":
         write_env_file(settings["env_file"], token)
         return
-    acct, svc = settings["account"], settings["keychain_service"]
-    for name, value in (("account", acct), ("keychain service", svc)):
-        if not re.fullmatch(r"[A-Za-z0-9._@-]+", value):
+    keychain_write_checked(settings["account"], settings["keychain_service"], token,
+                           security)
+
+
+class KeychainWriteError(RuntimeError):
+    """A keychain write that did not read back. `state` says what the item
+    holds now: 'restored' (the previous value, read back), 'unknown' (it may
+    hold a partial or different value: check it), or 'unchanged' (security
+    refused before writing anything that read back as changed)."""
+
+    def __init__(self, message, state):
+        super().__init__(message)
+        self.state = state
+
+
+def _keychain_get(acct, svc, security):
+    code, out = security(["security", "find-generic-password", "-a", acct, "-s", svc, "-w"])
+    return out.strip() if code == 0 and out.strip() else None
+
+
+def _keychain_put(acct, svc, value, security):
+    """`add-generic-password -U` through `security -i` (stdin): the value is
+    never in an argv or the process listing."""
+    code, _out = security(["security", "-i"], "add-generic-password -U -a {} -s {} -T "
+                          "/usr/bin/security -w {}\n".format(acct, svc, value))
+    return code
+
+
+def keychain_write_checked(acct, svc, value, security=run_security):
+    """Write `value` to the keychain item and read it back. `-U` replaces an
+    existing item before the read-back can tell whether the write is right,
+    so the previous value is read first and, when the read-back differs,
+    written back the same way (stdin, never a command line) and read back
+    again. Raises KeychainWriteError saying what the item holds then."""
+    for name, v in (("account", acct), ("keychain service", svc)):
+        if not re.fullmatch(r"[A-Za-z0-9._@-]+", v):
             raise ConfigError("the {} {!r} must be letters, digits, '.', '_', '@' "
-                              "or '-' to be stored safely".format(name, value))
-    command = "add-generic-password -U -a {} -s {} -T /usr/bin/security -w {}\n".format(
-        acct, svc, token)
-    code, _out = security(["security", "-i"], command)
-    if code != 0:
-        raise RuntimeError("security could not store the token (exit {})".format(code))
-    if read_stored_token(settings, security) != token:
-        raise RuntimeError("the keychain item {!r} did not read back as stored".format(svc))
+                              "or '-' to be stored safely".format(name, v))
+    previous = _keychain_get(acct, svc, security)
+    code = _keychain_put(acct, svc, value, security)
+    now_held = _keychain_get(acct, svc, security)
+    if code == 0 and now_held == value:
+        return
+    what = ("security could not store it (exit {})".format(code) if code != 0 else
+            "the keychain item {!r} did not read back as written".format(svc))
+    if now_held == previous:
+        raise KeychainWriteError(what + "; the item still holds its previous value",
+                                 "unchanged")
+    if previous is not None and _keychain_put(acct, svc, previous, security) == 0 \
+            and _keychain_get(acct, svc, security) == previous:
+        raise KeychainWriteError(what + "; the previous value was written back and reads "
+                                 "back correctly", "restored")
+    raise KeychainWriteError(
+        what + "; the item {!r} may now hold a different or partial value: check it "
+        "(`schedule.py token status`, or Keychain Access) before the next run".format(svc),
+        "unknown")
 
 
 def read_stored_token(settings, security=run_security):
@@ -1594,6 +1638,37 @@ def default_open_browser(url):
 def default_prompt(text):
     import getpass
     return getpass.getpass(text)
+
+
+def default_launch(argv):
+    """Run a short command (launchctl kickstart) and return its exit code."""
+    try:
+        return subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True).returncode
+    except OSError:
+        return 127
+
+
+# `token where --field NAME`: what the wrappers ask; the keys of token_settings
+WHERE_FIELDS = {"store": "store", "env-file": "env_file",
+                "keychain-service": "keychain_service", "account": "account"}
+
+
+def wrapper_mismatch(cfg, settings):
+    """When `token renew` stored the token somewhere other than what the
+    streams file says (a --store / --env-file given on the command line), the
+    wrappers, which read the streams file, will not find it: say so."""
+    configured = token_settings(cfg)
+    if settings["store"] != configured["store"]:
+        return ("the streams file's token.store is {!r} but the token was stored with "
+                "--store {}: the wrappers follow the streams file; set token.store to "
+                "{!r} there".format(configured["store"], settings["store"],
+                                    settings["store"]))
+    if settings["store"] == "env-file" and \
+            os.path.abspath(settings["env_file"]) != os.path.abspath(configured["env_file"]):
+        return ("the token was written to {} but the streams file's token.env_file is {}: "
+                "the wrappers read the streams file; set token.env_file to match".format(
+                    settings["env_file"], configured["env_file"]))
+    return None
 
 
 def default_spawn(argv, env):
@@ -1957,19 +2032,15 @@ def app_key_import(settings, path, security=run_security):
     if b"PRIVATE KEY" not in pem:
         sys.stderr.write("token app-key: {} is not a PEM private key\n".format(path))
         return EXIT_FAILED
-    acct = settings["account"]
-    for name, value in (("account", acct), ("keychain service", svc)):
-        if not re.fullmatch(r"[A-Za-z0-9._@-]+", value):
-            sys.stderr.write("token app-key: the {} {!r} must be letters, digits, '.', "
-                             "'_', '@' or '-'\n".format(name, value))
-            return EXIT_FAILED
     value = base64.b64encode(pem).decode("ascii")
-    code, _out = security(["security", "-i"], "add-generic-password -U -a {} -s {} -T "
-                          "/usr/bin/security -w {}\n".format(acct, svc, value))
-    back = security(["security", "find-generic-password", "-a", acct, "-s", svc, "-w"])
-    if code != 0 or back[0] != 0 or back[1].strip() != value:
-        sys.stderr.write("token app-key: the keychain item {!r} could not be stored and "
-                         "read back; keep using token.private_key_file\n".format(svc))
+    try:
+        keychain_write_checked(settings["account"], svc, value, security)
+    except ConfigError as exc:
+        sys.stderr.write("token app-key: {}\n".format(exc))
+        return EXIT_FAILED
+    except KeychainWriteError as exc:
+        sys.stderr.write("token app-key: storing failed: {}; keep using "
+                         "token.private_key_file\n".format(redact(str(exc), [value])))
         return EXIT_FAILED
     sys.stderr.write("token app-key: stored in the keychain item {!r}. Remove "
                      "token.private_key_file from the streams file to use it, and keep "
@@ -1979,13 +2050,19 @@ def app_key_import(settings, path, security=run_security):
 
 def cmd_token(cfg, args, http_get=None, prompt=None, open_browser=None,
               security=None, spawn=None, now=utc_now, api=None, sign=None,
-              **_ignored):
+              launch=None, **_ignored):
     http_get = http_get or default_http_get
     security = security or run_security
     settings = token_settings(cfg, args)
     out = sys.stdout.write
     if args.token_cmd == "kind":
         out(settings["store"] + "\n")
+        return EXIT_OK
+    if args.token_cmd == "where":
+        # the wrappers' one source for where the token is: the same settings
+        # `token renew` writes to (never the token itself)
+        where = token_settings(cfg)
+        out("{}\n".format(where[WHERE_FIELDS[args.field]]))
         return EXIT_OK
     if args.token_cmd in ("app-check", "app-key") or (
             settings["store"] == "app" and args.token_cmd == "status"):
@@ -2062,19 +2139,35 @@ def cmd_token(cfg, args, http_get=None, prompt=None, open_browser=None,
                          "with an 8-day limit will refuse it\n".format(info["days_left"]))
     try:
         store_token(settings, token, security)
+    except KeychainWriteError as exc:
+        # say what the item holds now, never more than was checked
+        sys.stderr.write("token renew: storing failed: {}\n".format(
+            redact(str(exc), [token])))
+        return EXIT_FAILED
     except (OSError, RuntimeError, ConfigError) as exc:
+        # the env file is replaced by one rename at the very end, and a
+        # ConfigError stops before any write: the old token is untouched
         sys.stderr.write("token renew: storing failed: {}; the old token stays in "
                          "place\n".format(redact(str(exc), [token])))
         return EXIT_FAILED
     sys.stderr.write("token renew: stored in {}\n".format(
         settings["env_file"] if settings["store"] == "env-file"
         else "the keychain item " + settings["keychain_service"]))
+    mismatch = wrapper_mismatch(cfg, settings)
+    if mismatch:
+        sys.stderr.write("token renew: WARNING: {}\n".format(mismatch))
     if args.kick:
         if sys.platform == "darwin" and not args.kick_here:
-            (spawn or default_spawn)(["launchctl", "kickstart", "gui/{}/{}".format(
-                os.getuid(), LAUNCH_LABEL)], dict(os.environ))
-            sys.stderr.write("token renew: started the scheduled job ({})\n".format(
-                LAUNCH_LABEL))
+            code = (launch or default_launch)(["launchctl", "kickstart", "gui/{}/{}".format(
+                os.getuid(), LAUNCH_LABEL)])
+            if code == 0:
+                sys.stderr.write("token renew: started the scheduled job ({})\n".format(
+                    LAUNCH_LABEL))
+            else:
+                sys.stderr.write("token renew: launchctl kickstart exited {}: the "
+                                 "scheduled job ({}) was NOT started (is it installed? "
+                                 "docs/SCHEDULING.md 10)\n".format(code, LAUNCH_LABEL))
+                return EXIT_FAILED
         else:
             env = dict(os.environ, GITHUB_TOKEN=token)
             (spawn or default_spawn)([sys.executable, os.path.abspath(__file__), "run",
@@ -2464,6 +2557,7 @@ commands:
   token status --streams FILE [--store keychain|env-file] [--env-file PATH]
   token remind --streams FILE
   token kind   --streams FILE
+  token where  --streams FILE --field store|env-file|keychain-service|account
   token app-check --streams FILE
   token app-key   --streams FILE --import PEM
 """
@@ -2531,6 +2625,9 @@ def parse_args(argv):
                                   "within 2 days or was refused (no network)"),
                        ("kind", "print where the token comes from: app, keychain "
                                 "or env-file (for the wrappers)"),
+                       ("where", "print one setting of where the token is kept, as "
+                                 "`token renew` uses it (for the wrappers; never "
+                                 "the token)"),
                        ("app-check", "mint an installation token and prove it: rate "
                                      "limit, REST, GraphQL and search reads of "
                                      "token.probe_repo"),
@@ -2557,6 +2654,9 @@ def parse_args(argv):
         if name == "app-key":
             t.add_argument("--import", dest="import_path", required=True, metavar="PEM",
                            help="the private key file downloaded from the app's page")
+        if name == "where":
+            t.add_argument("--field", required=True, choices=sorted(WHERE_FIELDS),
+                           help="store, env-file, keychain-service or account")
     args = p.parse_args(argv)
     if args.cmd == "token" and args.token_cmd == "renew" and not 1 <= args.days <= 366:
         p.error("--days must be between 1 and 366")
