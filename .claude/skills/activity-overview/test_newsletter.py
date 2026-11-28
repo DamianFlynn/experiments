@@ -3240,6 +3240,23 @@ class TestRelationClaimsParsed(TestStoryRelations):
         self.assertEqual([(x["subject"], x["target"]) for x in r], [("o/r#30", "o/r#13")])
         self.assertEqual(self.claims("## Stories\n\n#30 **depended on** #12.\n"), [])
 
+    def test_m4_a_colon_cue_reaches_the_list_below_it(self):
+        # #30 needs #12 and waits on x/y#9 in the record; it has no edge to #13
+        # (the generic "waited on" holds on both: depends_on #12, blocked_by x/y#9)
+        ok = ("## Stories\n\n[#30](" + R + "/pull/30) waited on:\n- [#12](" + R + "/pull/12)\n"
+              "- https://github.com/x/y/issues/9\n\nAfter that, nothing.\n")
+        self.assertEqual(self.claims(ok), [])
+        # the specific kind: x/y#9 is blocked_by, not depends_on
+        r = self.claims(ok.replace("waited on:", "depended on:"))
+        self.assertEqual([x["target"] for x in r], ["x/y#9"])
+        bad = ("## Stories\n\n[#30](" + R + "/pull/30) depended on:\n- [#12](" + R + "/pull/12)\n"
+               "- [#13](" + R + "/pull/13)\n")
+        r = self.claims(bad)
+        self.assertEqual([(x["subject"], x["target"]) for x in r], [("o/r#30", "o/r#13")])
+        # a blank line ends the cue: the list is not its targets
+        apart = bad.replace("depended on:\n", "depended on:\n\n")
+        self.assertEqual(self.claims(apart), [])
+
     def test_m2_a_denial_of_a_non_waiting_relation_is_judged_as_stated(self):
         # #31 is merged: "in force" is a waiting notion, a follow-up stays one
         r = newsletter.relation_claims([self.v()], "## Stories\n\n#31 is no longer a follow-up "

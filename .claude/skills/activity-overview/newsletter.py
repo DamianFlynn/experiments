@@ -3477,6 +3477,7 @@ def _root_item(view, train_id):
 
 
 _EMPHASIS_RE = re.compile(r"\*\*|__")
+_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+")
 
 
 def _claim_scope(views, text, subject_story=None):
@@ -3515,11 +3516,27 @@ def _claim_scope(views, text, subject_story=None):
         start = quoted.index(chunk, pos) if chunk else pos
         pos = start + len(chunk)
         # a heading is prose too ("### #30 depends on #13" claims a relation)
+        pars, cur = [], start
         for par, repo in _scoped_paragraphs(chunk, slugs):
+            at = quoted.find(par, cur)
+            if at >= 0:
+                cur = at + len(par)
+            pars.append([par, repo, at])
+        # a line ending in a colon hands the list right below it (no blank
+        # line between) to the parser with it: "#30 depended on:" + "- #12"
+        merged = []
+        for par, repo, at in pars:
+            prev = merged[-1] if merged else None
+            if prev and prev[2] >= 0 and at >= 0 and prev[3] and \
+                    _LIST_ITEM_RE.match(par) and \
+                    quoted[prev[2] + len(prev[0]):at].strip(" \t") == "\n":
+                prev[0] = quoted[prev[2]:at + len(par)]
+                continue
+            merged.append([par, repo, at, par.rstrip().endswith(":")])
+        for par, repo, par_pos, _colon in merged:
             repo = repo if repo is not None else (slugs[0] if len(slugs) == 1 else None)
             if repo is None:
                 continue
-            par_pos = quoted.find(par, start)
             orig_par = t[par_pos:par_pos + len(par)] if par_pos >= 0 else par
             # emphasis marks are layout, not words: "#30 **depended on** #13"
             # is read as "#30 depended on #13" (offsets kept)
