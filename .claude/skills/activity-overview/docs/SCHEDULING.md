@@ -108,8 +108,9 @@ The AI group's home organisations include `Azure-Samples` (stream `home` and man
 **Groups are manifest streams.** The owner thinks in groups ("Enterprise Landing Zones",
 "AI related Landing Zones") and wants one newsletter per group. A manifest stream is the
 skill's existing form for "one logical project, several repositories": one store and one
-project per group, so cross-repository references between the members become trains and the
-people of the group are one project; `latest --stream ai-lz` answers for the whole group and
+project per group, so cross-repository references between the members become project trains
+(in the digest's project view; the newsletter tells each member's trains as separate stories,
+`reference/newsletter.md`) and the people of the group are one project; `latest --stream ai-lz` answers for the whole group and
 its `next` commands already view every member and pass all the views to `newsletter.py`
 (the documented multi-repository newsletter). One stream per repository with a `group`
 label would need a new group reader that collects views from several stores, and would lose
@@ -554,9 +555,10 @@ python3 $AO/schedule.py token renew --streams $W/streams.json --kick
    - possibly a different or partial value, to check with `token status`.
 
    It never claims the old token is still there unless that was read back. `token app-key`
-   writes the app's key the same way. The env file is written as a new mode-600 file in a
-   mode-700 directory, fsynced and renamed over the old one: until that rename, the old file
-   is untouched.
+   writes the app's key the same way. The env file is written as a new mode-600 file in its
+   directory, fsynced and renamed over the old one: until that rename, the old file is
+   untouched. A missing directory is created mode 700; an existing one keeps its mode
+   (neither `token renew` nor the wrappers check or tighten it), so `chmod 700` it as above.
 5. `--kick` then starts a run: on macOS `launchctl kickstart gui/<uid>/local.activity-overview.gather`
    (the scheduled job, which reads the new token where the streams file says). If
    `launchctl` exits non-zero, `token renew` says the job was **not** started (e.g. it is not

@@ -60,10 +60,13 @@ theme counts.
 The earliest trigger of a story wins; a later event never makes a second post (except the
 closing post above). Stories that are only in flight or stalled without one of these events get
 no post (there is nothing for a reader to do yet). **Plumbing gets no daily post**: ONE weekly
-post per ISO week ("what was engineered"), due on that week's Sunday and pending until the
+post per ISO week **per repository** ("what was engineered"), due on that week's Sunday and pending until the
 view covers that day (never drafted from part of a week), covering every plumbing theme with a PR merged or opened that week, biggest first
 (`must_state.themes`, by merged then opened), plus the closures not posted
-(`closures_not_posted`): `post_id` `weekly:<repo>:<YYYY>-W<ww>`. The LinkedIn form may use its
+(`closures_not_posted`, each in the week of its closing day): `post_id` `weekly:<repo>:<YYYY>-W<ww>`. A
+week with folded closures but no plumbing activity still gets its post. In a multi-repository
+stream each member has its own weekly post, holding only that member's themes and closures;
+the members' posts are not merged into one. The LinkedIn form may use its
 full length; the X form names the one or two main things and links the repository or the main
 pull request.
 

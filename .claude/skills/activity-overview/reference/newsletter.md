@@ -343,6 +343,17 @@ repositories (one Terraform module per repository); people counts stay per repos
 (`numbers.by_repo`); stream totals add only additive counts. A member's GitHub release notes
 (`versions.releases`) stand in for a changelog.
 
+**A story never spans repositories.** A story is one member's train, and `link.py` builds
+trains per repository: PRs join only through the issues of their own repository that they
+close. Work that crosses members (a PR in one repository closing or citing an issue in
+another) is told as one story per member, each under its own qualified key, with nothing in
+the outline joining them; the project trains of `digest.py` (`ptrain-…`, BUNDLE.md) are not
+read here. A story may name another member's item by link or `owner/repo#N`; the story check
+treats such an item as outside its slice (never covered). Outside story blocks, a
+paragraph's repository is the one its github.com links name when they name exactly one
+member, else the one the nearest heading above it names (`owner/repo`, or a repository name
+no other member shares); `#N`, module areas and quotes are resolved in that repository.
+
 ## Inputs (view keys)
 
 `module_changes` (summary, modules with `url`, `display_name`, `description`,
