@@ -2054,7 +2054,7 @@ class TestSocialPosts(unittest.TestCase):
         # work that never releases posts on its merge day
         self.assertEqual((by["train-pr-13"]["day"], by["train-pr-13"]["trigger"]),
                          ("2026-10-09", "merged_no_release"))
-        # plumbing: no daily post, one weekly item per theme with activity
+        # plumbing: no daily post, one weekly post covering every theme
         self.assertNotIn("train-pr-12", by)
         # ONE weekly post per week (the owner's decision), every theme in it
         self.assertEqual([(w["post_id"], w["day"]) for w in c["weekly"]],
@@ -2820,6 +2820,154 @@ class TestSocialCoverageAndFile(unittest.TestCase):
         self.assertIn("story:o/r:train-pr-30", ids)
         # on 20 October #31 was open again: the story was not withdrawn
         self.assertNotIn("story:o/r:train-pr-30:closed", ids)
+
+
+class TestStoryRelations(unittest.TestCase):
+    """How stories depend on each other: the relation layer in the outline,
+    the work package, the issue check and the post check."""
+
+    def v(self):
+        v = TestSocialPosts().v()
+        # #30 (a module story) waits on #12 (plumbing); #31 is a follow-up of
+        # #11; #10's train mentions #13 only; #32 is blocked by an external issue
+        v["prs"] += [
+            {"number": 30, "title": "feat: hci thing", "author": "sam", "url": R + "/pull/30",
+             "state": "open", "merged": False, "created_at": "2026-10-03T10:00:00Z"},
+            {"number": 31, "title": "fix: dns follow-up", "author": "sam", "url": R + "/pull/31",
+             "state": "closed", "merged": True, "merged_at": "2026-10-12T10:00:00Z",
+             "created_at": "2026-10-10T10:00:00Z"}]
+        v["trains"] += [{"id": "train-pr-30", "outcome": "in_flight", "prs": [30], "issues": []},
+                        {"id": "train-pr-31", "outcome": "shipped", "prs": [31], "issues": []}]
+        k = "o/r:"
+        edges = [
+            {"from": k + "train-pr-30", "to": k + "train-pr-12", "relation": "depends_on",
+             "basis": {"kind": "text", "quote": "needs #12 first", "item": {"type": "pr",
+                                                                            "number": 30}},
+             "target_kind": "ci_workflows", "target_state": "merged", "waiting": False,
+             "target_item": {"type": "pr", "number": 12}},
+            {"from": k + "train-pr-31", "to": k + "train-pr-11", "relation": "follow_up_of",
+             "basis": {"kind": "text", "quote": "Follow-up to #11"}, "target_kind": "module_change",
+             "target_state": "merged"},
+            {"from": k + "train-issue-5", "to": k + "train-pr-13", "relation": "mentions",
+             "basis": {"kind": "text", "quote": "see #13"}},
+            {"from": k + "train-pr-30", "to": {"repo": "x/y", "number": 9,
+                                               "url": "https://github.com/x/y/issues/9"},
+             "relation": "blocked_by", "external": True, "target_kind": "external",
+             "basis": {"kind": "text", "quote": "wait on https://github.com/x/y/issues/9"}}]
+        v["story_graph"] = {"edges": edges, "chains": [[k + "train-pr-30", k + "train-pr-12"]],
+                            "most_blocking": [{"story": k + "train-pr-12", "waiting_stories": 2,
+                                               "stories": [k + "train-pr-30", k + "train-pr-31"]}],
+                            "external": [{"repo": "x/y", "number": 9, "from": k + "train-pr-30",
+                                          "relation": "blocked_by"}]}
+        v["stories"]["all"] += [
+            {"id": "train-pr-30", "group": "in_flight", "state": "in_flight", "worthy": "x",
+             "relations": [
+                 {"relation": "depends_on", "other": k + "train-pr-12", "other_kind": "ci_workflows",
+                  "basis": edges[0]["basis"], "other_state": "merged", "waiting": False,
+                  "other_item": {"type": "pr", "number": 12, "url": R + "/pull/12"}},
+                 {"relation": "blocked_by", "other": edges[3]["to"], "external": True,
+                  "basis": edges[3]["basis"]}]},
+            {"id": "train-pr-31", "group": "landed", "state": "landed", "worthy": "x",
+             "released": [{"status": "no_version_change"}],
+             "relations": [{"relation": "follow_up_of", "other": k + "train-pr-11",
+                            "basis": edges[1]["basis"], "other_state": "merged"}]}]
+        return v
+
+    def test_outline_carries_relations_connections_and_plumbing_needed_by(self):
+        out = newsletter.outline([self.v()])
+        st = section(out, "stories")
+        row = next(r for r in st["all"] if r["key"] == "train-pr-30")
+        dep = next(x for x in row["relations"] if x["relation"] == "depends_on")
+        self.assertEqual((dep["other"]["key"], dep["other"]["title"], dep["basis"]["quote"]),
+                         ("train-pr-12", "ci: bump action", "needs #12 first"))
+        ext = next(x for x in row["relations"] if x.get("external"))
+        self.assertIsNone(ext["other_state"])
+        self.assertEqual(row["waited_on_plumbing"][0]["relation"], "depends_on")
+        c = st["connections"]
+        self.assertEqual([x["key"] for x in c["chains"][0]], ["train-pr-30", "train-pr-12"])
+        self.assertEqual(c["most_blocking"][0]["key"], "train-pr-12")
+        self.assertEqual(c["external"][0]["target"]["repo"], "x/y")
+        th = section(out, "plumbing")["themes"][0]
+        self.assertEqual(th["needed_by"][0]["story"], "train-pr-30")
+        # no mention becomes a relation
+        row5 = next(r for r in st["all"] if r["key"] == "train-issue-5")
+        self.assertNotIn("relations", row5)
+
+    def test_work_package_rows_carry_relations(self):
+        with tempfile.TemporaryDirectory() as d:
+            newsletter.work_package([self.v()], d)
+            row = json.load(open(os.path.join(d, "rows", "train-pr-30.row.json")))
+            self.assertEqual(row["relations"][0]["other"]["title"], "ci: bump action")
+            brief = open(os.path.join(d, "batches", "stories-01", "STORY_BRIEF.md")).read()
+            self.assertIn("How the work connects", brief)
+
+    def claims(self, text, **kw):
+        return newsletter.relation_claims([self.v()], text, **kw)["relations_not_in_view"]
+
+    def test_a_relation_claim_must_match_an_edge(self):
+        ok = "## Stories\n\n[#30](" + R + "/pull/30) depended on [#12](" + R + "/pull/12).\n"
+        self.assertEqual(self.claims(ok), [])
+        self.assertEqual(self.claims("## Stories\n\n[#31](" + R + "/pull/31) is a follow-up to "
+                                     "[#11](" + R + "/pull/11).\n"), [])
+        # inverse wording
+        self.assertEqual(self.claims("## Stories\n\n[#12](" + R + "/pull/12) was needed by "
+                                     "[#30](" + R + "/pull/30).\n"), [])
+        # a bare mention is never a dependency
+        r = self.claims("## Stories\n\n[#10](" + R + "/pull/10) depends on [#13](" + R +
+                        "/pull/13).\n")
+        self.assertEqual(r[0]["problem"], "no such relation in the record")
+        # the wrong kind
+        self.assertTrue(self.claims("## Stories\n\n[#31](" + R + "/pull/31) was caused by "
+                                    "[#11](" + R + "/pull/11).\n"))
+        # an external target, named by its link
+        self.assertEqual(self.claims("## Stories\n\n[#30](" + R + "/pull/30) waited on "
+                                     "https://github.com/x/y/issues/9 to be resolved.\n"), [])
+
+    def test_still_waiting_needs_an_open_blocker(self):
+        r = self.claims("## Stories\n\n[#30](" + R + "/pull/30) still waits on [#12](" + R +
+                        "/pull/12).\n")
+        self.assertEqual(r[0]["problem"], "the blocker is no longer open")
+        # on 3 October #12 (opened 30 September, merged 4 October) was still open
+        v = self.v()
+        v["prs"][2]["created_at"] = "2026-09-30T10:00:00Z"
+        self.assertEqual(newsletter.relation_claims(
+            [v], "## Stories\n\n[#30](" + R + "/pull/30) still waits on [#12](" + R +
+            "/pull/12).\n", as_of="2026-10-03")["relations_not_in_view"], [])
+
+    def test_a_story_states_its_dependency_inside_its_block(self):
+        text = ("## Stories\n\n### In flight\n\n<!-- story: train-pr-30 -->\n**In flight — x**\n\n"
+                "It depended on [#12](" + R + "/pull/12).\n<!-- /story -->\n")
+        self.assertEqual(self.claims(text), [])
+        bad = text.replace("[#12](" + R + "/pull/12)", "[#13](" + R + "/pull/13)")
+        self.assertTrue(self.claims(bad))
+
+    def test_inside_one_story_passes_only_with_the_quote(self):
+        v = self.v()
+        v["prs"].append({"number": 33, "title": "x", "author": "sam", "url": R + "/pull/33",
+                         "state": "open", "merged": False, "created_at": "2026-10-03T10:00:00Z"})
+        v["trains"][-2]["prs"] = [30, 33]
+        bare = "## Stories\n\n[#33](" + R + "/pull/33) is blocking [#30](" + R + "/pull/30).\n"
+        r = newsletter.relation_claims([v], bare)["relations_not_in_view"]
+        self.assertEqual(r[0]["problem"], "inside one story without a quote")
+        quoted = ("## Stories\n\n[#33](" + R + "/pull/33) is blocking [#30](" + R + "/pull/30): "
+                  "its author wrote \"which is blocking #30\".\n")
+        self.assertEqual(newsletter.relation_claims([v], quoted)["relations_not_in_view"], [])
+
+    def test_the_issue_and_post_checks_fail_an_unsupported_relation(self):
+        v = self.v()
+        text = GOOD.replace("A pipeline action was bumped in [#12](https://github.com/o/r/pull/12).",
+                            "A pipeline action was bumped in [#12](https://github.com/o/r/pull/12), "
+                            "which depends on [#10](https://github.com/o/r/pull/10).")
+        r = newsletter.check_newsletter([v], text, slices={"train-issue-5": SLICE})
+        self.assertTrue(r["relations_not_in_view"])
+        self.assertFalse(r["ok"])
+        post = TestSocialPosts.POST.replace(
+            "It adds the Redis zone.", "It adds the Redis zone; #31 is a follow-up of #11.")
+        self.assertTrue(newsletter.check_posts([v], post)["ok"])
+        post = TestSocialPosts.POST.replace(
+            "It adds the Redis zone.", "It adds the Redis zone; it waits on #12.")
+        r = newsletter.check_posts([v], post)
+        self.assertTrue(r["posts"][1]["relations_not_in_view"])
 
 
 class TestThemeCheck(unittest.TestCase):

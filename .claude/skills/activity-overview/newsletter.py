@@ -3136,6 +3136,7 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence=None
     # one state per fact: a PR's review state, its open/merged/closed state and
     # a version's release status read the same in every section
     res.update(state_claims(views, text))
+    res.update(relation_claims(views, text))
 
     # dates carry the year
     no_year = []
@@ -3196,7 +3197,7 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence=None
                  "versions_not_linked", "release_status_missing", "ownership_not_in_view",
                  "automation_as_person",
                  "review_state_mismatch", "pr_state_mismatch", "release_status_mismatch",
-                 "superseded_not_in_view",
+                 "superseded_not_in_view", "relations_not_in_view",
                  "markers_malformed",
                  "sections_missing",
                  "omitted_section_present", "sections_out_of_order", "title_missing",
@@ -3368,6 +3369,151 @@ def release_on(view, module, version, day):
     if undated and not dates:
         return "unknown"     # tagged at an unknown time: the day cannot be told
     return "declared_not_published"
+
+
+# --- relation claims -----------------------------------------------------------
+
+# (claim, pattern, the edge relations that make it true, inverse wording?)
+_RELATION_CLAIMS = (
+    ("blocked_by", re.compile(r"\b(?:blocked\s+(?:by|on)|waits?\s+(?:on|for)|waiting\s+(?:on|for)|"
+                              r"waited\s+(?:on|for)|on\s+hold\s+until)\b", re.I),
+     {"blocked_by", "depends_on", "stacked_on"}, False),
+    ("depends_on", re.compile(r"\b(?:depends|depended|depending)\s+on\b|\bbuilt\s+on\b|"
+                              r"\bon\s+top\s+of\b|\bstack(?:s|ed)\s+on\b", re.I),
+     {"depends_on", "stacked_on", "blocked_by"}, False),
+    ("follow_up_of", re.compile(r"\bfollow(?:-|\s)?ups?\s+(?:to|of|on|for)\b|"
+                                r"\bfollows\s+up\s+on\b|\bcontinuation\s+of\b", re.I),
+     {"follow_up_of"}, False),
+    ("caused_by", re.compile(r"\bcaused\s+by\b|\bregression\s+from\b|\bbroken\s+by\b|"
+                             r"\bintroduced\s+by\b", re.I), {"caused_by"}, False),
+    ("blocked_by", re.compile(r"\bblock(?:s|ing)\b", re.I),
+     {"blocked_by", "depends_on", "stacked_on"}, True),
+    ("depends_on", re.compile(r"\b(?:needed|required)\s+by\b|\bprerequisite\s+for\b", re.I),
+     {"depends_on", "stacked_on", "blocked_by"}, True),
+    ("follow_up_of", re.compile(r"\bfollowed\s+(?:up\s+)?by\b|\bcontinued\s+in\b", re.I),
+     {"follow_up_of"}, True),
+)
+_STILL_RE = re.compile(r"\b(?:still|is|are|remains?|now)\s+(?:\w+\s+)?(?:blocked|waiting)\b|"
+                       r"\bwaits\s+(?:on|for)\b|\bstill\s+depends\b|\bdepends\s+on\b", re.I)
+
+
+def relation_claims(views, text, as_of=None, subject_story=None):
+    """A sentence that says a story is blocked by / waits on / depends on /
+    is built on / follows up on / was caused by another item (or the inverse
+    wording) must match an edge of that kind in the view's relation layer
+    (`story_graph`), between the stories of the items it names: the subject is
+    the item named before the cue, else the story block the sentence is in;
+    the object is the item (or external link) after it. A present-tense
+    "waits on" / "is blocked by" needs the edge still waiting (both ends open)
+    at the window's end, or, with `as_of`, on that day. A relation between
+    two items of the SAME story is not in the layer: it passes when the
+    sentence quotes the record (the quote is checked by the quote / story
+    check), else it fails. Quoted text is the author's words and is not read.
+    `subject_story` (a post's own story key) is the subject of a sentence that
+    names none. Returns {"relations_not_in_view": [...]}."""
+    slugs = [_slug(v) for v in views]
+    item_story, edges, states = {}, set(), {}
+    for v in views:
+        sl = _slug(v)
+        for t in v.get("trains") or []:
+            key = "{}:{}".format(sl, t["id"])
+            for n in t.get("prs") or []:
+                item_story.setdefault((sl, n), key)
+            for n in t.get("issues") or []:
+                item_story.setdefault((sl, n), key)
+        for e in (v.get("story_graph") or {}).get("edges") or []:
+            rel = e.get("relation")
+            if rel == "mentions":
+                continue
+            to = e.get("to")
+            to_key = "ext:" + (to.get("url") or "").lower() if isinstance(to, dict) else to
+            edges.add((e.get("from"), to_key, rel))
+            states[(e.get("from"), to_key, rel)] = e
+    blank = lambda m: re.sub(r"[^\n]", " ", m.group(0))   # noqa: E731
+    t = _COMMENT_RE.sub(lambda m: m.group(0) if m.group(0).lstrip("<!- ").startswith(
+        ("story:", "/story")) else blank(m), text)
+    t = _FENCE_RE.sub(blank, t)
+    quoted = link._QUOTE_RE.sub(blank, t)
+    blocks = [(m.start(), m.end(), m.group(1)) for m in _STORY_BLOCK_RE.finditer(t)]
+    out = []
+
+    def story_of_block(pos, repo):
+        for a, b, key in blocks:
+            if a <= pos < b:
+                k = key if ":" in key else "{}:{}".format(repo, key)
+                return k
+        return None
+    proj = RecordAsOf(views, as_of) if as_of else None
+    pos = 0
+    for sid, chunk in _section_chunks(quoted):
+        start = quoted.index(chunk, pos) if chunk else pos
+        pos = start + len(chunk)
+        for par, repo in _scoped_paragraphs(chunk, slugs):
+            if _is_heading(par):
+                continue
+            repo = repo if repo is not None else (slugs[0] if len(slugs) == 1 else None)
+            if repo is None:
+                continue
+            par_pos = quoted.find(par, start)
+            orig_par = t[par_pos:par_pos + len(par)] if par_pos >= 0 else par
+            for snt in _sentences(_strip(par, code=False)):
+                for claim, rx, ok_rels, inverse in _RELATION_CLAIMS:
+                    m = rx.search(snt)
+                    if not m:
+                        continue
+                    before = [int(x) for x in _ITEM_RE.findall(snt[:m.start()])]
+                    after_txt = snt[m.end():m.end() + 160]
+                    after = [int(x) for x in _ITEM_RE.findall(after_txt)]
+                    ext = [u.rstrip(".,;:)").lower() for u in _URL_RE.findall(after_txt)
+                           if not _REPO_LINK_RE.match(u) or
+                           _REPO_LINK_RE.match(u).group(1).lower() not in
+                           {x.lower() for x in slugs}]
+                    if not after and not ext:
+                        continue
+                    subj = [item_story.get((repo, n)) for n in before]
+                    subj = [x for x in subj if x] or [story_of_block(par_pos, repo)
+                                                      or subject_story]
+                    subj = [x for x in subj if x]
+                    if not subj:
+                        continue
+                    objs = [item_story.get((repo, n)) for n in after if item_story.get((repo, n))]
+                    objs += ["ext:" + u for u in ext]
+                    if not objs:
+                        continue
+                    found, same_story = None, False
+                    for a in subj:
+                        for b in objs:
+                            if a == b:
+                                same_story = True
+                                continue
+                            pair = (b, a) if inverse else (a, b)
+                            for rel in ok_rels:
+                                if (pair[0], pair[1], rel) in edges:
+                                    found = states[(pair[0], pair[1], rel)]
+                    row = {"claim": claim, "sentence": " ".join(snt.split())[:200]}
+                    if found is None:
+                        if same_story and link._QUOTE_RE.search(orig_par):
+                            continue    # in one story: the quoted record says it
+                        row["problem"] = "inside one story without a quote" if same_story \
+                            else "no such relation in the record"
+                        out.append(row)
+                        break
+                    if claim in ("blocked_by", "depends_on") and not inverse and \
+                            _STILL_RE.search(snt) and found.get("relation") in WAITING_RELATIONS:
+                        if proj is None:
+                            still = bool(found.get("waiting"))
+                        else:
+                            item = found.get("target_item") or {}
+                            src = (found.get("basis") or {}).get("item") or {}
+                            still = all(proj.pr_state(repo, x.get("number")) == "open"
+                                        or (x.get("type") == "issue" and
+                                            proj.pr_state(repo, x.get("number")) is None)
+                                        for x in (item, src) if x.get("number"))
+                        if not still:
+                            row["problem"] = "the blocker is no longer open"
+                            out.append(row)
+                    break
+    return {"relations_not_in_view": out}
 
 
 class RecordAsOf:
@@ -3551,7 +3697,8 @@ THEME_CHECK_KEYS = (
     "items_not_in_view", "modules_not_in_view", "versions_not_in_view", "people_not_in_view",
     "name_mismatch", "do_not_name_named", "affiliation_mismatch", "automation_as_person",
     "review_state_mismatch", "pr_state_mismatch", "release_status_mismatch",
-    "superseded_not_in_view", "candidates_worded_as_declared", "dates_without_year", "numbers_not_in_view",
+    "superseded_not_in_view", "relations_not_in_view", "candidates_worded_as_declared",
+    "dates_without_year", "numbers_not_in_view",
     "characterising_words", "modules_not_linked", "versions_not_linked", "markers_malformed")
 
 
@@ -3627,7 +3774,7 @@ CANNOT_CHECK = (
 # --- daily social posts (drafts for the owner to approve) ----------------------
 #
 # One post per story, at the first event a reader can act on; plumbing rolls
-# into one weekly item per theme with activity. reference/social.md has the
+# into ONE weekly post per repository, covering every theme with activity. reference/social.md has the
 # rules, the ledger and what the posting step needs. Nothing here schedules or
 # publishes anything: the outline lists what became postable on a day.
 
@@ -4036,8 +4183,9 @@ def social_candidates(views, hold_days=SOCIAL_HOLD_DAYS, automation=()):
                                                  v, replacements[e["module"]].get("module"))[0])
                                              if replacements.get(e["module"]) else None)}
                                             if e["kind"] == "deprecated" else {})}})
-        # plumbing: ONE weekly post per week, on the week's last day inside the
-        # window, covering every theme with activity that week, biggest first
+        # plumbing: ONE weekly post per week, due on the week's Sunday (pending
+        # until the coverage reaches it), covering every theme with activity
+        # that week, biggest first
         weeks = {}
         for th in sec["plumbing"].get("themes") or []:
             if multi and th.get("repo") != sl:
@@ -4146,7 +4294,8 @@ POST_CHECK_KEYS = (  # plus release_claimed_while_unknown, set per post
     "urls_not_in_view", "quotes_not_in_view", "items_not_in_view", "modules_not_in_view",
     "versions_not_in_view", "people_not_in_view", "do_not_name_named", "affiliation_mismatch",
     "automation_as_person", "review_state_mismatch", "pr_state_mismatch",
-    "release_status_mismatch", "superseded_not_in_view", "candidates_worded_as_declared",
+    "release_status_mismatch", "superseded_not_in_view", "relations_not_in_view",
+    "candidates_worded_as_declared",
     "dates_without_year", "numbers_not_in_view", "characterising_words")
 
 
@@ -4461,7 +4610,7 @@ def check_posts(views, text, registry=None, against=None, hold_days=SOCIAL_HOLD_
         allowed = set()
         _social_numbers(row.get("must_state") if row else None, allowed)
         if full.get("numbers_not_in_view"):
-            # a count the row itself gives (a weekly item's PRs) is a fact too
+            # a count the row itself gives (a weekly post's PRs) is a fact too
             full["numbers_not_in_view"] = [x for x in full["numbers_not_in_view"]
                                            if x not in allowed]
         if full.get("urls_not_in_view"):
@@ -4472,6 +4621,9 @@ def check_posts(views, text, registry=None, against=None, hold_days=SOCIAL_HOLD_
         # every state, review and publication claim against the record as of
         # the post's day (one projection, not the window's end)
         full.update(state_claims(views, issue, as_of=day))
+        full.update(relation_claims(views, issue, as_of=day, subject_story=(
+            "{}:{}".format(pid.split(":")[1], pid.split(":")[2]) if pid.startswith("story:")
+            and pid.count(":") >= 2 else None)))
         for snt in _sentences(_URL_RE.sub(" ", plain)):
             if not re.search(r"\bcommunity\b", snt, re.I):
                 continue
@@ -4568,6 +4720,16 @@ WORK_PACKAGE_RULES = """
    description that names the issue, or "a closing reference GitHub records") and **what a PR
    changed as a whole** (`net_files`: files, lines added / removed, own commits) may be said;
    an automation account works for the person `author_on_behalf_of` names on that PR.
+14. **How the work connects.** `relations` in the row file are the story's links to other
+   stories from the record (never a bare mention): say what it waits on (`blocked_by`,
+   `depends_on`, `stacked_on` with `waiting`) in "Where it stands", and what it unblocked,
+   followed up (`follow_up_of`), was caused by (`caused_by`) or where its content landed
+   (`content_landed_in`) where the change is told — with the quote's substance and a link to
+   the other item. A target with `waiting: false` is no longer waited on: say it was waited
+   on, not that it still is. An external target (another repository) is named with its link
+   and no state. A relation between two items of the same story is not in `relations`: state
+   it only with the slice's own quote. The issue check fails a dependency the record does not
+   hold (`relations_not_in_view`).
 """
 
 
