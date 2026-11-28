@@ -60,8 +60,8 @@ theme counts.
 The earliest trigger of a story wins; a later event never makes a second post (except the
 closing post above). Stories that are only in flight or stalled without one of these events get
 no post (there is nothing for a reader to do yet). **Plumbing gets no daily post**: ONE weekly
-post per ISO week ("what was engineered"), due on that week's Sunday (or the window's last
-day), covering every plumbing theme with a PR merged or opened that week, biggest first
+post per ISO week ("what was engineered"), due on that week's Sunday and pending until the
+view covers that day (never drafted from part of a week), covering every plumbing theme with a PR merged or opened that week, biggest first
 (`must_state.themes`, by merged then opened), plus the closures not posted
 (`closures_not_posted`): `post_id` `weekly:<repo>:<YYYY>-W<ww>`. The LinkedIn form may use its
 full length; the X form names the one or two main things and links the repository or the main
@@ -99,7 +99,8 @@ Both forms state the same facts; neither adds one.
 - **X**: at most `X_LIMIT` (280) characters, counted as X counts them: every URL counts
   `X_LINK_WEIGHT` (23) characters whatever its length, a character in the Latin and general
   punctuation ranges counts 1, any other (most emoji, CJK) counts 2 (`newsletter.x_length`).
-  One link, to the tag of the published version, else the pull request, else the module.
+  One link, to the tag of the published version, else the pull request, else the module; a
+  deprecation post that names a replacement carries a second link, to the replacement.
 - **LinkedIn**: a short paragraph or three, at most `LINKEDIN_LIMIT` (1,200) characters (URLs
   at their full length), plain text, at most `LINKEDIN_HASHTAGS` (3) hashtags.
 - **URLs** are read once (`_post_urls`): trailing sentence punctuation is not part of a link,
