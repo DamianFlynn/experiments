@@ -300,10 +300,55 @@ file it is then written to. Every way of entering one below reads a file or prom
 scans the docs and examples so a secret-on-the-command-line instruction cannot come back.
 
 **The folder that holds a secret** (the token env file, the app's private key file). The
-file's own mode 600 keeps its content private, but whoever can **write** its folder can
-replace or rename the file. So:
+file's own mode 600 keeps its content private, but whoever can **write** its folder, or any
+folder above it, can replace or rename the file. A mode-700 `/shared/private` under a
+world-writable `/shared` can be renamed away, with another folder and token put in its
+place. So the **whole path** is checked, component by component from `/`, on every read
+path and before every write (the env file, the app key, and the wrappers through
+`token where`):
 
-- **Group- or other-writable folder: refused, on every path.** That covers writing
+- every directory on the way, `/` included, is owned by you or by root;
+- no directory on the way is writable by group or others, **except** one with the sticky
+  bit (like `/tmp`) where the next component down is owned by you or root: the sticky bit
+  lets only an entry's owner (or root) rename or remove it;
+- a **symlink** on the way is a substitution point too. Its folder is checked like any
+  other, the link must be owned by you or root, and its target is then walked from `/` the
+  same way (relative targets from the link's folder; `..` through the real folders);
+- the secret file is a regular file owned by you.
+
+A refusal names the offending component and the fix. Examples:
+- `/shared is writable by group or others (mode 777) without the sticky bit … Fix: chmod
+  go-w /shared if it is yours, or keep the file under folders only you and root can change`;
+- `… is owned by uid 501 (neither you nor root)`;
+- `… is a symlink owned by uid …`.
+
+Ancestors are never chmod-ed. A missing folder is created only inside a folder that passes
+the same check.
+
+On macOS (reasoned from the standard layout, not run on a Mac):
+- `/Users` is root-owned, mode 755, and your home is yours: a key under
+  `~/.config/activity-overview` passes;
+- `/tmp` is a root-owned symlink to `/private/tmp`, which is sticky and world-writable:
+  it passes when the next folder is yours;
+- a group-writable folder such as one writable by `staff` or `admin` (e.g. an Intel
+  Homebrew prefix) is refused;
+- ACLs, which macOS uses more often than Linux, are not read (below).
+
+**What the check does not cover.**
+- Access control lists: only the mode bits and owners are read.
+- A root-owned directory that someone else administers: root is trusted on the whole path.
+- The time between check and use:
+  - The runner and `token status` open the file once, without following a final symlink,
+    and check the open handle (same file the walk saw, regular, yours) before reading. The
+    app key's bytes then go to `openssl` through a pipe, so it never reopens the path.
+  - The wrappers source the env file by path, but the path `token where` prints is the
+    real one, with no symlink left to swap.
+  - Changing a directory on a checked path needs its owner (you) or root, both already
+    trusted.
+
+On top of the path, **the folder that directly holds the secret** has its own rule:
+
+- **Group- or other-writable folder: refused, on every path,** even with the sticky bit. That covers writing
   (`token renew`, `token app-key`) and reading: the runner and `token status` /
   `token app-check` through the key, and the wrappers through `token where --field env-file`.
   The message names the folder, its mode and the fix (`chmod 700 <folder>`, or a private

@@ -1505,6 +1505,7 @@ class TestTokenInRuns(Case):
 # --- the app route --------------------------------------------------------------------------------
 
 APP_TOKEN_PREFIX = "ghs_" + "AppInst" * 5
+KEY_TEXT = b"-----BEGIN PRIVATE KEY-----\nnot a real key\n-----END PRIVATE KEY-----\n"
 
 
 class FakeAppAPI:
@@ -1588,7 +1589,7 @@ class AppCase(Case):
         os.makedirs(self.keydir, mode=0o700)
         self.key = os.path.join(self.keydir, "app.pem")
         with open(self.key, "w") as fh:
-            fh.write("-----BEGIN PRIVATE KEY-----\nnot a real key\n-----END PRIVATE KEY-----\n")
+            fh.write(KEY_TEXT.decode())
         os.chmod(self.key, 0o600)
 
     def app_cfg(self, streams=None, **token):
@@ -1648,8 +1649,15 @@ class TestAppJWT(Case):
             head = fh.read(40)
         if b"BEGIN RSA PRIVATE KEY" not in head:
             self.skipTest("this openssl cannot write a PKCS#1 key")
-        self.assertEqual(schedule.load_app_key({"private_key_file": pkcs1},
-                                               isdir=lambda p: False), ("file", pkcs1))
+        with open(pkcs1, "rb") as fh:
+            content = fh.read()
+        # the key is read once through the verified handle, then signed with
+        # through the pipe (openssl never reopens the path)
+        loaded = schedule.load_app_key({"private_key_file": pkcs1}, isdir=lambda p: False)
+        self.assertEqual(loaded, ("pem", content))
+        _header, claims = self.verify(pkcs1, schedule.make_jwt(
+            "Iv23x", loaded, 1_800_000_000))
+        self.assertEqual(claims["iss"], "Iv23x")
         _header, claims = self.verify(pkcs1, schedule.make_jwt(
             "Iv23x", ("file", pkcs1), 1_800_000_000))
         self.assertEqual(claims["iss"], "Iv23x")
@@ -1675,7 +1683,7 @@ class TestAppJWT(Case):
 class TestAppKey(AppCase):
     def test_file_checks(self):
         s = {"private_key_file": self.key, "workspace": self.ws}
-        self.assertEqual(schedule.load_app_key(s, isdir=lambda p: False), ("file", self.key))
+        self.assertEqual(schedule.load_app_key(s, isdir=lambda p: False), ("pem", KEY_TEXT))
         os.chmod(self.key, 0o644)
         with self.assertRaises(schedule.AuthError) as cm:
             schedule.load_app_key(s, isdir=lambda p: False)
@@ -2350,7 +2358,7 @@ class TestWrappersFollowTheSettings(Case):
         self.assertIsNone(got)
 
 
-class TestSecretFolders(AppCase):
+class SecretFolderCase(AppCase):
     """The folder holding the token file or the app key: tightened on write
     when it is the user's own private folder, refused on every path when
     group/other-writable, warned about when only group/other-readable, and
@@ -2375,6 +2383,8 @@ class TestSecretFolders(AppCase):
                                  now=FakeClock().now)
         return code, err.getvalue()
 
+
+class TestSecretFolders(SecretFolderCase):
     # --- write paths --------------------------------------------------------
 
     def test_a_new_folder_is_created_private(self):
@@ -2481,7 +2491,7 @@ class TestSecretFolders(AppCase):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             self.assertEqual(schedule.load_app_key(s, isdir=lambda p: False),
-                             ("file", self.key))
+                             ("pem", KEY_TEXT))
         self.assertIn("readable by group or others", err.getvalue())
         self.assertEqual(self.mode(self.keydir), 0o755)
         # app-check stops before any call with the folder writable
@@ -2520,6 +2530,206 @@ class TestSecretFolders(AppCase):
         self.assertEqual((code, out.strip()), (0, target))
         self.assertIn("readable by group or others", err)
         self.assertEqual(self.mode(d), 0o755)               # reads never chmod
+
+
+FOREIGN_UID = 54321
+AS_ROOT = hasattr(os, "getuid") and os.getuid() == 0
+
+
+class TestSecretChain(SecretFolderCase):
+    """Review (HIGH): the whole path to a secret is checked, not only its
+    folder. A mode-700 /shared/private under a world-writable, non-sticky
+    /shared could be renamed away and replaced with someone else's folder
+    and token. Real temporary directories; foreign ownership by chown
+    (root only), sticky directories, symlinks."""
+
+    def setUp(self):
+        super().setUp()
+        self.shared = self.folder("shared", 0o777)       # world-writable, NOT sticky
+        self.private = os.path.join(self.shared, "private")
+        os.makedirs(self.private)
+        os.chmod(self.private, 0o700)
+        self.addCleanup(os.chmod, self.shared, 0o700)
+
+    def put_token(self, folder):
+        target = os.path.join(folder, "token.env")
+        with open(target, "w") as fh:
+            fh.write("GITHUB_TOKEN={}\n".format(NEW_TOKEN))
+        os.chmod(target, 0o600)
+        return target
+
+    def test_the_finding_a_private_folder_under_a_writable_parent(self):
+        target = self.put_token(self.private)
+        with self.assertRaises(schedule.SecretDirError) as cm:
+            schedule.check_secret_dir(self.private)
+        msg = str(cm.exception)
+        self.assertIn("{} is writable by group or others (mode 777) without the sticky "
+                      "bit".format(self.shared), msg)
+        self.assertIn("chmod go-w " + self.shared, msg)
+        # every path refuses: where (the wrappers), status, renew (a write)
+        path = streams_file(self.tmp, token={"store": "env-file", "env_file": target})
+        code, out, err = self.run_cli(["token", "where", "--streams", path,
+                                       "--field", "env-file"])
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("without the sticky bit", err)
+        code, out, _err = self.run_cli(["token", "status", "--streams", path],
+                                       http_get=FakeAPI())
+        self.assertEqual(code, 1)
+        self.assertIn("REFUSED", out)
+        with open(target) as fh:
+            before = fh.read()
+        code, err = self.renew(target)
+        self.assertEqual(code, 1)
+        self.assertIn("without the sticky bit", err)
+        with open(target) as fh:
+            self.assertEqual(fh.read(), before)
+        self.assertEqual(self.mode(self.shared), 0o777)       # ancestors never chmod-ed
+        # the app key the same way
+        key = os.path.join(self.private, "app.pem")
+        with open(key, "wb") as fh:
+            fh.write(KEY_TEXT)
+        os.chmod(key, 0o600)
+        with self.assertRaises(schedule.AuthError) as cm:
+            schedule.load_app_key({"private_key_file": key}, isdir=lambda p: False)
+        self.assertIn("without the sticky bit", str(cm.exception))
+
+    def test_a_missing_folder_under_a_writable_parent_is_not_created(self):
+        target = os.path.join(self.shared, "new", "token.env")
+        code, err = self.renew(target)
+        self.assertEqual(code, 1)
+        self.assertIn("without the sticky bit", err)
+        self.assertFalse(os.path.exists(os.path.join(self.shared, "new")))
+
+    def test_the_sticky_exception(self):
+        os.chmod(self.shared, 0o1777)                         # like /tmp
+        target = self.put_token(self.private)
+        self.assertIsNone(schedule.check_secret_dir(self.private))
+        real, st = schedule.verify_secret_chain(target)
+        self.assertEqual(real, target)
+        data, _st = schedule.open_secret_file(target)
+        self.assertIn(NEW_TOKEN.encode(), data)
+
+    def test_the_real_temp_directory_passes_through_its_sticky_bit(self):
+        # every test path runs through the real temp directory; when it is the
+        # usual sticky, world-writable one, the walk accepts it because the
+        # next component (this test's folder) is ours
+        parent = os.path.dirname(os.path.realpath(self.tmp))
+        st = os.stat(parent)
+        if not (st.st_mode & 0o022 and st.st_mode & 0o1000):
+            self.skipTest("the temp directory is not sticky and world-writable here")
+        safe = self.folder("safe", 0o700)
+        self.assertIsNone(schedule.check_secret_dir(safe))
+
+    @unittest.skipUnless(AS_ROOT, "chown needs root")
+    def test_the_sticky_exception_needs_the_entry_to_be_ours(self):
+        os.chmod(self.shared, 0o1777)
+        os.chown(self.private, FOREIGN_UID, -1)
+        with self.assertRaises(schedule.SecretDirError) as cm:
+            schedule.check_secret_dir(self.private)
+        self.assertIn("protects only entries owned by you or root, but {} is owned by "
+                      "uid {}".format(self.private, FOREIGN_UID), str(cm.exception))
+
+    @unittest.skipUnless(AS_ROOT, "chown needs root")
+    def test_a_foreign_ancestor(self):
+        theirs = self.folder("theirs", 0o755)
+        mine = os.path.join(theirs, "mine")
+        os.makedirs(mine)
+        os.chmod(mine, 0o700)
+        os.chown(theirs, FOREIGN_UID, -1)
+        with self.assertRaises(schedule.SecretDirError) as cm:
+            schedule.check_secret_dir(mine)
+        self.assertIn("{} is owned by uid {} (neither you nor root)".format(
+            theirs, FOREIGN_UID), str(cm.exception))
+        target = self.put_token(mine)
+        with self.assertRaises(schedule.SecretDirError):
+            schedule.open_secret_file(target)
+
+    @unittest.skipUnless(AS_ROOT, "chown needs root")
+    def test_a_foreign_secret_file(self):
+        safe = self.folder("safe", 0o700)
+        target = self.put_token(safe)
+        os.chown(target, FOREIGN_UID, -1)
+        with self.assertRaises(schedule.SecretDirError) as cm:
+            schedule.open_secret_file(target)
+        self.assertIn("owned by uid {}, not you".format(FOREIGN_UID), str(cm.exception))
+        with self.assertRaises(schedule.SecretDirError):
+            schedule.env_file_for_wrapper(target)
+
+    def test_a_symlinked_path_is_walked_to_its_real_place(self):
+        safe = self.folder("safe", 0o700)
+        target = self.put_token(safe)
+        links = self.folder("links", 0o700)
+        link_dir = os.path.join(links, "cfg")
+        os.symlink("../safe", link_dir)                       # relative, with `..`
+        via_link = os.path.join(link_dir, "token.env")
+        self.assertEqual(schedule.verify_secret_chain(via_link)[0], target)
+        self.assertIsNone(schedule.check_secret_dir(link_dir))
+        path = streams_file(self.tmp, token={"store": "env-file", "env_file": via_link})
+        code, out, _err = self.run_cli(["token", "where", "--streams", path,
+                                        "--field", "env-file"])
+        self.assertEqual((code, out.strip()), (0, target))   # the real path, no link left
+        # a link whose target lies under the writable /shared is refused
+        bad = os.path.join(links, "bad")
+        os.symlink(self.private, bad)
+        self.put_token(self.private)
+        with self.assertRaises(schedule.SecretDirError) as cm:
+            schedule.open_secret_file(os.path.join(bad, "token.env"))
+        self.assertIn("without the sticky bit", str(cm.exception))
+
+    def test_a_symlink_in_a_writable_folder_is_a_substitution_point(self):
+        safe = self.folder("safe", 0o700)
+        self.put_token(safe)
+        link = os.path.join(self.shared, "cfg")               # the link's folder is 777
+        os.symlink(safe, link)
+        with self.assertRaises(schedule.SecretDirError) as cm:
+            schedule.open_secret_file(os.path.join(link, "token.env"))
+        self.assertIn("another user can rename {}".format(link), str(cm.exception))
+
+    @unittest.skipUnless(AS_ROOT, "lchown needs root")
+    def test_a_foreign_symlink(self):
+        safe = self.folder("safe", 0o700)
+        self.put_token(safe)
+        links = self.folder("links", 0o700)
+        link = os.path.join(links, "cfg")
+        os.symlink(safe, link)
+        os.lchown(link, FOREIGN_UID, -1)
+        with self.assertRaises(schedule.SecretDirError) as cm:
+            schedule.open_secret_file(os.path.join(link, "token.env"))
+        self.assertIn("{} is a symlink owned by uid {}".format(link, FOREIGN_UID),
+                      str(cm.exception))
+
+    def test_a_final_symlink_to_the_file_reads_the_real_file(self):
+        safe = self.folder("safe", 0o700)
+        target = self.put_token(safe)
+        alias = os.path.join(safe, "alias.env")
+        os.symlink("token.env", alias)
+        self.assertEqual(schedule.env_file_for_wrapper(alias), target)
+        data, _st = schedule.open_secret_file(alias)
+        self.assertIn(NEW_TOKEN.encode(), data)
+
+    def test_a_swap_between_check_and_open_is_refused(self):
+        safe = self.folder("safe", 0o700)
+        target = self.put_token(safe)
+        other = os.path.join(safe, "other.env")
+        with open(other, "w") as fh:
+            fh.write("x")
+        real_verify = schedule.verify_secret_chain
+
+        def stale(path, what="the token", allow_missing=False):
+            real, _st = real_verify(path, what, allow_missing)
+            return real, os.lstat(other)                      # what the walk saw before
+        with mock.patch.object(schedule, "verify_secret_chain", stale):
+            with self.assertRaises(schedule.SecretDirError) as cm:
+                schedule.open_secret_file(target)
+        self.assertIn("changed while it was being checked", str(cm.exception))
+
+    def test_the_write_goes_to_the_real_folder(self):
+        safe = self.folder("safe", 0o700)
+        links = self.folder("links", 0o700)
+        os.symlink(safe, os.path.join(links, "cfg"))
+        schedule.write_env_file(os.path.join(links, "cfg", "token.env"), NEW_TOKEN)
+        self.assertTrue(os.path.isfile(os.path.join(safe, "token.env")))
+        self.assertTrue(os.path.islink(os.path.join(links, "cfg")))
 
 
 class TestOwnersStreams(unittest.TestCase):
