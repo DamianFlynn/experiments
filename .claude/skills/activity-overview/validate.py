@@ -1321,6 +1321,12 @@ def _fact_signatures(value):
         if isinstance(value.get("prs"), list) and "gathered_at" in value \
                 and "base" not in value:
             out.add("pr_activity")
+        if isinstance(value.get("events"), list) and \
+                isinstance(value.get("without_owner"), list):
+            out.add("module_ownership")
+        if isinstance(value.get("items"), list) and \
+                isinstance(value.get("missing"), list):
+            out.add("linked_items")
         if isinstance(value.get("source"), str):
             out.add("label_taxonomy")
         if value and all(isinstance(v, dict) and "total" in v
@@ -1418,9 +1424,10 @@ _PR_ACTIVITY_FACT_KEYS = {"collected", "gathered_at", "limits", "requests",
 _PR_ACTIVITY_ROW_KEYS = {"number", "checks_status", "checks_reason", "head",
                          "commits_total", "commits", "threads_total", "threads",
                          "threads_omitted", "events", "events_omitted",
-                         "gathered_at"}
+                         "gathered_at", "history_status", "history_reason",
+                         "head_repo", "is_fork", "body_edited_at"}
 _PR_ACTIVITY_COMMIT_KEYS = {"sha", "committed_at", "rollup", "state", "checks",
-                            "checks_omitted"}
+                            "checks_omitted", "state_only"}
 _PR_ACTIVITY_CHECK_KEYS = {"name", "kind", "status", "conclusion", "started_at",
                            "completed_at", "url"}
 _PR_ACTIVITY_THREAD_KEYS = {"comment_id", "path", "line", "resolved",
@@ -1523,6 +1530,253 @@ def _pr_history_problem(value):
     return None
 
 
+_OWNERSHIP_FACT_KEYS = {"collected", "events", "without_owner", "label_patterns",
+                        "owner_files", "unread", "windows", "start_without_owner",
+                        "labelled_items", "without_owner_unavailable",
+                        "owners_at_end", "gathered_at", "start_state",
+                        "start_state_source", "end_check", "window", "as_of_window",
+                        "marker_files", "entry_files", "deprecated_modules",
+                        "stub_modules", "modules_at_end", "proposed_modules",
+                        "marker_texts", "shared_marker_texts"}
+_OWNERSHIP_EVENT_KEYS = {"kind", "module", "people", "date", "at", "seq", "source",
+                         "quote", "via", "marker_text", "info", "file_removed",
+                         "replacement", "file_added"}
+
+
+# --- typed shapes of the fields readers touch ---------------------------------
+#
+# A small schema language for the fields a reader indexes, slices, sorts or
+# keys on: "str" / "int" (never a boolean) / "bool" / "null" / "any"; a tuple
+# is any-of; ("list", spec); ("map", spec) a {str: spec} object; ("obj",
+# {field: (spec, required)}) an object whose listed fields have that shape
+# (other fields are let through: the unknown-key checks are separate).
+
+def _typed(v, spec):
+    if isinstance(spec, tuple) and spec and spec[0] in ("list", "map", "obj"):
+        kind, inner = spec
+        if kind == "list":
+            return isinstance(v, list) and all(_typed(x, inner) for x in v)
+        if kind == "map":
+            return isinstance(v, dict) and all(isinstance(k, str) and _typed(x, inner)
+                                               for k, x in v.items())
+        if not isinstance(v, dict):
+            return False
+        for field, (fspec, required) in inner.items():
+            if field not in v:
+                if required:
+                    return False
+                continue
+            if not _typed(v[field], fspec):
+                return False
+        return True
+    if isinstance(spec, tuple):
+        return any(_typed(v, x) for x in spec)
+    if spec == "any":
+        return True
+    if spec == "null":
+        return v is None
+    if spec == "bool":
+        return isinstance(v, bool)
+    if spec == "int":
+        return isinstance(v, int) and not isinstance(v, bool)
+    if spec == "str":
+        return isinstance(v, str)
+    raise ValueError(spec)
+
+
+_S, _SN, _I, _IN = "str", ("str", "null"), "int", ("int", "null")
+LINKED_ITEMS_SHAPE = ("obj", {
+    "collected": ("bool", True), "gathered_at": (_SN, False),
+    "items": (("list", ("obj", {
+        "number": (_I, True), "type": (_S, True), "title": (_SN, False),
+        "state": (_SN, False), "created_at": (_SN, False), "closed_at": (_SN, False),
+        "merged": ("bool", False), "merged_at": (_SN, False),
+        "state_reason": (_SN, False), "url": (_SN, False), "author": (_SN, False),
+        "gathered_at": (_SN, False)})), False),
+    "missing": (("list", _I), False), "failed": (("list", _I), False),
+    "capped": (_I, False), "requests": (_I, False), "failure": (_S, False)})
+PR_ACTIVITY_ADDED_SHAPE = ("obj", {"prs": (("list", ("obj", {
+    "body_edited_at": (_SN, False),
+    "events": (("list", ("obj", {"actor": (_SN, False), "actor_type": (_SN, False),
+                                 "at": (_SN, False)})), False)})), False)})
+PR_HISTORY_ADDED_SHAPE = ("obj", {"prs": (("list", ("obj", {
+    "net_files": (("obj", {"head": (_S, True), "base": (_S, True),
+                           "files": (("list", ("obj", {
+                               "path": (_S, True), "added": (_IN, False),
+                               "removed": (_IN, False)})), True),
+                           "files_omitted": (_I, False)}), False),
+    "net_files_unavailable": (_S, False),
+    "commits": (("list", ("obj", {"added": (("list", _S), False),
+                                  "paths": (("list", _S), False),
+                                  "parents": (_I, False),
+                                  "committed_at": (_SN, False),
+                                  "author": (_SN, False)})), False),
+    "replaced": (("list", ("obj", {"at": (_SN, False), "status": (_SN, False),
+                                   "actor": (_SN, False), "reason": (_SN, False),
+                                   "before": (_SN, False), "after": (_SN, False),
+                                   "commits_omitted": (_I, False),
+                                   "commits": (("list", ("obj", {
+                                       "sha": (_SN, False), "subject": (_SN, False),
+                                       "files": (_IN, False)})),
+                                       False)})), False)})), False)})
+MODULE_INFO_SHAPE = ("obj", {"display_name": (_S, False), "description": (_S, False),
+                             "resource_type": (_S, False),
+                             "alternative_names": (("list", _S), False)})
+OWNERSHIP_STATE_SHAPE = ("map", ("obj", {
+    "owner_file": (_SN, False), "owners": (("list", _S), False),
+    "codeowners": (("list", _S), False), "orphan_marker": ("bool", False),
+    "marker_since": (_SN, False), "owners_since": (_SN, False),
+    "entry": ("bool", False), "deprecated": ("bool", False),
+    "deprecated_since": (_SN, False), "deprecated_text": (_SN, False),
+    "marker_text": (_SN, False),
+    "replacement": (("obj", {"module": (_S, True), "quote": (_S, False),
+                             "file": (_S, False)}), False),
+    "info": (MODULE_INFO_SHAPE, False)}))
+PROPOSED_MODULES_SHAPE = ("map", ("obj", {"prs": (("list", _I), True),
+                                          "commit": (_S, False),
+                                          "committed_at": (_SN, False),
+                                          "info": (MODULE_INFO_SHAPE, False)}))
+LIFECYCLE_ROW_SHAPE = ("obj", {"module": (_S, True), "lifecycle": (_S, True),
+                               "display_name": (_S, False), "description": (_S, False),
+                               "resource_type": (_S, False),
+                               "deprecated_since": (_S, False),
+                               "deprecated_text": (_S, False)})
+
+
+_STR, _NONE = (str,), (type(None),)
+_INT = (int,)
+# Every field an ownership reader (extract.standing_without_owner /
+# merge_ownership_events / carried_ownership / ownership_event_order,
+# link.annotate_module_ownership, the newsletter's ownership section)
+# indexes, slices, sorts or keys on: {field: (types, required)}. A day is
+# a string (sliced [:10], compared); a module a string (a dict key, a
+# path joined into a URL) or null where gather writes null; people a list
+# of strings (sorted); seq an integer (never a boolean).
+_OWNERSHIP_ROW_TYPES = {
+    "events": {"kind": (_STR, True), "module": (_STR + _NONE, False),
+               "marker_text": (_STR, False), "info": ("info", False),
+               "file_removed": ("bool", False),
+               "file_added": ("bool", False),
+               "replacement": ("replacement", False),
+               "people": ("list_of_str", False), "date": (_STR, True),
+               "at": (_STR + _NONE, False), "seq": ("int", False),
+               "source": ("source", False), "via": (_STR + _NONE, False),
+               "quote": (_STR + _NONE, False)},
+    "without_owner": {"module": (_STR, True), "marker": (_STR + _NONE, False),
+                      "since": (_STR, False), "source": ("source", False)},
+    "start_without_owner": {"module": (_STR, True), "marker": (_STR + _NONE, False),
+                            "since": (_STR, False)},
+    "labelled_items": {"module": (_STR, True), "marker": (_STR + _NONE, False),
+                       "opened": (_STR, True), "closed": (_STR + _NONE, False),
+                       "source": ("source", False)},
+    "unread": {"path": (_STR, True), "commit": (_STR + _NONE, False),
+               "reason": (_STR, False)},
+}
+_OWNERSHIP_SOURCE_TYPES = {"type": _STR, "sha": _STR + _NONE, "number": _INT + _NONE,
+                           "url": _STR + _NONE, "pr": _INT + _NONE}
+
+
+def _typed_ok(v, types):
+    if types == "bool":
+        return isinstance(v, bool)
+    if types == "int":
+        return isinstance(v, int) and not isinstance(v, bool)
+    if types == "list_of_str":
+        return isinstance(v, list) and all(isinstance(x, str) for x in v)
+    if types == "info":
+        return _typed(v, MODULE_INFO_SHAPE)
+    if types == "replacement":
+        return _typed(v, ("obj", {"module": (_S, True), "quote": (_S, False),
+                                  "file": (_S, False)}))
+    if types == "source":
+        return isinstance(v, dict) and all(
+            k not in v or (isinstance(v[k], t) and not isinstance(v[k], bool))
+            for k, t in _OWNERSHIP_SOURCE_TYPES.items())
+    return isinstance(v, types) and not isinstance(v, bool)
+
+
+def _module_ownership_problem(value):
+    """Why a stored `module_ownership` value is not one gather writes (an
+    unknown key, an event kind gather does not write, a container of the
+    wrong type, a field of the wrong type that a reader indexes, slices,
+    sorts or keys on: _OWNERSHIP_ROW_TYPES), or None."""
+    extra = sorted(set(value) - _OWNERSHIP_FACT_KEYS)
+    if extra:
+        return "module_ownership carries unexpected key(s) {}".format(", ".join(extra))
+    if not _list_of_objects(value.get("events")) or \
+            not _list_of_objects(value.get("without_owner")):
+        return "module_ownership events / without_owner is not a list of objects"
+    for key in ("start_without_owner", "labelled_items", "unread"):
+        if key in value and not _list_of_objects(value[key]):
+            return "module_ownership {} is not a list of objects".format(key)
+    for key, spec in _OWNERSHIP_ROW_TYPES.items():
+        for r in value.get(key) or []:
+            for field, (types, required) in spec.items():
+                if field not in r:
+                    if required:
+                        return "module_ownership {} has a row without `{}`".format(
+                            key, field)
+                    continue
+                if not _typed_ok(r[field], types):
+                    return "module_ownership {} has a `{}` of the wrong type".format(
+                        key, field)
+    for e in value["events"]:
+        if not set(e) <= _OWNERSHIP_EVENT_KEYS or \
+                e.get("kind") not in gather.OWNERSHIP_EVENT_KINDS:
+            return "module_ownership has an event gather does not write"
+    pats = value.get("label_patterns")
+    if pats is not None and not (isinstance(pats, dict) and all(
+            isinstance(v, list) and all(isinstance(x, str) for x in v)
+            for v in pats.values())):
+        return "module_ownership label_patterns is not {kind: [regex]}"
+    oae = value.get("owners_at_end")
+    if oae is not None and not (isinstance(oae, dict) and all(
+            isinstance(v, list) and all(isinstance(x, str) for x in v)
+            for v in oae.values())):
+        return "module_ownership owners_at_end is not {module: [login]}"
+    files = value.get("owner_files")
+    if files is not None and not (isinstance(files, list)
+                                  and all(isinstance(x, str) for x in files)):
+        return "module_ownership owner_files is not a list of names"
+    for key in ("deprecated_modules", "stub_modules"):
+        if key in value and not _typed(value[key], ("list", LIFECYCLE_ROW_SHAPE)):
+            return "module_ownership {} has a row gather does not write".format(key)
+    for key, spec in (("modules_at_end", ("map", ("obj", {"lifecycle": (_S, True)}))),
+                      ("marker_files", ("map", ("list", _S))),
+                      ("proposed_modules", PROPOSED_MODULES_SHAPE),
+                      ("shared_marker_texts", ("list", ("obj", {
+                          "kind": (_S, True), "text": (_S, True),
+                          "modules": (("list", _S), True), "count": (_I, True)}))),
+                      ("marker_texts", ("map", ("obj", {"text": (_S, True),
+                                                        "modules": (_I, True)}))),
+                      ("entry_files", ("list", _S))):
+        if key in value and not _typed(value[key], spec):
+            return "module_ownership {} is not what gather writes".format(key)
+    if "start_state" in value and not _typed(value["start_state"], OWNERSHIP_STATE_SHAPE):
+        return "module_ownership start_state is not {module: {owners, codeowners, " \
+            "orphan_marker, ...}}"
+    for key in ("gathered_at",):
+        if key in value and not isinstance(value[key], str):
+            return "module_ownership {} is not a string".format(key)
+    win = value.get("window")
+    if win is not None and not _typed(win, ("obj", {"from": (_S, True), "to": (_S, True)})):
+        return "module_ownership window is not {from, to}"
+    # a self-contained window: its stored end state is the replay of its
+    # start state and events (a cross-check, never a second source)
+    if isinstance(value.get("start_state"), dict) and isinstance(win, dict):
+        try:
+            end = extract.ownership_state(value, win["to"][:10])
+        except Exception:                  # noqa: BLE001 - reported, not raised
+            return "module_ownership cannot be replayed"
+        if end is not None and any(
+                key in value and json.dumps(v, sort_keys=True)
+                != json.dumps(value[key], sort_keys=True)
+                for key, v in extract.ownership_end_fields(end).items()):
+            return "module_ownership end state does not match the replay of its " \
+                "start state and events"
+    return None
+
+
 def _fact_shape_problem(key, value):
     """Why a stored fact value cannot be the value of WINDOW_FACT_KEYS `key`,
     or None: it is not a JSON object (code_owners: an object or a rule list),
@@ -1540,6 +1794,18 @@ def _fact_shape_problem(key, value):
         why = _pr_history_problem(value)
         if why:
             return why
+    if ok and key == "linked_items":
+        if not _typed(value, LINKED_ITEMS_SHAPE) or any(
+                it.get("type") not in ("issue", "pr") for it in value.get("items") or []):
+            return "linked_items holds a field of a shape gather does not write"
+    if ok and key == "module_ownership":
+        why = _module_ownership_problem(value)
+        if why:
+            return why
+    if ok and key == "pr_activity" and not _typed(value, PR_ACTIVITY_ADDED_SHAPE):
+        return "pr_activity holds a field of a shape gather does not write"
+    if ok and key == "pr_history" and not _typed(value, PR_HISTORY_ADDED_SHAPE):
+        return "pr_history holds a field of a shape gather does not write"
     if ok and key == "pr_activity":
         why = _pr_activity_problem(value)
         if why:

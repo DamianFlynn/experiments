@@ -9,8 +9,8 @@
 > (§5, incl. the series file §5.2 and reading the trust check §5.5), **forecasting** (§6),
 > **playbooks for each target estate** — Bicep, AVM Bicep, AVM Terraform, AI landing zone,
 > hub/platform landing zone, an enterprise Bicep landing zone on AVM (§7) — store management
-> (§8), readers and spotlight queries (§9), automation (§10), troubleshooting (§11) and
-> security (§12).
+> (§8), readers and spotlight queries (§9), automation (§10; the nightly gather job is
+> [`SCHEDULING.md`](SCHEDULING.md)), troubleshooting (§11) and security (§12).
 
 ---
 
@@ -118,6 +118,11 @@ export AO=~/.claude/skills/activity-overview
 ```
 
 ### 2.1 Recommended workspace layout
+
+> **Scheduled gathering.** With the nightly runner (`schedule.py`, [`SCHEDULING.md`](SCHEDULING.md))
+> this layout is created for you from a streams file (`<workspace>/<stream>/stores/YYYY-MM.db`,
+> one shared `people.json`, `status.json` per stream); keep that workspace on a local,
+> non-synced disk and write only the reports into a notes vault.
 
 Keep **one directory per report stream**, and inside it **one store per monthly installment**
 (`stores/YYYY-MM.db`). Month-to-month continuity lives in `series.json`, not in the store.
@@ -612,8 +617,12 @@ area count that `tier` uses), and every slice carries the whole conversation as 
 The timeline's PR commits come from gather: a squash-merging repository keeps one commit per
 PR on its mainline, so gather fetches every window PR's `refs/pull/<N>/head` into
 `refs/remotes/pr/<N>` of the clone (one `git ls-remote`, then `git fetch --filter=blob:none`
-in batches of 100) and walks the `.bicep` / `.tf` diffs between the commits of the 40 most
-discussed PRs. Measured on `Azure/bicep-registry-modules` (a blobless clone shallow since
+in batches of 100) and walks the `.bicep` / `.tf` diffs between the commits of every PR
+(the whole record; earlier versions walked only the 40 most discussed PRs, which is
+what the first measurements below are of). Every PR and commit on October 2026 (160 PRs,
+1,280 commits, 32 force-pushes of which 21 replaced histories could still be fetched):
+296 s into the clone used for September (fetching October's refs and blobs), a 9.9 MB
+`pr_history` fact against 2.3 MB for the 40-PR walk. Measured on `Azure/bicep-registry-modules` (a blobless clone shallow since
 2026-07-25): September 2026, 142 PRs — 42 s, the clone's `.git` from 13.5 MB to 23.1 MB (the
 commit and tree history the PR heads reach, plus the blobs the diff walk read), 1,092 PR
 commits, notes for 40 PRs, a 1.1 MB fact; October 2026 into the same clone, 160 PRs — 11 s,
@@ -940,6 +949,35 @@ and shares over per-person labels, and check every person you name.
 - **Remove someone:** delete their entry. The next gather that sees them adds them back from
   public data; to stop that, keep the entry with `do_not_name` instead.
 - **Turn lookups off:** `--people-offline` (registry only) or `--no-affiliation` (nothing).
+
+### 5.8 The newsletter (release-notes style issue)
+
+The digest is the maintainers' fact base; the newsletter is the post for the people who use
+the modules, one per stream per week or month. After step 5 (link, with `--people` for
+registry context):
+
+```bash
+python3 $AO/newsletter.py $S/views/$M/bundle.json --outline > $S/views/$M/newsletter.outline.json
+# one slice per story the outline names (stories.full: every story, grouped by state),
+# each story checked as usual
+python3 $AO/link.py $S/views/$M/bundle.json --slice <train-id> > $S/views/$M/slices/<train-id>.slice.json
+# write $S/reports/$M.newsletter.md to reference/newsletter.md, then:
+python3 $AO/newsletter.py $S/views/$M/bundle.json --check-newsletter $S/reports/$M.newsletter.md \
+  --slices $S/views/$M/slices --people $PEOPLE
+```
+
+Sections: new modules, what changed, breaking changes, stories (Landed / In flight /
+Stalled), module ownership, people (with automation accounts), coming up, plumbing: what was
+engineered, numbers. There is no length target; a window of at most 16 days is a weekly issue
+(same layout, shorter window) unless `--monthly` is given; `--weekly` forces it. A multi-repo stream passes every member's linked view; `--automation LOGIN`
+marks an automation account the view does not. The check exits 0 when every module, version,
+person, number, quote and URL in the issue is in the view, module mentions are links and
+published versions link their tags, landed work states its release status, every story is
+written (or marked pending) under its state's heading with its state in its first line,
+ownership rows exist in the view, automation accounts are not presented as people, breaking
+candidates are not worded as declared, `unknown` people are not called community,
+do_not_name people are not named, every section is present or omitted with its reason and
+dates carry the year; `reference/newsletter.md` lists what it cannot check.
 
 ## 6. Forecasting — reading it and making it useful
 
@@ -1403,7 +1441,12 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 
 ## 10. Automation
 
-- **Deterministic part on a schedule.** A cron/launchd job can run `gather` + `validate` +
+- **Nightly gather (recommended).** `schedule.py run` keeps every stream's current month
+  store up to date (copy → gather → validate → atomic swap; the previous month re-gathered
+  for its first days; a lock, a run log and `status.json`), and `schedule.py latest` tells
+  the report step which store to read and refuses stale data. Setup, launchd / cron
+  templates and failure handling: [`SCHEDULING.md`](SCHEDULING.md).
+- **Deterministic part on a schedule (by hand).** A cron/launchd job can run `gather` + `validate` +
   `digest` on the 1st of each month for the previous month, so data is ready when you sit
   down. Example (Linux cron, 06:30 on the 1st):
 

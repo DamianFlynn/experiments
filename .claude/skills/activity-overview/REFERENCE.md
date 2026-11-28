@@ -255,6 +255,11 @@ The PR-history step also reads the walked PRs' commits as narrative (git only):
 `ACTIVITY_ADR_DIRS` (comma-separated folder paths; default `adr,adrs,decisions,docs/adr,
 docs/decisions`) names the folders whose Markdown files are decision records.
 
+Module ownership (`module_ownership`, BUNDLE.md) is read from the clone and the records
+already gathered: `ACTIVITY_OWNER_FILES` (comma-separated basenames of per-module owner
+files, default `metadata.json`) and `ACTIVITY_OWNERSHIP_LABELS` (`kind=regex;kind=regex`,
+kinds `owner_needed`, `orphaned`, ...) configure it.
+
 Check results, review-thread state and PR lifecycle events (`pr_activity`, BUNDLE.md):
 the events come from the issue timeline already fetched per PR (no extra call); the checks
 of each PR's latest 10 commits, the thread resolved flags and the force-push commits from
@@ -332,6 +337,25 @@ Then: `/activity <owner/repo> <from> <to> [options]` or `/activity --manifest PA
 [options]` (options: `--store PATH`, `--transcript PATH`, `--series PATH`, gather
 flags) — it parses the args and defers to `SKILL.md` (gather → validate → view → link
 → render → slices → report).
+
+### Scheduled gathering
+
+`schedule.py` runs the gathers on a schedule (launchd / cron / CI) and tells the report
+step which store to read; full guide `docs/SCHEDULING.md`, example `examples/streams.json`.
+
+```bash
+python3 schedule.py check  --streams ~/activity-data/streams.json      # how the file resolves
+python3 schedule.py run    --streams ~/activity-data/streams.json --dry-run
+python3 schedule.py run    --streams ~/activity-data/streams.json [--stream ID] [--backfill 2026-08..2026-10] [--max-minutes 180]
+python3 schedule.py status --streams ~/activity-data/streams.json [--json]
+python3 schedule.py latest --streams ~/activity-data/streams.json --stream ID --last-days 7   # prints the next commands
+python3 schedule.py recompute --streams ~/activity-data/streams.json --stream ID --month 2026-11 --what ownership
+```
+
+The token is read by gather from `GITHUB_TOKEN` (else `GH_TOKEN`) in the runner's
+environment; nothing writes it to disk, and captured output is redacted. Exit codes:
+`run` 0 ok / 1 a window failed or skipped / 2 usage / 3 locked; `latest` 0 ok / 1 refused
+(stale, failed, missing) / 2 usage.
 
 ## Tests
 

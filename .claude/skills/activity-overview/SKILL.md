@@ -23,7 +23,8 @@ pipeline's).
 All scripts referenced below ship inside this skill directory
 (`${CLAUDE_SKILL_DIR}`); run them with `python3` from the skill dir (stdlib only).
 For deeper detail: **`docs/HLD.md`** (high-level design + usage scenarios), **`docs/LLD.md`**
-(L400 low-level design), **`docs/USAGE.md`** (operator runbook: monthly series, forecasting,
+(L400 low-level design), **`docs/SCHEDULING.md`** (the nightly gather job and the `latest`
+reader), **`docs/USAGE.md`** (operator runbook: monthly series, forecasting,
 per-estate playbooks), **`ARCHITECTURE.md`** (the L400 deep dive — every tool's parameters
 + internals, the C4/data-model diagrams, end-to-end scenarios, and a diagnostics
 matrix), **`reference/report-sections.md`** (how to author each report
@@ -42,6 +43,20 @@ long as each step reads what the previous one wrote). Use a **new store per
 installment** (`docs/USAGE.md` §2.1 explains when one store that grows month by month also
 works: views are window-scoped, but a past month re-viewed later shows today's record
 state).
+
+**Scheduled workspace first.** When the data is gathered by the nightly job
+(`docs/SCHEDULING.md`: a streams file, one store per stream per month), do not gather:
+ask the reader which store holds the period and whether it may be read —
+```bash
+python3 schedule.py latest --streams STREAMS.json --stream ID --last-days 7   # or --month YYYY-MM, or --from F --to T
+```
+— and continue at step 3 with each `read[].store` / its `from`..`to` (exit 1 = refused:
+stale, failed or missing; say so, or pass `--accept-stale` and state the data's age). The
+newsletter flow is then `latest` → `view.py` → `link.py --people` → `newsletter.py
+--outline` (and `--work-package`) → write → `--check-story` / `--check-newsletter`;
+`latest` prints those exact commands as `next`, with `--weekly` when the stream's cadence
+makes it a weekly issue (the outline's default layout is monthly). Steps 1–2 below are the
+fallback when no scheduled workspace exists (gather on demand).
 
 **Two artifacts feed the report:**
 
@@ -286,6 +301,15 @@ per-train narrator contract), forecast, board/sprints, feature changes, content 
 module graph, ownership, issue kinds, contributors, stalled/blocked, module biography, the
 gated appendix, releases/CI/in-flight/rejected — is in **`reference/report-sections.md`**.
 Read it when authoring the report.
+
+**Newsletter (reader-facing, release-notes style).** For the weekly or monthly issue written
+for the people who use the modules — new modules, what changed, breaking changes, every
+story in full grouped by state, module ownership, people, what is coming, what the plumbing
+engineered and numbers last; no length target — follow
+**`reference/newsletter.md`**: `python3 newsletter.py <view> --outline` gives the ordered,
+pre-selected material per section, and `python3 newsletter.py <view> --check-newsletter
+ISSUE.md --slices DIR` checks the written issue against the view (a worked sample:
+`samples/newsletter/`).
 
 ## On-demand readers (other dimensions)
 

@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "workspace": "~/activity-data",
+  "people": "people.json",
+  "regather_previous_month_days": 7,
+  "stale_after_hours": 36,
+  "lock_stale_hours": 12,
+  "retention": {
+    "log_days": 60,
+    "store_months": null
+  },
+  "env": {
+    "TF_PLUGIN_CACHE_DIR": ".tfcache"
+  },
+  "streams": [
+    {
+      "id": "avm-bicep",
+      "title": "AVM Bicep",
+      "kind": "repo",
+      "owner": "Azure",
+      "repo": "bicep-registry-modules",
+      "home": {
+        "orgs": ["Azure", "microsoft"],
+        "names": ["Microsoft"],
+        "email_domains": ["microsoft.com"]
+      },
+      "cadence": ["weekly", "monthly"],
+      "gather_flags": ["--structural-iac"],
+      "enabled": true
+    },
+    {
+      "id": "avm-tf",
+      "title": "AVM Terraform",
+      "kind": "manifest",
+      "manifest": "avm-tf/manifest.json",
+      "home": {
+        "orgs": ["Azure", "microsoft"],
+        "names": ["Microsoft"],
+        "email_domains": ["microsoft.com"]
+      },
+      "cadence": ["monthly"],
+      "env": {
+        "ACTIVITY_IAC_MAX_WORKERS": "4"
+      },
+      "enabled": true
+    },
+    {
+      "id": "bicep",
+      "title": "Bicep",
+      "kind": "repo",
+      "owner": "Azure",
+      "repo": "bicep",
+      "home": {
+        "orgs": ["Azure", "microsoft"],
+        "names": ["Microsoft"],
+        "email_domains": ["microsoft.com"]
+      },
+      "cadence": ["weekly", "monthly"],
+      "enabled": true
+    },
+    {
+      "id": "ai-hub-gateway",
+      "title": "AI hub gateway landing zone",
+      "kind": "repo",
+      "owner": "Azure-Samples",
+      "repo": "ai-hub-gateway-solution-accelerator",
+      "home": {
+        "orgs": ["Azure", "Azure-Samples", "microsoft"],
+        "names": ["Microsoft"],
+        "email_domains": ["microsoft.com"]
+      },
+      "cadence": ["monthly"],
+      "gather_flags": ["--structural-iac", "--no-iac-build"],
+      "enabled": true
+    },
+    {
+      "id": "enterprise-scale",
+      "title": "Enterprise-scale landing zone",
+      "kind": "repo",
+      "owner": "Azure",
+      "repo": "Enterprise-Scale",
+      "home": {
+        "orgs": ["Azure", "microsoft"],
+        "names": ["Microsoft"],
+        "email_domains": ["microsoft.com"]
+      },
+      "cadence": ["monthly"],
+      "enabled": false
+    }
+  ]
+}

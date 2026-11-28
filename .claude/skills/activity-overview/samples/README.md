@@ -36,6 +36,10 @@ vertical: `gather (manifest) → store → validate → digest`.
 - **[`stories/`](stories/README.md)** — two sample stories (a single-repo view of
   `Azure/bicep-registry-modules`, September 2026) written from story slices with the
   story brief, each passing `link.py --check-story`.
+- **[`newsletter/`](newsletter/README.md)** — a sample release-notes style issue
+  ("Azure Verified Modules for Bicep — October 2026") written to
+  `reference/newsletter.md` from a live October 2026 view, passing
+  `newsletter.py --check-newsletter`.
 
 ## Constellation
 

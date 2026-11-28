@@ -325,7 +325,17 @@ events — renames, draft / ready, review requests and dismissals, force-pushes 
 what GitHub held when the window was gathered (`gathered_at`); absent from windows gathered
 before it existed; `validate.py`'s meta integrity refuses a key, `checks_status`, roll-up
 or event kind gather does not write. A new fact key, not a schema change: older stores
-simply lack it and a story slice's `gaps` says so. Gathered with the people registry
+simply lack it and a story slice's `gaps` says so) and `module_ownership` (the window's
+module ownership changes — CODEOWNERS and per-module owner files, orphan markers,
+ownership labels — and the modules without an owner at its end,
+`gather.collect_module_ownership`, BUNDLE.md "`module_ownership`"; omitted for a window
+with no ownership signal; validate refuses an unknown key or event kind, and
+`start_without_owner` / `labelled_items` that are not lists of objects. Events carry
+`at` (commit / item time) and `seq` (gather's order) so one day replays in order. Each
+window's fact is self-contained: `start_state`, the complete ownership state at its
+start, so any day's state is a replay of that window alone; a fact gathered before it
+is known for its own end day only until rewritten, offline, with
+`gather.py ... --recompute-ownership`). `linked_items` (the issues / PRs the window's records link that are not its records, with title, type, state and dates when gathered: `gather.collect_linked_items`, BUNDLE.md "What a story can name"; per window only, a new fact key). Gathered with the people registry
 (`--people`, a JSON file outside the store, BUNDLE.md "The people registry"), each entry
 also records the labels used for that window from it: the display `name`, `maintainer`,
 `maintainer_signal` and `maintainer_status` (the role's lifecycle at gather time: active /

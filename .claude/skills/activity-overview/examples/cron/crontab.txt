@@ -1,0 +1,5 @@
+# activity-overview nightly gather (install with `crontab -e`; paths are absolute).
+# 02:40 every night, local time. The runner plans by the UTC date: keep the run
+# well clear of midnight UTC. Its own per-run log is in <workspace>/logs/run-*.log;
+# this line only keeps what the wrapper prints before the runner starts.
+40 2 * * * /home/me/activity-data/bin/activity-gather.sh >> /home/me/activity-data/logs/cron.log 2>&1

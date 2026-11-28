@@ -106,6 +106,7 @@ e.g. the existing goldens). See `_materialize_symbol_events`.
 """
 
 import datetime
+import json
 import sys
 
 import graphstore
@@ -129,7 +130,8 @@ VIEW_CONTRACT_VERSION = 3
 _RAW_KEYS = ("meta", "prs", "issues", "commits", "code_events", "symbol_events",
              "milestones", "releases", "workflow_stats", "code_graph",
              "code_owners", "label_taxonomy", "newcomers", "module_notes",
-             "pr_history", "pr_activity", "affiliations", "prior_activity",
+             "pr_history", "pr_activity", "module_ownership", "affiliations",
+             "linked_items", "prior_activity",
              "artifacts", "people")
 
 # Reverse of derive._SYMBOL_CHANGE_TO_EVENT: the ledger stored the MAPPED event
@@ -463,6 +465,15 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     # (`_merged_pr_activity`); absent when no gather collected it.
     if "pr_activity" in facts:
         bundle["pr_activity"] = facts["pr_activity"]
+    # Module ownership (per-window only): as stored, or the events of the
+    # windows overlapping the view and the latest one's standing list
+    # (`_merged_module_ownership`); absent when no gather collected it.
+    if "module_ownership" in facts:
+        bundle["module_ownership"] = facts["module_ownership"]
+    # Linked items outside the window (per-window only): as stored, or per
+    # number the latest window overlapping the view (`_merged_linked_items`).
+    if "linked_items" in facts:
+        bundle["linked_items"] = facts["linked_items"]
     # Contributor affiliation (per-window only): the gathered window's fact
     # as stored, or each person's latest decision over the windows
     # overlapping the view (`_merged_affiliations`); absent when no gather
@@ -1251,7 +1262,8 @@ def _window_facts(conn, project, repo, ts_from, ts_to):
     structure_keys = tuple(k for k in graphstore.WINDOW_FACT_KEYS
                            if k not in ("workflow_stats", "newcomers",
                                         "module_notes", "pr_history",
-                                        "affiliations", "pr_activity"))
+                                        "affiliations", "pr_activity",
+                                        "module_ownership", "linked_items"))
 
     def win(key):
         return {"from": key[0], "to": key[1]}
@@ -1312,6 +1324,13 @@ def _window_facts(conn, project, repo, ts_from, ts_to):
     activity = _merged_pr_activity(conn, project, repo, overlapping, recorded)
     if activity is not None:
         facts["pr_activity"] = activity
+    linked = _merged_linked_items(conn, project, repo, overlapping, recorded)
+    if linked is not None:
+        facts["linked_items"] = linked
+    ownership = _merged_module_ownership(conn, project, repo, overlapping, recorded,
+                                         ts_from, ts_to)
+    if ownership is not None:
+        facts["module_ownership"] = ownership
     affiliations = _merged_affiliations(conn, project, repo, overlapping,
                                         recorded, ts_from, ts_to)
     if affiliations is not None:
@@ -1502,6 +1521,448 @@ def _merged_pr_history(conn, project, repo, overlapping, recorded):
     if limits is not None:
         out["limits"] = limits
     return out
+
+
+# Module ownership. Every gathered window's fact is SELF-CONTAINED: the
+# complete ownership state at the window's start (`start_state`), the
+# window's own events in recorded order and its labelled items. The state of
+# any day inside the window is a replay of that window alone; no reader
+# ever combines windows to build state.
+ORPHAN_MARKER_NAMES = ("ORPHANED.md",)
+_OWNED_KINDS = ("owner_added", "adopted")
+_UNOWNED_KINDS = ("owner_needed", "orphaned")
+PARTIAL_START_REASON = (
+    "the window {}..{} was gathered without the tree before it, so the owner files "
+    "at its start were never read: its ownership state is not known (its events "
+    "are; gather.py ... --recompute-ownership with a clone holding that history "
+    "rewrites it)")
+LEGACY_OWNERSHIP_REASON = (
+    "the window {}..{} was gathered before ownership could be reconstructed for a "
+    "day inside it (no complete start state: only its own end day is known; "
+    "gather.py ... --recompute-ownership rewrites it)")
+
+
+def ownership_event_order(e):
+    """The replay order of one fact's events: by day, then the commit / item
+    time (`at`), then the order gather emitted them in (`seq`); events stored
+    before `at` / `seq` existed fall back to (day, kind)."""
+    seq = e.get("seq")
+    return (str(e.get("date") or "")[:10], e.get("at") or "",
+            seq if isinstance(seq, int) and not isinstance(seq, bool) else -1,
+            e.get("kind") or "", str(e.get("module") or ""))
+
+
+def ownership_event_identity(e):
+    """What makes two stored ownership events the same change, whichever
+    window stored it and whenever it was gathered: the source commit /
+    item, kind, module, people and day — never the optional `at` / `seq`."""
+    src = e.get("source") or {}
+    return json.dumps([e.get("kind"), e.get("module"),
+                       sorted(str(p) for p in e.get("people") or []),
+                       src.get("type"), src.get("sha") or src.get("number"),
+                       str(e.get("date") or "")[:10]],
+                      sort_keys=True, default=str)
+
+
+def merge_ownership_events(facts):
+    """The events to REPORT for several windows (state is never built from
+    them): each change once (ownership_event_identity). Facts that recorded
+    times and sequence come first, so a refreshed copy replaces a legacy
+    copy and its order is the refreshed fact's; within a day and time the
+    order a fact recorded is kept (a stable sort by day and time). `seq` is
+    renumbered over the list when the events carry one."""
+    def timed(f):
+        return any("seq" in e for e in f.get("events") or [] if isinstance(e, dict))
+    merged, seen = [], set()
+    for f in sorted(facts, key=lambda f: not timed(f)):
+        for e in sorted((e for e in f.get("events") or [] if isinstance(e, dict)),
+                        key=ownership_event_order):
+            ident = ownership_event_identity(e)
+            if ident not in seen:
+                seen.add(ident)
+                merged.append(dict(e))
+    merged.sort(key=lambda e: (str(e.get("date") or "")[:10], e.get("at") or ""))
+    if any("seq" in e for e in merged):
+        for n, e in enumerate(merged):
+            e["seq"] = n
+    return merged
+
+
+def ownership_state(fact, day):
+    """The ownership state at the end of `day` inside the fact's window, from
+    that fact ALONE: its `start_state` ({module: {owner_file?, owners,
+    codeowners, orphan_marker, marker_since?, owners_since? (the day the
+    owner file last changed)}} — the tree just before the window), its events up to `day` in recorded order
+    (owner-file / CODEOWNERS owners added / removed / emptied, orphan
+    markers added / removed) and its labelled items open on `day`.
+    {without_owner: [{module, marker, [since], [source]}] (a module with an
+    orphan marker, or whose owner file lists nobody, or named by an open
+    owner-needed / orphaned item unless its latest change by `day` gave it
+    an owner on or after the item opened), owners: {module: [login]}}; None
+    for a fact without `start_state` (gathered before it was stored)."""
+    start = fact.get("start_state")
+    if not isinstance(start, dict) or fact.get("start_state_source") not in (None, "complete"):
+        return None         # never read (or read partly): the state is not known
+    mods = {m: {"owner_file": r.get("owner_file"),
+                "owners": list(r.get("owners") or []),
+                "codeowners": list(r.get("codeowners") or []),
+                "marker": bool(r.get("orphan_marker")),
+                "marker_since": r.get("marker_since"),
+                "owners_since": r.get("owners_since"),
+                "entry": r.get("entry") if isinstance(r.get("entry"), bool) else None,
+                "deprecated": bool(r.get("deprecated")),
+                "deprecated_since": r.get("deprecated_since"),
+                "deprecated_text": r.get("deprecated_text"),
+                "marker_text": r.get("marker_text"),
+                "replacement": r.get("replacement"),
+                "info": dict(r.get("info")) if isinstance(r.get("info"), dict) else {}}
+            for m, r in start.items() if isinstance(r, dict)}
+    # the last ownership change before the window, as the start state dates
+    # it (an owner file's last change; a marker's addition)
+    changed = {}
+    for m, r in mods.items():
+        if isinstance(r["owners_since"], str) and r["owner_file"]:
+            changed[m] = ("owned" if r["owners"] else "unowned", r["owners_since"])
+        if r["marker"] and isinstance(r["marker_since"], str):
+            changed[m] = ("unowned", r["marker_since"])
+
+    def mod(m):
+        return mods.setdefault(m, {"owner_file": None, "owners": [], "codeowners": [],
+                                   "marker": False, "marker_since": None,
+                                   "owners_since": None, "entry": None,
+                                   "deprecated": False, "deprecated_since": None,
+                                   "deprecated_text": None, "info": {},
+                                   "marker_text": None, "replacement": None})
+    for e in sorted((e for e in fact.get("events") or [] if isinstance(e, dict)),
+                    key=ownership_event_order):
+        d = str(e.get("date") or "")[:10]
+        if not d or d > day or (e.get("source") or {}).get("type") != "commit":
+            continue
+        m, kind, via = e.get("module"), e.get("kind"), e.get("via")
+        if not isinstance(m, str):
+            continue
+        r = mod(m)
+        people = [p for p in e.get("people") or [] if isinstance(p, str)]
+        if kind in ("deprecated", "undeprecated"):
+            r.update(deprecated=kind == "deprecated",
+                     deprecated_since=d if kind == "deprecated" else None,
+                     deprecated_text=e.get("marker_text") if kind == "deprecated" else None,
+                     replacement=e.get("replacement") if kind == "deprecated" else None)
+            continue
+        if kind in ("module_added", "module_removed"):
+            r["entry"] = kind == "module_added"
+            r["removed"] = kind == "module_removed"
+            continue
+        if kind == "module_info_changed":
+            if isinstance(e.get("info"), dict):
+                r["info"] = dict(e["info"])
+            continue
+        if via in ORPHAN_MARKER_NAMES:
+            if kind == "orphaned":
+                r.update(marker=True, marker_since=d, marker_text=e.get("marker_text"))
+            elif kind == "adopted":
+                r.update(marker=False, marker_since=None, marker_text=None)
+        elif via == "codeowners":
+            people = [p for p in people if "/" not in p and "@" not in p]
+            if kind == "owner_added":
+                r["codeowners"] += [p for p in people if p not in r["codeowners"]]
+            elif kind == "owner_removed":
+                r["codeowners"] = [p for p in r["codeowners"] if p not in people]
+        else:
+            r["owner_file"] = r["owner_file"] or via
+            if kind == "owner_added":
+                r["owners"] += [p for p in people if p not in r["owners"]]
+                r["owners_since"] = d
+            elif kind == "owner_removed":
+                r["owners"] = [p for p in r["owners"] if p not in people]
+                r["owners_since"] = d
+                if e.get("file_removed") is True:
+                    # the owner file itself was deleted: no owner file to be
+                    # empty (a removed module is never "without an owner")
+                    r["owner_file"] = None
+                    r["owners"] = []
+            elif kind == "owner_needed":
+                r["owners"] = []
+                r["owners_since"] = d
+        if kind in _OWNED_KINDS:
+            changed[m] = ("owned", d)
+        elif kind in _UNOWNED_KINDS:
+            changed[m] = ("unowned", d)
+    out = {}
+    for m, r in mods.items():
+        if r["marker"]:
+            row = {"module": m, "marker": ORPHAN_MARKER_NAMES[0]}
+            if r["marker_since"]:
+                row["since"] = r["marker_since"]
+            out[m] = row
+        elif r["owner_file"] and not r["owners"] and not r["codeowners"]:
+            row = {"module": m, "marker": r["owner_file"]}
+            if r["owners_since"]:
+                row["since"] = r["owners_since"]
+            out[m] = row
+    for it in fact.get("labelled_items") or []:
+        if not isinstance(it, dict):
+            continue
+        opened, closed = it.get("opened") or "", it.get("closed")
+        if not opened or opened > day or (closed and closed <= day):
+            continue
+        m = it.get("module")
+        st = changed.get(m)
+        if st and st[0] == "owned" and st[1] >= opened:
+            continue
+        out.setdefault(m, {"module": m, "marker": it.get("marker"),
+                           "source": it.get("source")})
+    owners = {m: sorted(set(r["owners"]) | set(r["codeowners"]))
+              for m, r in mods.items() if r["owners"] or r["codeowners"]}
+    # a module an open PR proposes (its own commits by `day` add the folder's
+    # entry and metadata files): `proposed` unless the base already has it live
+    for m, p in (fact.get("proposed_modules") or {}).items():
+        if not isinstance(p, dict) or not isinstance(m, str) or \
+                str(p.get("committed_at") or "")[:10] > day:
+            continue
+        r = mod(m)
+        if module_lifecycle(r) in ("live", "deprecated", "orphaned", "removed"):
+            continue
+        r["proposed"] = [n for n in p.get("prs") or [] if isinstance(n, int)]
+        if isinstance(p.get("info"), dict) and not r["info"]:
+            r["info"] = dict(p["info"])
+    # one boilerplate marker text shared by several modules is said once
+    counts = {}
+    for r in mods.values():
+        for key in ("deprecated_text", "marker_text"):
+            if r.get(key) and (key == "marker_text" and r["marker"]
+                               or key == "deprecated_text" and r["deprecated"]):
+                counts[(key, " ".join(r[key].split()))] = counts.get(
+                    (key, " ".join(r[key].split())), 0) + 1
+    shared = {k for k, n in counts.items() if n > 1}
+    # per kind, the ONE most-shared notice is said once in `marker_texts`
+    # (rows: `marker_text_shared`); any other notice keeps its own text on
+    # its rows; every shared notice is listed in `shared_marker_texts`
+    primary = {}
+    for (key, norm), n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+        if n > 1:
+            primary.setdefault(key, norm)
+    marker_texts = {}
+    shared_texts = {}
+    modules = {}
+    for m, r in mods.items():
+        row = {"lifecycle": module_lifecycle(r)}
+        for k in ("display_name", "description", "resource_type", "alternative_names"):
+            if r["info"].get(k):
+                row[k] = r["info"][k]
+        if r.get("proposed"):
+            row["proposed_by"] = r["proposed"]
+        for key, on in (("deprecated_text", r["deprecated"]), ("marker_text", r["marker"])):
+            if not on or not r.get(key):
+                continue
+            norm = " ".join(r[key].split())
+            kind = "deprecated" if key == "deprecated_text" else "orphaned"
+            if (key, norm) in shared:
+                st = shared_texts.setdefault((kind, norm), {"kind": kind, "text": r[key],
+                                                            "modules": []})
+                st["modules"].append(m)
+            if primary.get(key) == norm:
+                row["marker_text_shared"] = True
+                marker_texts.setdefault(kind, {"text": r[key], "modules": 0})
+                marker_texts[kind]["modules"] += 1
+            else:
+                row[key] = r[key]
+        if r["deprecated"]:
+            if r["deprecated_since"]:
+                row["deprecated_since"] = r["deprecated_since"]
+            if r.get("replacement"):
+                row["replacement"] = r["replacement"]
+        modules[m] = row
+    rows = []
+    for k in sorted(out, key=lambda m: m or ""):
+        row = dict(out[k])
+        info = modules.get(k) or {"lifecycle": "unknown"}
+        row["lifecycle"] = info["lifecycle"]
+        for f in ("display_name", "description", "resource_type", "marker_text",
+                  "marker_text_shared"):
+            if info.get(f):
+                row[f] = info[f]
+        rows.append(row)
+    return {"without_owner": [r for r in rows if r["lifecycle"] in OWNERLESS_LIFECYCLES],
+            "deprecated_modules": [_lifecycle_row(m, modules[m]) for m in sorted(modules)
+                                   if modules[m]["lifecycle"] == "deprecated"],
+            "stub_modules": [_lifecycle_row(m, modules[m]) for m in sorted(modules)
+                             if modules[m]["lifecycle"] == "stub"],
+            "owners": {m: owners[m] for m in sorted(owners)},
+            "modules": {m: modules[m] for m in sorted(modules)},
+            "marker_texts": marker_texts,
+            "shared_marker_texts": sorted(
+                ({"kind": x["kind"], "text": x["text"], "modules": sorted(x["modules"]),
+                  "count": len(x["modules"])} for x in shared_texts.values()),
+                key=lambda x: (x["kind"], -x["count"], x["text"]))}
+
+
+# A module's lifecycle from the tree: `deprecated` (a deprecation marker),
+# `orphaned` (an orphan marker), `live` (its entry file), `stub` (metadata
+# only, no entry file), `removed` (its entry file removed in the window),
+# `unknown` (a start state read before entry files
+# were recorded). "Without an owner" is about live and orphaned modules
+# (and unknown ones, never hidden).
+MODULE_LIFECYCLES = ("live", "deprecated", "orphaned", "stub", "removed", "proposed",
+                     "unknown")
+OWNERLESS_LIFECYCLES = ("live", "orphaned", "unknown")
+
+
+def module_lifecycle(r):
+    if r.get("removed"):
+        return "removed"
+    if r.get("proposed") and not r.get("entry") and not r.get("deprecated") \
+            and not r.get("marker"):
+        return "proposed"
+    if r.get("deprecated"):
+        return "deprecated"
+    if r.get("marker"):
+        return "orphaned"
+    if r.get("entry") is True:
+        return "live"
+    if r.get("entry") is False:
+        return "stub"
+    return "unknown"
+
+
+def _lifecycle_row(m, info):
+    return dict({"module": m}, **info)
+
+
+def ownership_end_fields(end):
+    """The end-state fields a gathered fact stores (validate replays them):
+    without_owner, deprecated_modules, stub_modules, owners_at_end,
+    modules_at_end."""
+    return {"without_owner": end["without_owner"],
+            "deprecated_modules": end["deprecated_modules"],
+            "stub_modules": end["stub_modules"],
+            "owners_at_end": end["owners"],
+            "modules_at_end": end["modules"],
+            "marker_texts": end["marker_texts"],
+            "shared_marker_texts": end["shared_marker_texts"]}
+
+
+def standing_without_owner(fact, day):
+    """ownership_state's `without_owner` for `day`, or None for a fact
+    gathered before the complete start state."""
+    st = ownership_state(fact, day)
+    return None if st is None else st["without_owner"]
+
+
+def covering_window(values, day):
+    """The one stored window a view ending on `day` reads its ownership
+    state from: a collected window containing `day`, the one gathered latest
+    (`gathered_at`), then the latest end, the latest start, the key; None
+    when none contains it."""
+    holder = [k for k in values if k[0][:10] <= day <= k[1][:10]]
+    if not holder:
+        return None
+    return max(holder, key=lambda k: (values[k].get("gathered_at") or "",
+                                      k[1][:10], k[0][:10], k))
+
+
+def _merged_module_ownership(conn, project, repo, overlapping, recorded,
+                             ts_from, ts_to):
+    """The `module_ownership` of a view that is not exactly one gathered
+    window. Events REPORTED: those of every overlapping window dated in the
+    view, each change once (merge_ownership_events). State: from the ONE
+    window covering the view's end day (covering_window) alone —
+    `without_owner` and `owners_at_end` replayed for that day
+    (ownership_state); `as_of_window` names it. No covering window, or a
+    legacy fact (no start state) for a day other than its own end:
+    `without_owner` empty, no `owners_at_end`, and
+    `without_owner_unavailable` with the reason. None when no overlapping
+    window collected ownership."""
+    values = {}
+    for k in sorted(k for k in overlapping if k in recorded):
+        got = graphstore.get_window_facts(conn, project, repo, *k,
+                                          keys=("module_ownership",))
+        value = (got or {}).get("facts", {}).get("module_ownership")
+        if isinstance(value, dict) and value.get("collected"):
+            values[k] = value
+    if not values:
+        return None
+    ordered = sorted(values, key=lambda k: (k[1][:10], k[0][:10], k))
+    lo, hi = (ts_from or "")[:10], (ts_to or "")[:10]
+    events = [e for e in merge_ownership_events([values[k] for k in ordered])
+              if not ((lo and str(e.get("date") or "")[:10] < lo)
+                      or (hi and str(e.get("date") or "")[:10] > hi))]
+    if any("seq" in e for e in events):
+        for n, e in enumerate(events):
+            e["seq"] = n
+    latest = values[ordered[-1]]
+    out = {k: v for k, v in latest.items()
+           if k in ("collected", "label_patterns", "owner_files")}
+    covering = covering_window(values, hi) if hi else None
+    if covering is not None:
+        # the covering fact's proposals, those committed by the view's end
+        prop = {m: r for m, r in (values[covering].get("proposed_modules") or {}).items()
+                if isinstance(r, dict) and str(r.get("committed_at") or "")[:10] <= hi}
+        if prop:
+            out["proposed_modules"] = prop
+    out["events"] = events
+    out["windows"] = [{"from": k[0], "to": k[1]} for k in sorted(values)]
+    unread, seen_u = [], set()
+    for k in ordered:
+        for u in values[k].get("unread") or []:
+            key = json.dumps(u, sort_keys=True)
+            if key not in seen_u:
+                seen_u.add(key)
+                unread.append(u)
+    if unread:
+        out["unread"] = unread
+    end = hi or ordered[-1][1][:10]
+    k = covering_window(values, end)
+    if k is None:
+        out["without_owner"] = []
+        out["without_owner_unavailable"] = (
+            "ownership was not collected for {} (no collected window covers it; "
+            "the collected windows end {})".format(end, max(w[1][:10] for w in values)))
+        return out
+    out["as_of_window"] = {"from": k[0], "to": k[1]}
+    fact = values[k]
+    st = ownership_state(fact, end)
+    if st is not None:
+        out.update(ownership_end_fields(st))
+    elif isinstance(fact.get("start_state"), dict):
+        # a start state that was not read completely: never presented as known
+        out["without_owner"] = []
+        out["without_owner_unavailable"] = PARTIAL_START_REASON.format(k[0], k[1])
+    elif end == k[1][:10]:
+        out["without_owner"] = list(fact.get("without_owner") or [])
+        for key in ("owners_at_end", "modules_at_end", "deprecated_modules",
+                    "stub_modules", "marker_texts", "shared_marker_texts"):
+            if key in fact:
+                out[key] = fact[key]
+    else:
+        out["without_owner"] = []
+        out["without_owner_unavailable"] = LEGACY_OWNERSHIP_REASON.format(k[0], k[1])
+    return out
+
+
+def _merged_linked_items(conn, project, repo, overlapping, recorded):
+    """The `linked_items` of a view that is not exactly one gathered window:
+    per number, the row of the latest overlapping window that read it (by
+    end day); `missing` the numbers no window found. None when no
+    overlapping window collected it."""
+    values = {}
+    for k in sorted(k for k in overlapping if k in recorded):
+        got = graphstore.get_window_facts(conn, project, repo, *k,
+                                          keys=("linked_items",))
+        value = (got or {}).get("facts", {}).get("linked_items")
+        if isinstance(value, dict) and value.get("collected"):
+            values[k] = value
+    if not values:
+        return None
+    items, missing = {}, set()
+    for k in sorted(values, key=lambda k: (k[1][:10], k[0][:10], k)):
+        for it in values[k].get("items") or []:
+            if isinstance(it, dict) and isinstance(it.get("number"), int):
+                items[it["number"]] = dict(it, gathered_at=values[k].get("gathered_at"))
+        missing.update(n for n in values[k].get("missing") or [] if isinstance(n, int))
+    return {"collected": True, "items": [items[n] for n in sorted(items)],
+            "missing": sorted(missing - set(items)),
+            "windows": [{"from": k[0], "to": k[1]} for k in sorted(values)]}
 
 
 def _merged_pr_activity(conn, project, repo, overlapping, recorded):

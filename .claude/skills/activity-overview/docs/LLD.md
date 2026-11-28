@@ -387,6 +387,14 @@ per-window fact (`graphstore.WINDOW_FACT_KEYS`, §4.10), never as a singleton no
 
 ### 4.4c Checks, thread state and lifecycle events (`collect_pr_activity`)
 
+Every commit: after the batched first read (the latest 10 commits with contexts),
+`collect_check_history` pages a PR's older commits with their roll-up state only
+(`PR_COMMITS_PAGE_QUERY`, 100 per page) and reads full contexts only where the state is not
+a success, or where the first read cut a commit's contexts at 50 without a visible failure
+(`commit_contexts_query`, `object(oid:)` aliases, 20 per request, paged by cursor). Window
+budget `ACTIVITY_PR_CHECKS_MAX_REQUESTS` (400), per-PR `ACTIVITY_PR_CHECKS_MAX_COMMITS`
+(1,000); `history_status` records complete / capped / failed.
+
 The per-window fact `pr_activity` (BUNDLE.md) answers what the conversation does not:
 whether the checks passed on each push, whether a review thread was marked resolved, and
 the PR's renames, draft / ready changes, review requests, dismissals and force-pushes.

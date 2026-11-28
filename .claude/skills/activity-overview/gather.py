@@ -910,10 +910,20 @@ def parse_blocks_refs(text):
     return out
 
 
+def _with_author_type(out, raw):
+    """`out` with `author_type`: the account type GitHub reports for the
+    record's author (`user.type`), kept only when it is not "User" (a
+    "Bot" account is automation whatever its login says). Pure."""
+    typ = (raw.get("user") or {}).get("type")
+    if typ and typ != "User":
+        out["author_type"] = typ
+    return out
+
+
 def normalize_pr(raw):
     """Map a GitHub REST PR object to the bundle's PR shape."""
     milestone = raw.get("milestone")
-    return {
+    return _with_author_type({
         "number": raw["number"],
         "title": raw.get("title", ""),
         "body": raw.get("body") or "",
@@ -948,7 +958,7 @@ def normalize_pr(raw):
         "crossref_issues": parse_listed_refs(_pr_text(raw), _pr_repo_slug(raw)),
         "closes": parse_closing_refs(_pr_text(raw), _pr_repo_slug(raw)),
         "url": raw.get("html_url"),
-    }
+    }, raw)
 
 
 def _pr_text(raw):
@@ -975,7 +985,7 @@ def select_merged_prs(prs, from_date, to_date):
 def normalize_issue(raw):
     """Map a GitHub REST issue object to the bundle's issue shape."""
     milestone = raw.get("milestone")
-    return {
+    return _with_author_type({
         "number": raw["number"],
         "title": raw.get("title", ""),
         "body": raw.get("body") or "",
@@ -997,7 +1007,7 @@ def normalize_issue(raw):
             (raw.get("title", "") or "") + "\n" + (raw.get("body") or "")
         ),
         "url": raw.get("html_url"),
-    }
+    }, raw)
 
 
 # Submitted review states (GitHub: APPROVED, CHANGES_REQUESTED, COMMENTED,
@@ -1069,14 +1079,14 @@ def normalize_review(raw):
     texture). A review's `html_url` is surfaced as `url` for provenance; when
     absent, the fold synthesizes a stable `<pr url>#pullrequestreview-<id>`
     ref (so check_provenance never fails)."""
-    return {
+    return _with_author_type({
         "id": raw.get("id"),
         "author": (raw.get("user") or {}).get("login"),
         "state": (raw.get("state") or "").lower() or None,
         "submitted_at": raw.get("submitted_at"),
         "body": raw.get("body"),
         "url": raw.get("html_url"),
-    }
+    }, raw)
 
 
 # Lifecycle events we persist as first-class `event` social nodes. Conservative
@@ -1089,7 +1099,7 @@ def parse_timeline_lifecycle(raw_timeline):
     """Normalize the allowlisted timeline lifecycle events. Pure.
 
     Keeps only `reopened`/`closed`/`ready_for_review` (order-preserving), each as
-    {id, actor, event, created_at, label, url}. `url` is None when the raw event
+    {id, actor, event, created_at, label, url, [state_reason], [commit]}. `url` is None when the raw event
     carries none — the fold synthesizes a stable `<parent html_url>#event-<id>`
     provenance ref in that case (so check_provenance passes)."""
     out = []
@@ -1097,14 +1107,22 @@ def parse_timeline_lifecycle(raw_timeline):
         event = ev.get("event")
         if event not in _LIFECYCLE_EVENTS:
             continue
-        out.append({
+        row = {
             "id": ev.get("id"),
             "actor": (ev.get("actor") or {}).get("login"),
             "event": event,
             "created_at": ev.get("created_at"),
             "label": (ev.get("label") or {}).get("name"),
             "url": ev.get("url"),
-        })
+        }
+        # why / by what an item was closed: GitHub's state_reason
+        # (completed / not_planned / reopened) and the commit that closed
+        # it, when the event carries them (omitted otherwise)
+        if ev.get("state_reason"):
+            row["state_reason"] = ev["state_reason"]
+        if ev.get("commit_id"):
+            row["commit"] = ev["commit_id"]
+        out.append(row)
     return out
 
 
@@ -1413,14 +1431,14 @@ def normalize_milestone(raw):
 def _normalize_comment_obj(raw):
     """Shared mapping for conversation + review comments: the bundle's comment
     shape {id, author, author_association, body, url, created_at}. Pure, permissive."""
-    return {
+    return _with_author_type({
         "id": raw.get("id"),
         "author": (raw.get("user") or {}).get("login"),
         "author_association": raw.get("author_association"),
         "body": raw.get("body") or "",
         "url": raw.get("html_url"),
         "created_at": raw.get("created_at"),
-    }
+    }, raw)
 
 
 def normalize_comment(raw):
@@ -1700,6 +1718,30 @@ def _cap_snippet(text, limit=200):
     return (text or "").strip()[:limit] or None
 
 
+def _decorator_owners(lang, lines):
+    """{line index: (subkind, name)} for the lines of a Bicep decorator
+    block (`@allowed([` ... `])`, `@minValue(1)`, ...) that directly
+    precede a declaration in the hunk: the declaration they decorate.
+    Decorator lines not followed by a declaration inside the hunk are left
+    to the caller's rule. Other languages: {}. Pure."""
+    if lang != "bicep":
+        return {}
+    out, pending, depth = {}, [], 0
+    for i, (_sign, text) in enumerate(lines):
+        t = text.strip()
+        if depth > 0 or t.startswith("@"):
+            pending.append(i)
+            depth = max(0, depth + sum(t.count(c) for c in "([{")
+                        - sum(t.count(c) for c in ")]}"))
+            continue
+        decl = detect_symbol_decl(lang, text)
+        if decl is not None and decl[0] == "symbol":
+            for j in pending:
+                out[j] = (decl[1], decl[2])
+        pending = []
+    return out
+
+
 def build_symbol_deltas(path, hunks):
     """Attribute a file's diff hunks to symbol-level changes (diff-local). Pure.
 
@@ -1721,12 +1763,16 @@ def build_symbol_deltas(path, hunks):
 
     for hunk in hunks:
         current = None
-        for sign, text in hunk["lines"]:
+        owner = _decorator_owners(lang, hunk["lines"])
+        for i, (sign, text) in enumerate(hunk["lines"]):
             decl = detect_symbol_decl(lang, text)
             if decl is None:
-                if sign in ("+", "-") and current is not None:
-                    touched.add(current)
-                    note(current, sign, text)
+                # a decorator's lines (`@allowed([...])` and its entries)
+                # belong to the declaration BELOW them, not the one above
+                target = owner.get(i, current)
+                if sign in ("+", "-") and target is not None:
+                    touched.add(target)
+                    note(target, sign, text)
                 continue
             kind, subkind, name = decl
             key = (subkind, name)
@@ -2370,6 +2416,753 @@ def collect_module_notes(code_events, read_blob, list_tags, from_date, to_date):
     return notes
 
 
+# --- Module ownership (per-window fact `module_ownership`) --------------------
+#
+# Who owns which module, and the window's changes to it (issue #97: "maintainer
+# needed / added / removed"). From the clone and the records already gathered:
+# CODEOWNERS changes, per-module owner files (a JSON file with an `owners`
+# list, e.g. Azure/bicep-registry-modules' `metadata.json`), orphaned-module
+# markers (`ORPHANED.md` added / removed under a module folder, and those
+# standing at the window's end) and issues / PRs carrying an ownership label.
+# Never inferred from prose: a quote is the item's own title.
+
+CODEOWNERS_PATHS = (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS")
+# Per-module owner files (ACTIVITY_OWNER_FILES, comma-separated basenames).
+OWNER_FILE_NAMES = ("metadata.json",)
+ORPHAN_MARKER_NAMES = extract.ORPHAN_MARKER_NAMES
+# Ownership labels by event kind, matched case-insensitively against label
+# names (ACTIVITY_OWNERSHIP_LABELS: `kind=regex;kind=regex`). The defaults
+# match "Status: Module Orphaned :yellow_circle:" style labels and "owner
+# needed" / "looking for an owner" / "needs a new owner" ones - NOT a label
+# such as Azure/bicep-registry-modules' "Needs: Module Owner :mega:", which
+# asks the existing owner to respond (checked on the October 2026 records:
+# it sits on PRs of modules that have owners).
+OWNERSHIP_LABEL_PATTERNS = {"owner_needed": (r"owner\W*needed",
+                                             r"looking\W*for\W*(?:an?\W*)?owner",
+                                             r"needs?\W*(?:a\W*)?new\W*owner"),
+                            "orphaned": (r"orphan",),
+                            # asks the module's existing owner to respond: not
+                            # an ownership change (link reads it off the
+                            # records as `owner_response_requested`)
+                            "owner_response_requested": (r"needs\W*module\W*owner",)}
+OWNERSHIP_EVENT_KINDS = ("owner_needed", "owner_added", "owner_removed",
+                         "orphaned", "adopted",
+                         # module lifecycle, from the tree
+                         "deprecated", "undeprecated", "module_added",
+                         "module_removed", "module_info_changed")
+# Module lifecycle markers and entry files (ACTIVITY_DEPRECATED_FILES /
+# ACTIVITY_ENTRY_FILES, comma-separated basenames): a module folder is
+# `live` with an entry file, `deprecated` with a deprecation marker,
+# `orphaned` with an orphan marker, a `stub` with its metadata only.
+DEPRECATED_MARKER_NAMES = ("DEPRECATED.md",)
+MODULE_ENTRY_FILES = ("main.bicep", "main.tf")
+MARKER_TEXT_LINES = 5          # lines of a deprecation marker kept verbatim
+MARKER_TEXT_CAP = 600
+_AVM_MODULE_FOLDER_RE = re.compile(r"^avm/(?:res|ptn|utl)/[^/]+/[^/]+$")
+# the module metadata an owner file carries, as the module rows name it
+MODULE_INFO_FIELDS = (("moduleDisplayName", "display_name"),
+                      ("moduleDescription", "description"),
+                      ("canonicalType", "resource_type"),
+                      ("alternativeNames", "alternative_names"))
+# the label kinds ACTIVITY_OWNERSHIP_LABELS may configure
+OWNERSHIP_LABEL_KINDS = OWNERSHIP_EVENT_KINDS + ("owner_response_requested",)
+_AVM_MODULE_REF_RE = re.compile(r"\b(?:avm/)?((?:res|ptn|utl)/[\w.-]+/[\w.-]+)")
+
+
+def ownership_label_patterns(env=None):
+    """{kind: (regex, ...)} from ACTIVITY_OWNERSHIP_LABELS or the defaults."""
+    env = os.environ if env is None else env
+    raw = env.get("ACTIVITY_OWNERSHIP_LABELS")
+    if not raw:
+        return {k: tuple(v) for k, v in OWNERSHIP_LABEL_PATTERNS.items()}
+    out = {}
+    for part in raw.split(";"):
+        kind, _, rx = part.partition("=")
+        kind = kind.strip()
+        if kind not in OWNERSHIP_LABEL_KINDS or not rx.strip():
+            raise SystemExit("error: ACTIVITY_OWNERSHIP_LABELS: {!r} is not "
+                             "kind=regex with a kind of {}".format(
+                                 part, ", ".join(OWNERSHIP_LABEL_KINDS)))
+        out.setdefault(kind, ())
+        out[kind] += (rx.strip(),)
+    return out
+
+
+def _name_list(env_key, default, env=None):
+    env = os.environ if env is None else env
+    raw = env.get(env_key)
+    if raw is None:
+        return tuple(default)
+    return tuple(x.strip() for x in raw.split(",") if x.strip())
+
+
+def deprecated_marker_names(env=None):
+    return _name_list("ACTIVITY_DEPRECATED_FILES", DEPRECATED_MARKER_NAMES, env)
+
+
+def module_entry_names(env=None):
+    return _name_list("ACTIVITY_ENTRY_FILES", MODULE_ENTRY_FILES, env)
+
+
+def module_info_from_json(text):
+    """{display_name, description, resource_type, alternative_names} the
+    module's metadata (owner) file states, each only when it is there;
+    {} when the text is not a JSON object."""
+    try:
+        data = json.loads(text or "")
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out = {}
+    for src, dst in MODULE_INFO_FIELDS:
+        v = data.get(src)
+        if isinstance(v, str) and v.strip():
+            out[dst] = v.strip()
+        elif dst == "alternative_names" and isinstance(v, list):
+            names = [x for x in v if isinstance(x, str) and x.strip()]
+            if names:
+                out[dst] = names
+    return out
+
+
+def marker_text(text):
+    """A lifecycle marker's first non-empty lines, verbatim (a deprecation
+    marker usually names the replacement)."""
+    lines = [ln.rstrip() for ln in (text or "").splitlines() if ln.strip()]
+    return "\n".join(lines[:MARKER_TEXT_LINES])[:MARKER_TEXT_CAP]
+
+
+_REPLACEMENT_RES = (
+    re.compile(r"(?i)\b(?:replaced by|superseded by|moved to|migrated to|"
+               r"successor(?: module)? is|please use|migrate to)\s+(?:the\s+)?`?"
+               r"((?:avm/)?(?:res|ptn|utl)/[\w.-]+/[\w.-]+)`?"),
+    re.compile(r"(?i)\buse\s+(?:the\s+)?`?((?:avm/)?(?:res|ptn|utl)/[\w.-]+/[\w.-]+)`?"
+               r"\s+(?:module\s+)?instead\b"))
+
+
+def replacement_named(texts):
+    """{module, quote, file} — the replacement module a deprecated module's
+    own texts name EXPLICITLY ("replaced by / superseded by / moved to /
+    migrate to <module>", "use <module> instead"), from [(file, text)] in
+    order; None when none does (never guessed)."""
+    for name, text in texts:
+        for rx in _REPLACEMENT_RES:
+            m = rx.search(text or "")
+            if m:
+                mod = m.group(1)
+                if not mod.startswith("avm/"):
+                    mod = "avm/" + mod
+                line = next((ln.strip() for ln in (text or "").splitlines()
+                             if m.group(0) in ln), m.group(0))
+                return {"module": mod, "quote": line[:300], "file": name}
+    return None
+
+
+def is_module_folder(folder, entry_names=MODULE_ENTRY_FILES):
+    """A folder a module lives in: `avm/res|ptn|utl/<group>/<name>`, the
+    repository root of a Terraform module, or `modules/<name>`."""
+    return bool(_AVM_MODULE_FOLDER_RE.match(folder or "")) or folder == "" \
+        or bool(re.match(r"^modules/[^/]+$", folder or ""))
+
+
+def _owner_file_names(env=None):
+    env = os.environ if env is None else env
+    raw = env.get("ACTIVITY_OWNER_FILES")
+    if raw is None:
+        return OWNER_FILE_NAMES
+    return tuple(x.strip() for x in raw.split(",") if x.strip())
+
+
+def _codeowners_module(pattern):
+    p = (pattern or "").strip().lstrip("/")
+    while p.endswith(("/**", "/*", "/")):
+        p = p[:-3] if p.endswith("/**") else p[:-2] if p.endswith("/*") else p[:-1]
+    return p or "/"
+
+
+_UNPARSEABLE = object()
+
+
+def _owners_from_json(text):
+    """The `owners` list of an owner file's text: a list of logins; None when
+    the JSON has no `owners` list (not an owner file); _UNPARSEABLE when the
+    text is not JSON at all (never read as "no owners")."""
+    try:
+        data = json.loads(text)
+    except (TypeError, ValueError):
+        return _UNPARSEABLE
+    owners = data.get("owners") if isinstance(data, dict) else None
+    if not isinstance(owners, list):
+        return None
+    return [str(o).lstrip("@") for o in owners if isinstance(o, str) and o.strip()]
+
+
+def _module_of_item(rec):
+    m = _AVM_MODULE_REF_RE.search(rec.get("title") or "")
+    return "avm/" + m.group(1) if m else None
+
+
+def collect_module_ownership(code_events, commits, prs, issues, read_blob,
+                             end_files, frm, to, web=None, label_patterns=None,
+                             owner_files=None, start_files=None, end_rev=None,
+                             start_state=None, clock=None, proposed=None):
+    """The window's SELF-CONTAINED `module_ownership` fact: {collected,
+    gathered_at, window {from, to}, start_state, start_state_source, events:
+    [{kind, module, people, date, at, seq, source: {type, number|sha, url,
+    [pr]}, [quote], [via]}], labelled_items, without_owner: [{module,
+    marker, [since], [source]}], owners_at_end, [end_check], label_patterns,
+    owner_files, [unread]}.
+    - `start_state` (ownership_start_state, passed in): the COMPLETE state
+      at the window's start; without it (a caller with no tree before the
+      window) the orphan markers only, from `start_files` or derived from
+      `end_files` and the window's marker events (`start_state_source`
+      `markers_only`);
+    - CODEOWNERS (CODEOWNERS_PATHS) changed in the window: per pattern,
+      owners added -> `owner_added`, removed -> `owner_removed` (module: the
+      pattern as a path), via `codeowners`;
+    - a per-module owner file (`owner_files`, default ACTIVITY_OWNER_FILES /
+      OWNER_FILE_NAMES: JSON with an `owners` list) changed: owners added /
+      removed, via that file; an `owners` list that became empty ->
+      `owner_needed`. A version that is not JSON is `unread` and no change
+      is derived from it;
+    - an orphan marker (ORPHAN_MARKER_NAMES) added -> `orphaned`, removed ->
+      `adopted` (people: the commit author, as the store resolves it: pass
+      code events after author resolution);
+    - an issue / PR (as it was at the window's end: extract.record_as_of;
+      one created later is skipped) opened in the window with an ownership
+      label (`label_patterns` {kind: regexes}) -> that kind, its title as
+      `quote`, module from an `avm/res|ptn|utl/...` reference in the title;
+      `labelled_items` — every owner-needed / orphaned item that existed at
+      the window's end, with the day it opened and the day it closed.
+    Events carry `at` (commit / item time) and `seq` (the replay order: day,
+    time, the walk's order; one change's own events by kind). The state of
+    any day of the window is extract.ownership_state over this fact alone;
+    `without_owner` / `owners_at_end` are that state at the window's end
+    (validate replays it again), `end_check` compares the replayed owners
+    with an independent read of the end tree's owner files at `end_rev`.
+    The `owner_response_requested` label kind is not an ownership change
+    and is not stored as an event (link reads it off the records). Pure
+    over its readers."""
+    patterns = label_patterns or ownership_label_patterns()
+    owner_files = owner_files or _owner_file_names()
+    dep_names = deprecated_marker_names()
+    entry_names = module_entry_names()
+    by_sha = {c.get("sha"): c for c in commits or []}
+    walk = {c.get("sha"): i for i, c in enumerate(commits or [])}
+    events, unread = [], []
+
+    def at(e):
+        return (by_sha.get(e.get("commit")) or {}).get("committed_at")
+
+    def src(e):
+        out = {"type": "commit", "sha": e.get("commit")}
+        if web and e.get("commit"):
+            out["url"] = "{}/commit/{}".format(web, e["commit"])
+        pr = (by_sha.get(e.get("commit")) or {}).get("pr")
+        if pr is not None:
+            out["pr"] = pr
+        return out
+
+    def versions(e):
+        before = after = ""
+        try:
+            if e.get("change") != "add":
+                before = read_blob(e["commit"] + "^", e.get("old_path") or e["path"])
+            if e.get("change") != "delete":
+                after = read_blob(e["commit"], e["path"])
+        except BlobUnreadable:
+            return None, None
+        return before, after
+
+    # one day's changes replay in commit order (the commit time, then the
+    # walk's order), never by kind: emptied at 09:00 and refilled at 15:00
+    # ends the day owned
+    for e in sorted(code_events or [], key=lambda x: (
+            x.get("date") or "", at(x) or "", walk.get(x.get("commit"), -1),
+            x.get("commit") or "")):
+        path = e.get("path") or ""
+        first = len(events)
+        base = path.rsplit("/", 1)[-1]
+        folder = path.rsplit("/", 1)[0] if "/" in path else ""
+        if path in CODEOWNERS_PATHS:
+            before, after = versions(e)
+            if before is None and after is None:
+                unread.append({"path": path, "commit": e.get("commit")})
+                continue
+            old = {r["pattern"]: r["owners"] for r in parse_codeowners(before or "")}
+            new = {r["pattern"]: r["owners"] for r in parse_codeowners(after or "")}
+            for pat in sorted(set(old) | set(new)):
+                a = [o for o in new.get(pat, []) if o not in old.get(pat, [])]
+                r = [o for o in old.get(pat, []) if o not in new.get(pat, [])]
+                for kind, people in (("owner_added", a), ("owner_removed", r)):
+                    if people:
+                        events.append({"kind": kind, "module": _codeowners_module(pat),
+                                       "people": people, "date": e.get("date"),
+                                       "source": src(e), "via": "codeowners"})
+        elif base in owner_files:
+            before, after = versions(e)
+            if before is None and after is None:
+                unread.append({"path": path, "commit": e.get("commit")})
+                continue
+            old = _owners_from_json(before) if before else []
+            new = _owners_from_json(after) if after else []
+            if old is not _UNPARSEABLE and new is not _UNPARSEABLE \
+                    and e.get("change") != "delete":
+                info_before, info_after = module_info_from_json(before), \
+                    module_info_from_json(after)
+                if info_after and info_after != info_before:
+                    events.append({"kind": "module_info_changed", "module": folder,
+                                   "people": [p for p in [e.get("author")] if p],
+                                   "date": e.get("date"), "source": src(e), "via": base,
+                                   "info": info_after})
+            if old is _UNPARSEABLE or new is _UNPARSEABLE:
+                unread.append({"path": path, "commit": e.get("commit"),
+                               "reason": "not valid JSON"})
+                continue
+            if old is None and new is None:
+                continue                      # not an owner file after all
+            old, new = old or [], new or []
+            module = folder
+            a = [o for o in new if o not in old]
+            r = [o for o in old if o not in new]
+            for kind, people in (("owner_added", a), ("owner_removed", r)):
+                if people:
+                    ev = {"kind": kind, "module": module, "people": people,
+                          "date": e.get("date"), "source": src(e), "via": base}
+                    if e.get("change") == "delete":
+                        # the owner FILE went away (often with the module): not
+                        # an owner list emptied
+                        ev["file_removed"] = True
+                    events.append(ev)
+            if not r and e.get("change") == "delete":
+                events.append({"kind": "owner_removed", "module": module, "people": [],
+                               "date": e.get("date"), "source": src(e), "via": base,
+                               "file_removed": True})
+            if old and not new and e.get("change") != "delete":
+                events.append({"kind": "owner_needed", "module": module, "people": [],
+                               "date": e.get("date"), "source": src(e), "via": base})
+            elif e.get("change") == "add" and isinstance(_owners_from_json(after), list) \
+                    and not new:
+                # an owner file created with an empty `owners` list (a new
+                # module nobody owns yet) — distinct from metadata without an
+                # `owners` field, which is no owner file at all
+                events.append({"kind": "owner_needed", "module": module, "people": [],
+                               "date": e.get("date"), "source": src(e), "via": base,
+                               "file_added": True})
+        if base in ORPHAN_MARKER_NAMES and e.get("change") in ("add", "delete"):
+            ev = {"kind": "orphaned" if e["change"] == "add" else "adopted",
+                  "module": folder, "people": [p for p in [e.get("author")] if p],
+                  "date": e.get("date"), "source": src(e), "via": base}
+            if e["change"] == "add":
+                try:
+                    text = marker_text(read_blob(e["commit"], path) or "")
+                except BlobUnreadable:
+                    text = ""
+                if text:
+                    ev["marker_text"] = text
+            events.append(ev)
+        if base in dep_names and e.get("change") in ("add", "delete"):
+            ev = {"kind": "deprecated" if e["change"] == "add" else "undeprecated",
+                  "module": folder, "people": [p for p in [e.get("author")] if p],
+                  "date": e.get("date"), "source": src(e), "via": base}
+            if e["change"] == "add":
+                try:
+                    text = marker_text(read_blob(e["commit"], path) or "")
+                except BlobUnreadable:
+                    text = ""
+                if text:
+                    ev["marker_text"] = text
+                if ev["kind"] == "deprecated":
+                    texts = [("DEPRECATED marker", text)]
+                    for name in ("README.md", "CHANGELOG.md"):
+                        try:
+                            texts.append((name, read_blob(e["commit"], folder + "/" + name)
+                                          or ""))
+                        except BlobUnreadable:
+                            continue
+                    rep_ = replacement_named(texts)
+                    if rep_:
+                        ev["replacement"] = rep_
+            events.append(ev)
+        if base in entry_names and e.get("change") in ("add", "delete") \
+                and is_module_folder(folder):
+            events.append({"kind": "module_added" if e["change"] == "add"
+                           else "module_removed", "module": folder,
+                           "people": [p for p in [e.get("author")] if p],
+                           "date": e.get("date"), "source": src(e), "via": base})
+        # one change's own events (same instant) in kind order
+        events[first:] = sorted(events[first:], key=lambda x: (x["kind"],
+                                                               x.get("module") or ""))
+        if at(e):
+            for ev in events[first:]:
+                ev["at"] = at(e)
+    compiled = {k: [re.compile(x, re.I) for x in v] for k, v in patterns.items()}
+
+    def label_kind(labels):
+        for kind in OWNERSHIP_EVENT_KINDS:
+            for lbl in labels or []:
+                if any(rx.search(lbl) for rx in compiled.get(kind, ())):
+                    return kind, lbl
+        return None, None
+    labelled = []
+    for typ, recs in (("issue", issues or []), ("pr", prs or [])):
+        for raw in recs:
+            rec = extract.record_as_of(typ, raw, to)
+            if rec is None:
+                continue                  # created after the window's end
+            kind, lbl = label_kind(rec.get("labels"))
+            if not kind:
+                continue
+            source = {"type": typ, "number": rec.get("number"), "url": rec.get("url")}
+            if in_window(rec.get("created_at"), frm, to):
+                events.append({"kind": kind, "module": _module_of_item(rec),
+                               "people": [p for p in [rec.get("author")] if p],
+                               "date": (rec.get("created_at") or "")[:10],
+                               "at": rec.get("created_at"),
+                               "source": source, "quote": rec.get("title"),
+                               "via": lbl})
+            closed = (rec.get("closed_at") or "")[:10] \
+                if rec.get("state") == "closed" else None
+            if kind in extract._UNOWNED_KINDS and _module_of_item(rec) \
+                    and (closed is None or closed >= (frm or "")[:10]):
+                item = {"module": _module_of_item(rec), "marker": lbl,
+                        "opened": (rec.get("created_at") or "")[:10],
+                        "source": source}
+                if closed:
+                    item["closed"] = closed
+                labelled.append(item)
+    if start_state is None:
+        # no complete start state was read (a caller without the tree before
+        # the window): the orphan markers only, from the start tree or from
+        # the end tree and the window's marker events
+        def markers_of(files):
+            return {f.rsplit("/", 1)[0] if "/" in f else ""
+                    for f in files or [] if f.rsplit("/", 1)[-1] in ORPHAN_MARKER_NAMES}
+        if start_files is not None:
+            start = markers_of(start_files)
+        else:
+            start = markers_of(end_files)
+            for e in reversed(events):            # code events: in commit order
+                if (e.get("source") or {}).get("type") != "commit" \
+                        or e.get("via") not in ORPHAN_MARKER_NAMES:
+                    continue
+                if e["kind"] == "orphaned":
+                    start.discard(e["module"])
+                elif e["kind"] == "adopted":
+                    start.add(e["module"])
+        start_state = {m: {"owners": [], "codeowners": [], "orphan_marker": True}
+                       for m in sorted(start)}
+        start_source = "markers_only"
+    else:
+        start_source = "complete"
+    # the replay order (extract.ownership_event_order): day, commit / item
+    # time, then the order emitted (`seq`: a commit's events in walk order)
+    order = sorted(range(len(events)), key=lambda i: (
+        (events[i].get("date") or "")[:10], events[i].get("at") or "", i))
+    events = [events[i] for i in order]
+    for i, e in enumerate(events):
+        e["seq"] = i
+    labelled.sort(key=lambda x: (x["module"], x["opened"], x["source"]["number"] or 0))
+    out = {"collected": True,
+           "gathered_at": (clock or (lambda: datetime.datetime.now(
+               datetime.timezone.utc)))().strftime("%Y-%m-%dT%H:%M:%SZ"),
+           "window": {"from": (frm or "")[:10], "to": (to or "")[:10]},
+           "start_state": {m: start_state[m] for m in sorted(start_state)},
+           "start_state_source": start_source,
+           "events": events, "labelled_items": labelled,
+           "label_patterns": {k: list(v) for k, v in patterns.items()},
+           "owner_files": list(owner_files),
+           "marker_files": {"orphaned": list(ORPHAN_MARKER_NAMES),
+                            "deprecated": list(dep_names)},
+           "entry_files": list(entry_names)}
+    if proposed:
+        out["proposed_modules"] = proposed
+    # the window's end, derived by the same replay every reader uses (kept
+    # stored as a cross-check: validate replays it again)
+    end = extract.ownership_state(out, (to or "")[:10])
+    if end is None:
+        # the owner files at the window's start were never read: the state
+        # is not known (the events are)
+        out["without_owner"] = []
+        out["without_owner_unavailable"] = extract.PARTIAL_START_REASON.format(
+            (frm or "")[:10], (to or "")[:10])
+    else:
+        for key, val in extract.ownership_end_fields(end).items():
+            out[key] = val
+    if end_rev and start_source == "complete":
+        # an independent read of the end tree's owner files: what the replay
+        # derived must match it (unread versions make it differ)
+        read = {}
+        for f in end_files or []:
+            folder, _, base = f.rpartition("/")
+            if base not in owner_files:
+                continue
+            try:
+                text = read_blob(end_rev, f)
+            except BlobUnreadable:
+                continue
+            got = _owners_from_json(text) if text else None
+            if isinstance(got, list):
+                read[folder] = got
+        diffs = sorted(m for m in set(read) | {m for m, r in start_state.items()
+                                               if r.get("owner_file")}
+                       if sorted(read.get(m) or []) != sorted(
+                           (start_state_owner_files(out, m)) or []))
+        out["end_check"] = {"matches": not diffs, "differences": diffs[:50]}
+    if unread:
+        out["unread"] = unread
+    return out
+
+
+def start_state_owner_files(fact, module):
+    """The owner-file owners of `module` at the window's end by replay (the
+    CODEOWNERS individuals left out), for the end-tree cross-check."""
+    import copy
+    f = copy.deepcopy(fact)
+    for r in (f.get("start_state") or {}).values():
+        r["codeowners"] = []
+    f["events"] = [e for e in f.get("events") or [] if e.get("via") != "codeowners"]
+    return (extract.ownership_state(f, "9999-12-31") or {}).get("owners", {}).get(module)
+
+
+def proposed_module_info(pr_history, read_blob, as_of=None, prs=None):
+    """{module folder: {prs: [n], commit, committed_at, [info]}} — the
+    module folders whose entry file a PR's own commits (committed by
+    `as_of`, the window's end) ADD: proposed modules; `info` is what the
+    metadata file the PR adds says the module is (display name,
+    description, resource type) — a stub on the base keeps its own.
+    Only PRs still open at `as_of` propose (`prs`: the window's PR records;
+    one merged or closed by then does not). Offline: the PR heads are in the
+    clone (refs/remotes/pr/<N>)."""
+    ended = {p.get("number") for p in prs or [] if isinstance(p, dict)
+             and (p.get("merged_at") or p.get("closed_at"))
+             and (not as_of or (p.get("merged_at") or p.get("closed_at")) <= as_of)}
+    out = {}
+    for row in (pr_history or {}).get("prs") or []:
+        if not isinstance(row, dict) or row.get("number") in ended:
+            continue
+        commits = [c for c in row.get("commits") or [] if isinstance(c, dict)
+                   and c.get("parents", 1) == 1
+                   and (not as_of or (c.get("committed_at") or "") <= as_of)]
+        added = {p: c for c in commits for p in c.get("added") or []}
+        for path, c in added.items():
+            folder, _, base = path.rpartition("/")
+            if base not in module_entry_names() or not is_module_folder(folder):
+                continue
+            # the PR's commits add the folder's entry file: proposed (a stub
+            # on the base keeps its metadata; a new folder's metadata file
+            # comes with the PR)
+            r = out.setdefault(folder, {"prs": [], "commit": c["sha"],
+                                        "committed_at": c.get("committed_at")})
+            if row.get("number") not in r["prs"]:
+                r["prs"].append(row.get("number"))
+            for name in _owner_file_names():
+                meta_c = added.get(folder + "/" + name)
+                if meta_c is None or r.get("info"):
+                    continue
+                try:
+                    info = module_info_from_json(read_blob(meta_c["sha"],
+                                                           folder + "/" + name) or "")
+                except BlobUnreadable:
+                    info = {}
+                if info:
+                    r["info"] = info
+    return {k: out[k] for k in sorted(out)}
+
+
+def window_start_commit(clone_dir, from_date, run=None):
+    """The newest first-parent commit before `from_date` (the tree just
+    before the window), or None when the bounded clone holds none."""
+    run = run or run_git
+    try:
+        raw = run(["git", "-C", clone_dir, "log", "--first-parent",
+                   f"--pretty=format:{LOG_FORMAT}"])
+    except RuntimeError:
+        return None
+    return next((rec["sha"] for rec in parse_git_log(raw)
+                 if (rec.get("date") or "")[:10] < (from_date or "")[:10]), None)
+
+
+def _last_change_days(clone_dir, sha, names, run):
+    """{path: day it last changed by `sha`} for every file named one of
+    `names` (any folder), from ONE `git log --name-only` walk; {} when the
+    walk fails (the days are then simply not stated)."""
+    try:
+        raw = run(["git", "-C", clone_dir, "log", "--format=%x1e%cI", "--name-only",
+                   sha, "--"] + ["*" + n for n in names])
+    except RuntimeError:
+        return {}
+    out = {}
+    for rec in raw.split("\x1e"):
+        lines = [ln for ln in rec.split("\n") if ln.strip()]
+        if not lines:
+            continue
+        day = lines[0].strip()[:10]
+        for path in lines[1:]:
+            out.setdefault(path.strip(), day)
+    return out
+
+
+def ownership_start_state(clone_dir, from_date, owner_files=None, run=None,
+                          read_blob=None):
+    """The COMPLETE ownership state at a window's start, from the tree of the
+    newest first-parent commit before `from_date`: {module folder:
+    {owner_file?, owners (that file's list), codeowners (CODEOWNERS rules
+    naming individuals for the folder), orphan_marker, marker_since? (the
+    day the marker file last changed), owners_since? (the day the owner
+    file last changed)}} — only folders with an owner file,
+    an orphan marker or a CODEOWNERS rule naming people. ([], unread) when
+    the clone holds no commit before the window: (None, []). Read once per
+    window; a reader never needs another window."""
+    run = run or run_git
+    owner_files = owner_files or _owner_file_names()
+    read_blob = read_blob or git_blob_reader(clone_dir, run)
+    sha = window_start_commit(clone_dir, from_date, run)
+    if sha is None:
+        return None, []
+    try:
+        files = [ln for ln in run(["git", "-C", clone_dir, "ls-tree", "-r", "--name-only",
+                                   sha]).split("\n") if ln]
+    except RuntimeError:
+        return None, []
+    state, unread = {}, []
+    dep_names, entry_names = deprecated_marker_names(), module_entry_names()
+    days = _last_change_days(clone_dir, sha, tuple(owner_files) + ORPHAN_MARKER_NAMES
+                             + tuple(dep_names), run)
+    tracked = set(files)
+    for f in files:
+        folder, _, base = f.rpartition("/")
+        if base in owner_files:
+            try:
+                got = _owners_from_json(read_blob(sha, f) or "")
+            except BlobUnreadable:
+                unread.append({"path": f, "commit": sha})
+                continue
+            if got is _UNPARSEABLE:
+                unread.append({"path": f, "commit": sha, "reason": "not valid JSON"})
+                continue
+            if got is None:
+                continue
+            r = state.setdefault(folder, {"owners": [], "codeowners": [],
+                                          "orphan_marker": False})
+            r["owner_file"] = base
+            r["owners"] = got
+            if days.get(f):
+                r["owners_since"] = days[f]
+            try:
+                info = module_info_from_json(read_blob(sha, f) or "")
+            except BlobUnreadable:
+                info = {}
+            if info:
+                r["info"] = info
+        elif base in dep_names:
+            r = state.setdefault(folder, {"owners": [], "codeowners": [],
+                                          "orphan_marker": False})
+            r["deprecated"] = True
+            if days.get(f):
+                r["deprecated_since"] = days[f]
+            try:
+                text = marker_text(read_blob(sha, f) or "")
+            except BlobUnreadable:
+                text = ""
+            if text:
+                r["deprecated_text"] = text
+        elif base in ORPHAN_MARKER_NAMES:
+            r = state.setdefault(folder, {"owners": [], "codeowners": [],
+                                          "orphan_marker": False})
+            r["orphan_marker"] = True
+            if days.get(f):
+                r["marker_since"] = days[f]
+            try:
+                text = marker_text(read_blob(sha, f) or "")
+            except BlobUnreadable:
+                text = ""
+            if text:
+                r["marker_text"] = text
+    for folder, r in state.items():
+        if r.get("deprecated"):
+            # where the repository names the replacement, explicitly: the
+            # marker, the module's README, its CHANGELOG
+            texts = [("DEPRECATED marker", r.get("deprecated_text") or "")]
+            for name in ("README.md", "CHANGELOG.md"):
+                try:
+                    texts.append((name, read_blob(sha, (folder + "/" if folder else "")
+                                                  + name) or ""))
+                except BlobUnreadable:
+                    continue
+            rep_ = replacement_named(texts)
+            if rep_:
+                r["replacement"] = rep_
+    for folder, r in state.items():
+        # a live module has its entry file; metadata alone is a stub
+        r["entry"] = any((folder + "/" if folder else "") + n in tracked
+                         for n in entry_names)
+    folders = {f.rpartition("/")[0] for f in files}
+    for path in CODEOWNERS_PATHS:
+        if path not in files:
+            continue
+        try:
+            text = read_blob(sha, path) or ""
+        except BlobUnreadable:
+            unread.append({"path": path, "commit": sha})
+            break
+        for rule in parse_codeowners(text):
+            m = _codeowners_module(rule["pattern"])
+            people = [o for o in rule["owners"] if "/" not in o and "@" not in o]
+            if people and m in folders:
+                r = state.setdefault(m, {"owners": [], "codeowners": [],
+                                         "orphan_marker": False})
+                r["codeowners"] = people
+        break
+    return state, unread
+
+
+def recompute_module_ownership(conn, project, repo, frm, to, clone_dir,
+                               read_blob=None, end_files=None, start_files=None,
+                               run=None, start_state=None):
+    """Recompute the `module_ownership` fact of an already gathered window
+    [frm, to] of a store, offline, from a clone of the repository holding
+    the window's history (`gather.py ... --recompute-ownership`): the
+    window's records and code events as stored, the end tree at the
+    window's stored clone sha, the start tree before `frm`. Only that fact
+    is replaced; the window's other facts are written back unchanged.
+    Returns the new fact."""
+    run = run or run_git
+    got = graphstore.get_window_facts(conn, project, repo, frm, to)
+    if got is None:
+        raise SystemExit("error: {}/{} has no gathered window {}..{} in this store"
+                         .format(project, repo, frm, to))
+    view = extract.extract(conn, project, repo, frm, to)
+    meta = view.get("meta") or {}
+    slug = meta.get("repo") if "/" in (meta.get("repo") or "") \
+        else "{}/{}".format(project, repo)
+    if end_files is None:
+        sha = got.get("clone_sha") or "HEAD"
+        end_files = [ln for ln in run(["git", "-C", clone_dir, "ls-tree", "-r",
+                                       "--name-only", sha]).split("\n") if ln]
+    if start_state is None and start_files is None:
+        # the complete state at the window's start, from the tree before it
+        start_state, _unread = ownership_start_state(clone_dir, frm, run=run,
+                                                     read_blob=read_blob)
+        start_files = window_start_files(clone_dir, frm, run)
+    fact = collect_module_ownership(
+        view.get("code_events") or [], view.get("commits") or [],
+        view.get("prs") or [], view.get("issues") or [],
+        read_blob or git_blob_reader(clone_dir, run), end_files, frm, to,
+        web="https://github.com/" + slug, start_files=start_files,
+        end_rev=got.get("clone_sha"), start_state=start_state,
+        proposed=proposed_module_info(
+            view.get("pr_history"), read_blob or git_blob_reader(clone_dir, run),
+            (to + "T23:59:59Z") if len(to) == 10 else to, view.get("prs")))
+    bundle = dict(got["facts"])
+    bundle["module_ownership"] = fact
+    bundle["meta"] = {"workflows_collected": got.get("ci_collected")}
+    graphstore.set_window_facts(conn, project, repo, frm, to, bundle,
+                                clone_sha=got.get("clone_sha"))
+    return fact
+
+
 # --- PR-internal history (per-window fact `pr_history`) ---------------------
 #
 # The base-branch walk sees one commit per squash-merged PR, so the work inside
@@ -2385,19 +3178,26 @@ def collect_module_notes(code_events, read_blob, list_tags, from_date, to_date):
 # Refspecs per `git fetch`. One fetch per batch keeps the command line short and
 # lets one failed batch be recorded without losing the others.
 PR_HISTORY_FETCH_BATCH = 100
+# The whole record (issue #97: "we need all the commits"): every PR of the
+# window and every commit of it is walked; the caps below are safety caps,
+# set high, each with a count of what it left out. ACTIVITY_PR_HISTORY_MAX_PRS
+# / ACTIVITY_PR_HISTORY_MAX_COMMITS override the PR and per-PR commit caps
+# of the walks. Replaced commits (force-pushes): at most
+# PR_HISTORY_REPLACED_MAX per push are listed.
+PR_HISTORY_REPLACED_MAX = 100
 # Commits kept per PR (oldest first); the rest are counted in commits_omitted.
 # GitHub's own PR commit list stops at 250.
-PR_HISTORY_MAX_COMMITS = 250
+PR_HISTORY_MAX_COMMITS = 1000
 # The comment / parameter walk (a `git log -p` over the PR's commits, which
 # fetches the blobs of the .bicep / .tf files they touch) runs only for PRs
 # with human conversation (the gather-time sign of a story), at most this many
 # PRs per window, the most discussed first ...
-PR_HISTORY_NOTES_MAX_PRS = 40
+PR_HISTORY_NOTES_MAX_PRS = 2000
 # ... and only for PRs of at most this many commits.
-PR_HISTORY_NOTES_MAX_COMMITS = 60
+PR_HISTORY_NOTES_MAX_COMMITS = 1000
 # Comment / parameter events kept per PR (the newest; notes_omitted counts the
 # oldest left out). A new module's first commit alone can add a few hundred.
-PR_HISTORY_NOTES_MAX = 400
+PR_HISTORY_NOTES_MAX = 20000
 # The symbol kinds the walk keeps: comments (developer notes, parameter
 # descriptions) and the interface (parameters, Terraform variables, outputs).
 PR_HISTORY_NOTE_SUBKINDS = ("comment", "todo", "param", "variable", "output")
@@ -2422,9 +3222,9 @@ PR_HISTORY_PATCH_PATHSPECS = ("*CHANGELOG.md", ".github/", "utilities/",
 # Lines kept per file per commit (added + removed; `lines_omitted` the rest),
 # characters per line, and characters per PR (the newest excerpts are kept,
 # `patches_omitted` counts the oldest left out).
-PR_HISTORY_PATCH_LINES = 40
+PR_HISTORY_PATCH_LINES = 400
 PR_HISTORY_PATCH_LINE_CAP = 500
-PR_HISTORY_PATCH_CHARS = 8000
+PR_HISTORY_PATCH_CHARS = 200000
 # A git trailer line: a hyphenated token (`Co-authored-by`, `Signed-off-by`,
 # `Change-Id`), a colon, a value. "Note: ..." is prose, not a trailer.
 _TRAILER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+: \S")
@@ -2465,13 +3265,19 @@ def pr_commit_body(text):
     return body[:PR_HISTORY_BODY_CAP], len(body)
 
 
+_NAME_STATUS_RE = re.compile(r"^([ACDMRTUXB])\d*\t(.+)$")
+
+
 def parse_pr_commits(raw):
-    """A `git log --format=PR_COMMIT_FORMAT --name-only` listing -> commits
+    """A `git log --format=PR_COMMIT_FORMAT --name-status` (or
+    `--name-only`) listing -> commits
     [{sha, parents, author, authored_at, committed_at, subject, files,
-    [paths], [paths_omitted], [body], [body_truncated_from]}] in the
+    [paths], [paths_omitted], [added], [body], [body_truncated_from]}] in the
     listing's order. `parents` is a count (2 for a merge), `files` the
     number of paths the commit changed (a merge lists none), `paths` those
-    paths (at most PR_HISTORY_PATHS_MAX), `body` the message body
+    paths (at most PR_HISTORY_PATHS_MAX), `added` the paths the commit
+    added (a `--name-status` listing only: a new module's entry file is
+    how a proposed module is recognised), `body` the message body
     (pr_commit_body); both omitted when empty. A listing in the older
     format (no body, no closing separator) still parses, without `paths`
     and `body`. Pure."""
@@ -2483,14 +3289,25 @@ def parse_pr_commits(raw):
             fields = head.split(FIELD_SEP, 6)
             if len(fields) < 7:
                 continue
-            paths = [ln.strip("\r") for ln in names.split("\n") if ln.strip()]
+            paths, added = [], []
+            for ln in names.split("\n"):
+                ln = ln.strip("\r")
+                if not ln.strip():
+                    continue
+                m = _NAME_STATUS_RE.match(ln)
+                if m:
+                    paths.append(m.group(2))
+                    if m.group(1) == "A":
+                        added.append(m.group(2))
+                else:
+                    paths.append(ln)
             body, body_len = pr_commit_body(fields[6])
             subject = fields[5]
         else:
             fields = lines[0].split(FIELD_SEP, 5)
             if len(fields) < 6:
                 continue
-            paths, body, body_len = None, "", 0
+            paths, added, body, body_len = None, [], "", 0
             subject = fields[5]
             names_count = len([ln for ln in lines[1:] if ln.strip()])
         sha, parents, author, authored, committed = (f.strip() for f in fields[:5])
@@ -2505,6 +3322,8 @@ def parse_pr_commits(raw):
             row["paths"] = paths[:PR_HISTORY_PATHS_MAX]
             if len(paths) > PR_HISTORY_PATHS_MAX:
                 row["paths_omitted"] = len(paths) - PR_HISTORY_PATHS_MAX
+        if added:
+            row["added"] = added[:PR_HISTORY_PATHS_MAX]
         if body:
             row["body"] = body
             if body_len > len(body):
@@ -2608,8 +3427,126 @@ def _human_conversation(pr):
                and not derive.is_bot_login(c.get("author")))
 
 
+def _pr_history_caps(env=None):
+    """(PRs walked per window, commits per walked PR)."""
+    return (_env_int("ACTIVITY_PR_HISTORY_MAX_PRS", PR_HISTORY_NOTES_MAX_PRS, 0, env),
+            _env_int("ACTIVITY_PR_HISTORY_MAX_COMMITS", PR_HISTORY_NOTES_MAX_COMMITS,
+                     1, env))
+
+
+def collect_replaced_commits(row, clone_dir, pushes, base_ref, exclude, run):
+    """For each force-push of a PR (`pushes`: head_ref_force_pushed events
+    with `before` / `after` commits, from `pr_activity`), the commits it
+    replaced: reachable from `before` but not from `after` nor the walked
+    branch, with their subject, body and paths (parse_pr_commits; at most
+    PR_HISTORY_REPLACED_MAX). A `before` or `after` commit not in the clone
+    is fetched by sha (`git fetch origin <sha>`: GitHub often still serves a
+    PR's replaced commits); when either end cannot be established the push
+    is `unavailable` with the reason (never a list that could include
+    retained commits). Sets row["replaced"] = [{at, actor, before, after, status:
+    read|unavailable, [commits], [commits_omitted], [reason]}]."""
+    out = []
+    for e in pushes:
+        before, after = e.get("before"), e.get("after")
+        rec = {k: e.get(k) for k in ("at", "actor", "before", "after")
+               if e.get(k) is not None}
+        if not before or not re.fullmatch(r"[0-9a-f]{40}", before):
+            rec.update(status="unavailable", reason="the push's before commit "
+                       "is not recorded")
+            out.append(rec)
+            continue
+        try:
+            run(["git", "-C", clone_dir, "cat-file", "-e", before + "^{commit}"])
+        except RuntimeError:
+            try:
+                run(["git", "-C", clone_dir, "fetch", "--quiet", "--filter=blob:none",
+                     "--no-tags", "--no-write-fetch-head", "origin", before])
+            except RuntimeError as exc:
+                rec.update(status="unavailable", reason="not fetchable: {}".format(
+                    (str(exc).splitlines() or ["?"])[-1][:200]))
+                out.append(rec)
+                continue
+        # both ends must be established: without the `after` commit the
+        # list would include commits the push retained
+        if not after or not re.fullmatch(r"[0-9a-f]{40}", after):
+            rec.update(status="unavailable", reason="the push's after commit is "
+                       "not recorded")
+            out.append(rec)
+            continue
+        try:
+            run(["git", "-C", clone_dir, "cat-file", "-e", after + "^{commit}"])
+        except RuntimeError:
+            try:
+                run(["git", "-C", clone_dir, "fetch", "--quiet", "--filter=blob:none",
+                     "--no-tags", "--no-write-fetch-head", "origin", after])
+                run(["git", "-C", clone_dir, "cat-file", "-e", after + "^{commit}"])
+            except RuntimeError as exc:
+                rec.update(status="unavailable", reason="the push's after commit is "
+                           "not fetchable: {}".format(
+                               (str(exc).splitlines() or ["?"])[-1][:200]))
+                out.append(rec)
+                continue
+        nots = [after]
+        try:
+            listing = run(["git", "-C", clone_dir, "log", "--date-order", "--reverse",
+                           "--format=" + PR_COMMIT_FORMAT, "--name-only",
+                           "--no-renames"] + list(_WALK_PIN_ARGS)
+                          + [before, "--not", base_ref] + nots + exclude + ["--"])
+        except RuntimeError as exc:
+            rec.update(status="unavailable", reason="log failed: {}".format(
+                (str(exc).splitlines() or ["?"])[-1][:200]))
+            out.append(rec)
+            continue
+        commits = parse_pr_commits(listing)
+        rec["status"] = "read"
+        if len(commits) > PR_HISTORY_REPLACED_MAX:
+            rec["commits_omitted"] = len(commits) - PR_HISTORY_REPLACED_MAX
+            commits = commits[-PR_HISTORY_REPLACED_MAX:]
+        rec["commits"] = commits
+        out.append(rec)
+    if out:
+        row["replaced"] = out
+
+
+PR_HISTORY_NET_FILES_MAX = 300
+
+
+def pr_net_files(row, clone_dir, base_ref, run, as_of=None):
+    """The PR's net change per file as of `as_of` (the window's end): `git
+    diff --numstat` from the merge base of its head as of then (its latest
+    commit committed by `as_of`) with the walked branch, to that head ->
+    row["net_files"] = {head, base, files: [{path, added, removed}],
+    [files_omitted]} (`added` / `removed` null for a binary file); a failed
+    diff is `net_files_unavailable` with the reason. In place."""
+    commits = [c for c in row.get("commits") or []
+               if not as_of or (c.get("committed_at") or "") <= as_of]
+    if not commits:
+        return
+    head = commits[-1]["sha"]
+    try:
+        base = run(["git", "-C", clone_dir, "merge-base", base_ref, head]).strip()
+        raw = run(["git", "-C", clone_dir, "diff", "--numstat", "--no-renames",
+                   base, head])
+    except RuntimeError as exc:
+        row["net_files_unavailable"] = (str(exc).splitlines() or ["?"])[-1][:200]
+        return
+    files = []
+    for ln in raw.splitlines():
+        parts = ln.split("\t", 2)
+        if len(parts) != 3:
+            continue
+        a, r, path = parts
+        files.append({"path": path, "added": int(a) if a.isdigit() else None,
+                      "removed": int(r) if r.isdigit() else None})
+    out = {"head": head, "base": base, "files": files[:PR_HISTORY_NET_FILES_MAX]}
+    if len(files) > PR_HISTORY_NET_FILES_MAX:
+        out["files_omitted"] = len(files) - PR_HISTORY_NET_FILES_MAX
+    row["net_files"] = out
+
+
 def collect_pr_history(prs, clone_dir, base_ref="HEAD", run=None,
-                       base_branch=None):
+                       base_branch=None, all_prs=False, force_pushes=None,
+                       as_of=None):
     """The window's `pr_history` fact. All git goes through `run` (default
     run_git, which retries a dropped connection); a refusal is recorded,
     never fatal.
@@ -2639,6 +3576,18 @@ def collect_pr_history(prs, clone_dir, base_ref="HEAD", run=None,
        (_collect_pr_patches) and the narrative evidence
        (collect_pr_narrative: code comments, documentation prose and
        interface deltas per commit, and what followed each review comment).
+
+    5b. For every PR with commits, its net change per file from the merge
+       base to its head as of `as_of` (pr_net_files).
+
+    6. With `force_pushes` ({number: [head_ref_force_pushed events]}, from
+       `pr_activity`), the commits each push replaced
+       (collect_replaced_commits) as row["replaced"].
+
+    `all_prs` (what acquire passes: the whole record) walks every PR with
+    commits of its own, not only those with human conversation; the PR and
+    commit caps of the walks are then ACTIVITY_PR_HISTORY_MAX_PRS /
+    ACTIVITY_PR_HISTORY_MAX_COMMITS.
 
     Returns {"collected": True, "base": base_branch, "prs": [per PR, by
     number], "limits": {...}} or, when the refs cannot be listed,
@@ -2685,7 +3634,7 @@ def collect_pr_history(prs, clone_dir, base_ref="HEAD", run=None,
         try:
             listing = run(["git", "-C", clone_dir, "log", "--reverse",
                            "--date-order", "--format=" + PR_COMMIT_FORMAT,
-                           "--name-only", "--no-renames"] + list(_WALK_PIN_ARGS)
+                           "--name-status", "--no-renames"] + list(_WALK_PIN_ARGS)
                           + [ref, "--not", base_ref] + exclude + ["--"])
         except RuntimeError as exc:
             row.update(status="log_failed",
@@ -2702,21 +3651,25 @@ def collect_pr_history(prs, clone_dir, base_ref="HEAD", run=None,
     candidates = sorted(
         (n for n in fetched if rows[n].get("status") == "fetched"),
         key=lambda n: (-_human_conversation(by_number.get(n, {})), n))
+    max_prs, max_commits = _pr_history_caps() if all_prs else (
+        PR_HISTORY_NOTES_MAX_PRS, PR_HISTORY_NOTES_MAX_COMMITS)
     walked = 0
     for n in candidates:
         row = rows[n]
         commits = row.get("commits") or []
+        if commits:
+            pr_net_files(row, clone_dir, base_ref, run, as_of)
+        if force_pushes and force_pushes.get(n):
+            collect_replaced_commits(row, clone_dir, force_pushes[n], base_ref,
+                                     exclude, run)
         if not commits:
             row["notes_skipped"] = "no commits of its own"
-        elif _human_conversation(by_number.get(n, {})) == 0:
+        elif not all_prs and _human_conversation(by_number.get(n, {})) == 0:
             row["notes_skipped"] = "no human conversation"
-        elif len(commits) + row.get("commits_omitted", 0) \
-                > PR_HISTORY_NOTES_MAX_COMMITS:
-            row["notes_skipped"] = "more than {} commits".format(
-                PR_HISTORY_NOTES_MAX_COMMITS)
-        elif walked >= PR_HISTORY_NOTES_MAX_PRS:
-            row["notes_skipped"] = "over the {}-PR cap of the window".format(
-                PR_HISTORY_NOTES_MAX_PRS)
+        elif len(commits) + row.get("commits_omitted", 0) > max_commits:
+            row["notes_skipped"] = "more than {} commits".format(max_commits)
+        elif walked >= max_prs:
+            row["notes_skipped"] = "over the {}-PR cap of the window".format(max_prs)
         else:
             walked += 1
             try:
@@ -2801,12 +3754,12 @@ PR_ADR_DIRS = ("adr", "adrs", "decisions", "docs/adr", "docs/decisions")
 # comment (`truncated_from`), documentation lines kept (added + removed;
 # `lines_omitted`), interface rows kept (`interface_omitted`), module files
 # whose interface is read.
-PR_NARRATIVE_COMMENTS = 25
+PR_NARRATIVE_COMMENTS = 200
 PR_NARRATIVE_COMMENT_CHARS = 500
-PR_NARRATIVE_DOC_LINES = 30
+PR_NARRATIVE_DOC_LINES = 200
 PR_NARRATIVE_LINE_CHARS = 300
-PR_NARRATIVE_INTERFACE_ROWS = 40
-PR_NARRATIVE_INTERFACE_FILES = 10
+PR_NARRATIVE_INTERFACE_ROWS = 400
+PR_NARRATIVE_INTERFACE_FILES = 100
 PR_NARRATIVE_VALUE_CHARS = 200
 PR_NARRATIVE_DESCRIPTION_CHARS = 300
 # A blob larger than this is not read for its interface.
@@ -2816,14 +3769,14 @@ PR_NARRATIVE_BLOB_BYTES = 400000
 # commit of a new module adds every comment and the whole README, which the
 # merged result carries anyway; the rework after a review is what only this
 # history has.
-PR_NARRATIVE_CHARS = 24000
+PR_NARRATIVE_CHARS = 400000
 # Per review comment: commits after it that touched the lines it is on (at
 # most this many), hunks per commit, lines per hunk; per PR a character
 # budget over all responses (`responses_omitted` the latest left out).
 PR_RESPONSE_COMMITS = 3
 PR_RESPONSE_HUNKS = 2
 PR_RESPONSE_LINES = 12
-PR_RESPONSE_CHARS = 12000
+PR_RESPONSE_CHARS = 100000
 # Lines either side of a review comment's line that count as "near" it.
 PR_RESPONSE_NEAR = 3
 # The sections an automated README generator writes (headings compared
@@ -5570,6 +6523,13 @@ def parse_args(argv):
                         "heads reach) and the comment / parameter walk over the "
                         "most discussed PRs' commits; the window's `pr_history` "
                         "fact then says it was not collected")
+    p.add_argument("--recompute-ownership", "--recompute-modules",
+                   dest="recompute_ownership", action="store_true", default=False,
+                   help="offline: recompute only the `module_ownership` fact (module "
+                        "ownership, lifecycle and what each module is) of the "
+                        "already gathered window --from..--to of --owner/--repo in "
+                        "--store, from the clone at --clone-dir (no API call); the "
+                        "window's other facts are kept")
     p.add_argument("--no-pr-checks", dest="pr_checks", action="store_false",
                    default=True,
                    help="skip the check results / review-thread state read "
@@ -6017,6 +6977,27 @@ def clone_head_sha(clone_dir, run=run_git):
         return run(["git", "-C", clone_dir, "rev-parse", "HEAD"]).strip() or None
     except Exception:
         return None
+
+
+def window_start_files(clone_dir, from_date, run=None):
+    """The paths tracked at the window's START: the tree of the newest
+    first-parent commit before `from_date`, or None when the bounded clone
+    holds none (the caller then derives what it needs from the end tree)."""
+    run = run or run_git
+    try:
+        raw = run(["git", "-C", clone_dir, "log", "--first-parent",
+                   f"--pretty=format:{LOG_FORMAT}"])
+    except RuntimeError:
+        return None
+    sha = next((rec["sha"] for rec in parse_git_log(raw)
+                if (rec.get("date") or "")[:10] < (from_date or "")[:10]), None)
+    if sha is None:
+        return None
+    try:
+        out = run(["git", "-C", clone_dir, "ls-tree", "-r", "--name-only", sha])
+    except RuntimeError:
+        return None
+    return [ln for ln in out.split("\n") if ln]
 
 
 def window_end_commit(clone_dir, to_date, run=None):
@@ -7268,6 +8249,114 @@ def _graphql_client(token):
     return _graphql
 
 
+# --- Linked items outside the window (per-window fact `linked_items`) -------
+#
+# A story names issues / PRs its conversation links (#N, closing references,
+# cross-references) that the window's records do not hold. Their title, type,
+# state and closing dates come from ONE GraphQL request per
+# LINKED_ITEMS_BATCH numbers (`issueOrPullRequest`), at most LINKED_ITEMS_MAX
+# numbers per window (ACTIVITY_LINKED_ITEMS_MAX), the rest counted in `capped`.
+# The state is GitHub's when gathered; a reader projects it to its own end
+# from the dates (created / closed / merged).
+LINKED_ITEMS_BATCH = 50
+LINKED_ITEMS_MAX = 500
+_LINKED_REF_RE = re.compile(r"(?<![\w/.&])#(\d+)\b")
+_LINKED_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+_LINKED_FIELDS = (
+    "__typename ... on Issue {{ number title state stateReason createdAt closedAt url "
+    "author {{ login }} }} ... on PullRequest {{ number title state createdAt closedAt "
+    "mergedAt merged url author {{ login }} }}")
+
+
+def linked_numbers(prs, issues, slug=None):
+    """The issue / PR numbers the window's records link (closing and
+    cross references, `#N` and github.com links to the repository in their
+    bodies, comments, review comments and reviews; HTML comments left out)
+    that are not records of the window, ascending. Pure."""
+    own = {r.get("number") for r in list(prs or []) + list(issues or [])
+           if isinstance(r, dict)}
+    link_re = re.compile(r"https://github\.com/{}/(?:issues|pull)/(\d+)".format(
+        re.escape(slug or "\x00")), re.I)
+    found = set()
+    for rec in list(prs or []) + list(issues or []):
+        if not isinstance(rec, dict):
+            continue
+        for key in ("closes", "crossref_issues"):
+            found.update(n for n in rec.get(key) or [] if isinstance(n, int))
+        texts = [rec.get("body")]
+        for key in ("comments_list", "review_comments", "reviews"):
+            texts += [c.get("body") for c in rec.get(key) or [] if isinstance(c, dict)]
+        for t in texts:
+            t = _LINKED_HTML_COMMENT_RE.sub("", t or "")
+            found.update(int(n) for n in link_re.findall(t))
+            found.update(int(n) for n in _LINKED_REF_RE.findall(
+                re.sub(r"https?://\S+", "", t)))
+    return sorted(n for n in found if n not in own and n > 0)
+
+
+def _linked_item(node):
+    if not isinstance(node, dict) or not node.get("number"):
+        return None
+    typ = "pr" if node.get("__typename") == "PullRequest" else "issue"
+    out = {"number": node["number"], "type": typ, "title": node.get("title"),
+           "state": _lower(node.get("state")), "created_at": node.get("createdAt"),
+           "url": node.get("url"), "author": (node.get("author") or {}).get("login")}
+    if node.get("closedAt"):
+        out["closed_at"] = node["closedAt"]
+    if typ == "pr":
+        out["merged"] = bool(node.get("merged"))
+        if node.get("mergedAt"):
+            out["merged_at"] = node["mergedAt"]
+    elif node.get("stateReason"):
+        out["state_reason"] = _lower(node["stateReason"])
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def collect_linked_items(prs, issues, graphql, owner, repo, clock=None, cap=None):
+    """The window's `linked_items` fact: {collected, gathered_at, items:
+    [{number, type, title, state (when gathered), created_at, [closed_at],
+    [merged, merged_at] | [state_reason], url, [author]}], missing:
+    [number] (no such issue / PR), [failed: [number]], [capped: n],
+    requests}. One GraphQL request per LINKED_ITEMS_BATCH numbers
+    (linked_numbers), at most `cap` (ACTIVITY_LINKED_ITEMS_MAX, default
+    LINKED_ITEMS_MAX) numbers. None without a GraphQL client."""
+    if graphql is None:
+        return None
+    clock = clock or (lambda: datetime.datetime.now(datetime.timezone.utc))
+    cap = _env_int("ACTIVITY_LINKED_ITEMS_MAX", LINKED_ITEMS_MAX, 0) \
+        if cap is None else cap
+    numbers = linked_numbers(prs, issues, "{}/{}".format(owner, repo))
+    out = {"collected": True, "items": [], "missing": [], "requests": 0}
+    if len(numbers) > cap:
+        out["capped"] = len(numbers) - cap
+        numbers = numbers[:cap]
+    takes_errors = _accepts_errors(graphql)
+    for i in range(0, len(numbers), LINKED_ITEMS_BATCH):
+        batch = numbers[i:i + LINKED_ITEMS_BATCH]
+        q = "query($owner: String!, $name: String!) { repository(owner: $owner, " \
+            "name: $name) { " + " ".join(
+                "n{0}: issueOrPullRequest(number: {0}) {{ {1} }}".format(
+                    n, _LINKED_FIELDS.format()) for n in batch) + " } }"
+        errors = []
+        try:
+            got = graphql(q, {"owner": owner, "name": repo}, errors=errors) \
+                if takes_errors else graphql(q, {"owner": owner, "name": repo})
+        except Exception as exc:          # noqa: BLE001 - recorded, never fatal
+            out.setdefault("failed", []).extend(batch)
+            out["failure"] = str(exc)[:200]
+            continue
+        out["requests"] += 1
+        repo_obj = ((got or {}).get("data") or got or {}).get("repository") or {}
+        for n in batch:
+            item = _linked_item(repo_obj.get("n{}".format(n)))
+            if item is None:
+                out["missing"].append(n)
+            else:
+                out["items"].append(item)
+    out["gathered_at"] = clock().strftime("%Y-%m-%dT%H:%M:%SZ")
+    return out
+
+
 # --- PR checks, review-thread state, lifecycle events (fact `pr_activity`) ---
 #
 # What happened to a PR besides its conversation: the check results of its
@@ -7298,6 +8387,26 @@ PR_FORCE_PUSHES_LAST = 20
 # then the most discussed (the story candidates), then the newest; the rest
 # are `checks_status: capped`. 200 PRs = 20 requests.
 PR_CHECKS_MAX_PRS = 200
+# Every commit of a PR (issue #97: "we need all the commits"): the commits
+# before the latest PR_CHECKS_COMMITS are read in pages of
+# PR_CHECKS_HISTORY_PAGE with GitHub's roll-up STATE only (one point per
+# page: no nested connection), and their check contexts are then read only
+# where the state is not a success (`PR_CHECKS_DETAIL_BATCH` commits per
+# request, about one point). A commit whose contexts were cut at
+# PR_CHECKS_CONTEXTS without a visible failure is paged to the end (at
+# most PR_CHECKS_MAX_CONTEXTS), so a partial page is read rather than
+# reported `incomplete`. Caps: commits per PR (ACTIVITY_PR_CHECKS_MAX_COMMITS)
+# and requests of this second phase per window
+# (ACTIVITY_PR_CHECKS_MAX_REQUESTS); what a cap leaves out is recorded per PR
+# (`history_status: capped`).
+PR_CHECKS_HISTORY_PAGE = 100
+PR_CHECKS_DETAIL_BATCH = 20
+PR_CHECKS_MAX_COMMITS = 1000
+PR_CHECKS_MAX_CONTEXTS = 500
+PR_CHECKS_MAX_REQUESTS = 400
+PR_CHECKS_HISTORY_STATUSES = ("complete", "capped", "failed")
+_STATE_ROLLUP = {"success": "passing", "failure": "failing", "error": "failing",
+                 "pending": "pending", "expected": "pending"}
 # Requests in a row that failed before the rest are given up (`failed`).
 PR_ACTIVITY_FAILURE_STOP = 3
 # Lifecycle events kept per PR (the latest; `events_omitted` the rest).
@@ -7312,15 +8421,17 @@ CHECK_PASSING = frozenset(("success", "neutral", "skipped"))
 CHECK_ROLLUPS = ("passing", "failing", "pending", "incomplete", "none")
 # The issue-timeline events kept as PR lifecycle events (`ready_for_review`
 # is already a `lifecycle` event of the PR record).
+# The label history of a PR record (`label_events`): labels read as of a day.
+PR_LABEL_EVENTS = ("labeled", "unlabeled")
 PR_TIMELINE_EVENTS = ("renamed", "convert_to_draft", "review_requested",
                       "review_request_removed", "review_dismissed",
-                      "head_ref_force_pushed")
+                      "head_ref_force_pushed", "assigned")
 
 _PR_ACTIVITY_FIELDS = (
-    "number headRefOid "
+    "number headRefOid lastEditedAt "
     "commits(last: {commits}) {{ totalCount nodes {{ commit {{ oid committedDate "
     "statusCheckRollup {{ state contexts(first: {contexts}) {{ totalCount "
-    "pageInfo {{ hasNextPage }} nodes {{ __typename "
+    "pageInfo {{ hasNextPage endCursor }} nodes {{ __typename "
     "... on CheckRun {{ name status conclusion startedAt completedAt detailsUrl }} "
     "... on StatusContext {{ context state createdAt targetUrl }} }} }} }} }} }} }} "
     "reviewThreads(first: {threads}) {{ totalCount nodes {{ isResolved isOutdated "
@@ -7333,6 +8444,227 @@ _PR_ACTIVITY_FIELDS = (
 
 def _pr_checks_max(env=None):
     return _env_int("ACTIVITY_PR_CHECKS_MAX", PR_CHECKS_MAX_PRS, 0, env)
+
+
+def _pr_checks_history_settings(env=None):
+    """(commits per PR, second-phase requests per window)."""
+    return (_env_int("ACTIVITY_PR_CHECKS_MAX_COMMITS", PR_CHECKS_MAX_COMMITS, 0, env),
+            _env_int("ACTIVITY_PR_CHECKS_MAX_REQUESTS", PR_CHECKS_MAX_REQUESTS, 0,
+                     env))
+
+
+_CONTEXT_FIELDS = (
+    "totalCount pageInfo { hasNextPage endCursor } nodes { __typename "
+    "... on CheckRun { name status conclusion startedAt completedAt detailsUrl } "
+    "... on StatusContext { context state createdAt targetUrl } }")
+
+PR_COMMITS_PAGE_QUERY = """
+query($owner:String!, $repo:String!, $number:Int!, $cursor:String) {
+  rateLimit { cost remaining }
+  repository(owner:$owner, name:$repo) {
+    pullRequest(number:$number) {
+      commits(first: %d, after: $cursor) {
+        totalCount pageInfo { hasNextPage endCursor }
+        nodes { commit { oid committedDate statusCheckRollup { state } } }
+      }
+    }
+  }
+}
+""".strip() % PR_CHECKS_HISTORY_PAGE
+
+
+def commit_contexts_query(wanted):
+    """The GraphQL query reading the check contexts of several commits by
+    sha: `c<i>: object(oid: "<sha>") { ... on Commit { statusCheckRollup {
+    state contexts(first: 100[, after: "<cursor>"]) } } }`, one alias per
+    (sha, cursor) of `wanted`. A sha is 40 hex characters and a cursor is
+    written as a JSON string, so neither can break the query. Pure."""
+    lines = ["query($owner:String!, $repo:String!) {",
+             "  rateLimit { cost remaining }",
+             "  repository(owner:$owner, name:$repo) {"]
+    for i, (sha, cursor) in enumerate(wanted):
+        if not re.fullmatch(r"[0-9a-f]{40}", sha or ""):
+            raise ValueError("not a commit sha: {!r}".format(sha))
+        after = ", after: {}".format(json.dumps(cursor)) if cursor else ""
+        lines.append('    c{0}: object(oid: "{1}") {{ ... on Commit {{ oid '
+                     "statusCheckRollup {{ state contexts(first: 100{2}) {{ {3} }} "
+                     "}} }} }}".format(i, sha, after, _CONTEXT_FIELDS))
+    lines += ["  }", "}"]
+    return "\n".join(lines)
+
+
+class _Budget:
+    """Requests / points of the second phase, against its window cap."""
+
+    def __init__(self, cap):
+        self.cap, self.requests, self.points = cap, 0, 0
+
+    def take(self):
+        if self.requests >= self.cap:
+            return False
+        self.requests += 1
+        return True
+
+    def cost(self, data):
+        c = ((data or {}).get("rateLimit") or {}).get("cost")
+        if isinstance(c, int):
+            self.points += c
+
+
+def _ask(graphql, takes_errors, query, variables):
+    """One GraphQL request; raises on field errors (this phase reads only
+    what it can trust whole)."""
+    errs = []
+    data = graphql(query, variables, errors=errs) if takes_errors \
+        else graphql(query, variables)
+    if errs:
+        raise ValueError(str(errs[0].get("message") or "GraphQL field error"))
+    repo_obj = (data or {}).get("repository")
+    if not isinstance(repo_obj, dict):
+        raise ValueError("no repository in the answer")
+    return data, repo_obj
+
+
+def _read_contexts(graphql, takes_errors, owner, repo, wanted, budget):
+    """{sha: (contexts, omitted)} for [(sha, cursor)]: each commit's
+    contexts from the cursor on (None: from the start), paged until the
+    end or PR_CHECKS_MAX_CONTEXTS; a commit left short keeps `omitted`
+    (count of contexts still unread, at least 1). Requests stop when the
+    budget does; a failed request leaves its commits out."""
+    out, todo = {}, list(wanted)
+    while todo:
+        batch, todo = todo[:PR_CHECKS_DETAIL_BATCH], todo[PR_CHECKS_DETAIL_BATCH:]
+        if not budget.take():
+            break
+        try:
+            data, repo_obj = _ask(graphql, takes_errors, commit_contexts_query(batch),
+                                  {"owner": owner, "repo": repo})
+        except (SystemExit, Exception):  # noqa: BLE001 — record, never fatal
+            continue
+        budget.cost(data)
+        for i, (sha, _cursor) in enumerate(batch):
+            node = repo_obj.get("c{}".format(i))
+            ctx = ((node or {}).get("statusCheckRollup") or {}).get("contexts") \
+                if isinstance(node, dict) else None
+            if not isinstance(node, dict) or node.get("oid") != sha \
+                    or not isinstance(ctx, dict) \
+                    or not isinstance(ctx.get("nodes"), list):
+                # a missing / mismatched object or no context connection is
+                # not a read of zero checks: leave what is known as it is
+                continue
+            got = [x for x in (normalize_check_context(n)
+                               for n in ctx.get("nodes") or []) if x]
+            prev, _ = out.get(sha, ([], 0))
+            got = prev + got
+            info = ctx.get("pageInfo") or {}
+            total = ctx.get("totalCount")
+            if info.get("hasNextPage") and info.get("endCursor") \
+                    and len(got) < PR_CHECKS_MAX_CONTEXTS:
+                out[sha] = (got, 1)
+                todo.append((sha, info["endCursor"]))
+            else:
+                left = 0
+                if info.get("hasNextPage"):
+                    left = max(1, (total or 0) - len(got)) if isinstance(total, int) \
+                        else 1
+                out[sha] = (got, left)
+    return out
+
+
+def collect_check_history(row, n, graphql, owner, repo, budget, max_commits,
+                          takes_errors=None):
+    """Complete one gathered pr_activity row in place (the second phase):
+    the commits before the latest PR_CHECKS_COMMITS, in pages of
+    PR_CHECKS_HISTORY_PAGE with their roll-up `state` (rows `state_only:
+    true`, `rollup` from the state), then the contexts of every commit
+    whose state is not a success, and the remaining contexts of every
+    commit cut at PR_CHECKS_CONTEXTS without a visible failure. Records
+    `history_status` `complete` / `capped` (`max_commits` or the window's
+    request budget reached; `history_reason`) / `failed` (a page failed;
+    `history_reason`) when the PR has older commits; a commit's contexts
+    left short keep `checks_omitted`."""
+    takes_errors = _accepts_errors(graphql) if takes_errors is None else takes_errors
+    commits = row.get("commits") or []
+    known = {c["sha"] for c in commits}
+    total = row.get("commits_total")
+    older = []
+    if isinstance(total, int) and total > len(commits):
+        status, reason, cursor = "complete", None, None
+        while True:
+            if len(older) + len(commits) >= min(total, max_commits):
+                if total > max_commits:
+                    status = "capped"
+                    reason = "commits beyond the per-PR cap of {}".format(max_commits)
+                break
+            if not budget.take():
+                status, reason = "capped", "the window's request budget was spent"
+                break
+            try:
+                data, repo_obj = _ask(graphql, takes_errors, PR_COMMITS_PAGE_QUERY,
+                                      {"owner": owner, "repo": repo, "number": n,
+                                       "cursor": cursor})
+            except (SystemExit, Exception) as err:  # noqa: BLE001
+                status = "failed"
+                reason = (str(err).splitlines() or ["?"])[-1][:200]
+                break
+            budget.cost(data)
+            page = ((repo_obj.get("pullRequest") or {}).get("commits"))
+            if not isinstance(page, dict) or not isinstance(page.get("nodes"), list):
+                status, reason = "failed", "a page of commits came back without them"
+                break
+            stop = False
+            for node in page.get("nodes") or []:
+                c = (node or {}).get("commit") or {}
+                if not c.get("oid"):
+                    continue
+                if c["oid"] in known:
+                    stop = True
+                    break
+                state = _lower((c.get("statusCheckRollup") or {}).get("state"))
+                r = {"sha": c["oid"], "committed_at": c.get("committedDate"),
+                     "rollup": _STATE_ROLLUP.get(state, "none"), "checks": [],
+                     "state_only": True}
+                if state:
+                    r["state"] = state
+                older.append(r)
+                if len(older) + len(commits) >= max_commits:
+                    break
+            info = page.get("pageInfo") or {}
+            if stop or not info.get("hasNextPage") or not info.get("endCursor"):
+                break
+            cursor = info["endCursor"]
+        if status == "complete" and total > max_commits:
+            status = "capped"
+            reason = "commits beyond the per-PR cap of {}".format(max_commits)
+        row["history_status"] = status
+        if reason:
+            row["history_reason"] = reason
+    wanted = [(c["sha"], None) for c in older if c.get("state") not in ("success",
+                                                                       None)]
+    wanted += [(c["sha"], c["_cursor"]) for c in commits
+               if c.get("_cursor") and c.get("rollup") != "failing"]
+    got = _read_contexts(graphql, takes_errors, owner, repo, wanted, budget) \
+        if wanted else {}
+    for c in older + commits:
+        c.pop("_cursor", None)
+        if c["sha"] not in got:
+            continue
+        ctx, left = got[c["sha"]]
+        merged = c.get("checks") or []
+        if c.pop("state_only", False):
+            merged = []
+        names = {(x.get("name"), x.get("kind"), x.get("started_at")) for x in merged}
+        merged = merged + [x for x in ctx if (x.get("name"), x.get("kind"),
+                                              x.get("started_at")) not in names]
+        merged.sort(key=lambda x: (x.get("name") or "", x.get("kind"),
+                                   x.get("started_at") or ""))
+        c["checks"] = merged
+        c["rollup"] = checks_rollup(merged)["rollup"]
+        if left:
+            c["checks_omitted"] = left
+        else:
+            c.pop("checks_omitted", None)
+    row["commits"] = older + commits
 
 
 def pr_activity_query(numbers):
@@ -7457,13 +8789,17 @@ def parse_pr_activity_node(pr_obj):
     commits: [{sha, committed_at, rollup, state, checks, [checks_omitted]}]
     (oldest first), threads_total, threads: [{comment_id, path, line,
     resolved, [resolved_by], outdated}], [threads_omitted], force_pushes:
-    [{at, actor, before, after}]}. `rollup` is checks_rollup over the
+    [{at, actor, before, after}], [body_edited_at]}. `rollup` is checks_rollup over the
     commit's contexts as gathered (over the contexts read only: a reader
     applies `checks_omitted`, checks_rollup(..., omitted=), so a partial
     page is never a pass), `state` GitHub's own roll-up state
     (lowercase; absent with no status at all). Pure."""
     pr_obj = pr_obj if isinstance(pr_obj, dict) else {}
     out = {"head": pr_obj.get("headRefOid")}
+    if pr_obj.get("lastEditedAt"):
+        # when the description was last edited: a body edited after a
+        # window's end is "as last gathered" for that window
+        out["body_edited_at"] = _utc_timestamp(pr_obj["lastEditedAt"])
     commits = pr_obj.get("commits") or {}
     out["commits_total"] = commits.get("totalCount")
     rows = []
@@ -7489,6 +8825,9 @@ def parse_pr_activity_node(pr_obj):
             row["state"] = _lower(roll["state"])
         if omitted:
             row["checks_omitted"] = omitted
+            cursor = (ctx.get("pageInfo") or {}).get("endCursor")
+            if cursor:
+                row["_cursor"] = cursor     # internal: collect pages the rest
         rows.append(row)
     out["commits"] = rows
     threads = pr_obj.get("reviewThreads") or {}
@@ -7520,22 +8859,32 @@ def parse_pr_activity_node(pr_obj):
     return out
 
 
-def parse_timeline_pr_events(raw_timeline):
+def parse_timeline_pr_events(raw_timeline, kinds=None):
     """The PR lifecycle events a story needs from an issue timeline (the
     REST shapes of PR_TIMELINE_EVENTS), in timeline order: {id, event, at,
-    actor} plus `from` / `to` (renamed), `requested` (a login, or
+    actor, [actor_type] (GitHub's account type when not "User")} plus
+    `label` (labeled / unlabeled), `from` / `to` (renamed), `requested` (a login, or
     `team:<slug>`) and `by` (the requester) for review_requested /
     review_request_removed, `review_id` / `state` / `message` for
     review_dismissed. A force-push's before / after commits are not in the
-    REST event (parse_pr_activity_node reads them). Pure."""
+    REST event (parse_pr_activity_node reads them). `kinds`: the event kinds
+    kept (default PR_TIMELINE_EVENTS; PR_LABEL_EVENTS for the label
+    history). Pure."""
+    kinds = PR_TIMELINE_EVENTS if kinds is None else kinds
     out = []
     for ev in raw_timeline or []:
         kind = ev.get("event") if isinstance(ev, dict) else None
-        if kind not in PR_TIMELINE_EVENTS:
+        if kind not in kinds:
             continue
         row = {"id": ev.get("id"), "event": kind, "at": ev.get("created_at"),
                "actor": (ev.get("actor") or {}).get("login")}
-        if kind == "renamed":
+        typ = (ev.get("actor") or {}).get("type")
+        if typ and typ != "User":
+            row["actor_type"] = typ          # "Bot": automation, whatever its name
+        if kind in ("labeled", "unlabeled"):
+            # label history: a label's own time, so labels read as of a day
+            row["label"] = (ev.get("label") or {}).get("name")
+        elif kind == "renamed":
             ren = ev.get("rename") or {}
             row["from"], row["to"] = ren.get("from"), ren.get("to")
         elif kind in ("review_requested", "review_request_removed"):
@@ -7543,6 +8892,10 @@ def parse_timeline_pr_events(raw_timeline):
             team = (ev.get("requested_team") or {}).get("slug")
             row["requested"] = who or ("team:" + team if team else None)
             row["by"] = (ev.get("review_requester") or {}).get("login")
+        elif kind == "assigned":
+            # who assigned whom: for a coding agent's PR, the person who
+            # handed it the work
+            row["assignee"] = (ev.get("assignee") or {}).get("login")
         elif kind == "review_dismissed":
             d = ev.get("dismissed_review") or {}
             row["review_id"] = d.get("review_id")
@@ -7696,6 +9049,18 @@ def collect_pr_activity(prs, graphql, owner, repo, timeline_events=None,
             rows[n]["checks_status"] = "gathered"
             rows[n].update({k: v for k, v in got.items()
                             if v not in (None, []) or k in ("commits", "threads")})
+    # the second phase: every commit of every gathered PR (open PRs first)
+    max_commits, max_requests = _pr_checks_history_settings()
+    budget = _Budget(max_requests)
+    for n in order:
+        if rows[n].get("checks_status") == "gathered":
+            collect_check_history(rows[n], n, graphql, owner, repo, budget,
+                                  max_commits, takes_errors)
+    for r in rows.values():
+        for c in r.get("commits") or []:
+            c.pop("_cursor", None)
+    requests += budget.requests
+    points += budget.points
     return {"collected": True,
             "gathered_at": clock().strftime("%Y-%m-%dT%H:%M:%SZ"),
             "limits": {"batch": PR_ACTIVITY_BATCH, "max_prs": max_prs,
@@ -7703,7 +9068,8 @@ def collect_pr_activity(prs, graphql, owner, repo, timeline_events=None,
                        "contexts": PR_CHECKS_CONTEXTS,
                        "threads": PR_THREADS_FIRST,
                        "force_pushes": PR_FORCE_PUSHES_LAST,
-                       "events": PR_EVENTS_MAX},
+                       "events": PR_EVENTS_MAX, "max_commits": max_commits,
+                       "history_requests": max_requests},
             "requests": requests, "points": points,
             "prs": [rows[n] for n in numbers]}
 
@@ -8849,6 +10215,9 @@ def enrich_pr(pr, get_page, api, current_slug, events_out=None):
         pr["lifecycle"] = lifecycle
     if events_out is not None:
         events_out[num] = parse_timeline_pr_events(timeline)
+    labels = parse_timeline_pr_events(timeline, PR_LABEL_EVENTS)
+    if labels:
+        pr["label_events"] = labels      # when each label came and went
     if pr.get("merged") and not pr.get("merged_by"):
         pr["merged_by"] = parse_timeline_merged_by(timeline)
     review_comments = fetch_all(get_page, f"{api}/pulls/{num}/comments?per_page=100")
@@ -9150,7 +10519,16 @@ def acquire(args, env):
         pr_history = {"collected": False}
     elif walk_clone and prs:
         _started = time.monotonic()
-        pr_history = collect_pr_history(prs, clone_dir, base_branch=base_branch)
+        pushes = {}
+        for r in (pr_activity or {}).get("prs") or []:
+            evs = [e for e in r.get("events") or []
+                   if e.get("event") == "head_ref_force_pushed"]
+            if evs:
+                pushes[r["number"]] = evs
+        pr_history = collect_pr_history(prs, clone_dir, base_branch=base_branch,
+                                        as_of=(to + "T23:59:59Z") if len(to) == 10
+                                        else to,
+                                        all_prs=True, force_pushes=pushes)
         _rows = pr_history["prs"]
         sys.stderr.write(
             "pr history: {}/{}: {} PR head(s) fetched, {} missing, {} failed, "
@@ -9285,6 +10663,26 @@ def acquire(args, env):
         remap_event_authors(code_events, by_sha)
         remap_event_authors(symbol_events, by_sha)
 
+    # Module ownership (per-window fact `module_ownership`): CODEOWNERS and
+    # per-module owner-file changes, orphan markers, ownership labels; see
+    # collect_module_ownership. Needs the window's history on disk; after
+    # author resolution, so a marker commit's author is the store's identity.
+    module_ownership = None
+    if walk_clone:
+        module_ownership = collect_module_ownership(
+            code_events, commits, prs, issues, git_blob_reader(clone_dir),
+            tracked or [], frm, to, web="https://github.com/{}/{}".format(owner, repo),
+            start_files=window_start_files(clone_dir, frm), end_rev=clone_sha,
+            start_state=ownership_start_state(clone_dir, frm)[0],
+            proposed=proposed_module_info(pr_history, git_blob_reader(clone_dir),
+                                          (to + "T23:59:59Z") if len(to) == 10 else to,
+                                          prs))
+        sys.stderr.write(
+            "module ownership: {}/{}: {} event(s), {} module(s) without an owner "
+            "at the window's end\n".format(owner, repo,
+                                          len(module_ownership["events"]),
+                                          len(module_ownership["without_owner"])))
+
     workflows = []
     workflow_stats = {}
     if getattr(args, "include_workflows", True):
@@ -9388,6 +10786,20 @@ def acquire(args, env):
         "boundary_dropped_commits": _boundary_dropped,
         "period": {"from": frm, "to": to}, "prev_bundle": None,
     }
+    # Linked items outside the window (per-window fact `linked_items`): what
+    # the records link that the window does not hold, one GraphQL request
+    # per LINKED_ITEMS_BATCH numbers.
+    linked_items = None
+    if token and getattr(args, "pr_checks", True) and (prs or issues):
+        try:
+            linked_items = collect_linked_items(prs, issues, _graphql_client(token),
+                                                owner, repo)
+        except Exception as exc:          # noqa: BLE001 - recorded, never fatal
+            linked_items = {"collected": False, "failure": str(exc)[:200]}
+        sys.stderr.write("linked items: {}/{}: {} read, {} missing\n".format(
+            owner, repo, len((linked_items or {}).get("items") or []),
+            len((linked_items or {}).get("missing") or [])))
+
     bundle = build_bundle(meta, commits, prs, issues)
     bundle["workflows"] = workflows
     bundle["workflow_stats"] = workflow_stats
@@ -9413,6 +10825,12 @@ def acquire(args, env):
         bundle["pr_history"] = pr_history
     if pr_activity is not None:
         bundle["pr_activity"] = pr_activity
+    if linked_items is not None:
+        bundle["linked_items"] = linked_items
+    # always when collected, empty or not: a later window that collected
+    # nothing must clear an earlier window's standing list in a merged view
+    if module_ownership is not None:
+        bundle["module_ownership"] = module_ownership
     bundle["code_events"] = code_events
     bundle["symbol_events"] = symbol_events
     bundle["code_graph"] = code_graph
@@ -9953,7 +11371,7 @@ def _lifecycle_event_data(ev, parent_url, parent_local):
         url = "{}#event-{}".format(base, ev.get("id"))
     # `id` is kept in the blob so extract round-trips it and a re-fold rebuilds the
     # SAME `event-<parent>-<id>` node id (idempotency).
-    return {
+    data = {
         "id": ev.get("id"),
         "actor": ev.get("actor"),
         "event": ev.get("event"),
@@ -9961,6 +11379,10 @@ def _lifecycle_event_data(ev, parent_url, parent_local):
         "label": ev.get("label"),
         "url": url,
     }
+    for k in ("state_reason", "commit"):
+        if ev.get(k):
+            data[k] = ev[k]
+    return data
 
 
 def record_rows(kind, record, project, repo, fetched, members=None):
@@ -11386,6 +12808,18 @@ def main(argv=None):
         if people_run_from_args(args) is None and getattr(args, "people_offline", False):
             raise SystemExit("error: --people-offline needs a people registry "
                              "(--people PATH or the manifest's `people`)")
+    if getattr(args, "recompute_ownership", False):
+        conn = graphstore.open_store(args.store)
+        try:
+            fact = recompute_module_ownership(
+                conn, args.owner, args.repo, getattr(args, "from"), args.to,
+                args.clone_dir or f"workspace/{args.repo}-clone")
+        finally:
+            conn.close()
+        sys.stderr.write("module ownership recomputed: {} event(s), {} module(s) "
+                         "without an owner\n".format(len(fact["events"]),
+                                                     len(fact["without_owner"])))
+        return args.store
     os.makedirs(os.path.dirname(args.store) or ".", exist_ok=True)
     conn = graphstore.open_store(args.store)
     failures = []

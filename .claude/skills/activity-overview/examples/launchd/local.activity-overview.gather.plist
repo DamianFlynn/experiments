@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Nightly gather for the activity-overview streams (a per-user LaunchAgent).
+  Template: replace __WORKSPACE__ with the absolute workspace path (launchd does
+  not expand ~ or $HOME), set the time below, then install it as
+  docs/SCHEDULING.md "Install on macOS" shows. The job runs as you, in your
+  login session, only while the Mac is awake: a run missed while it slept starts
+  at the next wake.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.activity-overview.gather</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>__WORKSPACE__/bin/activity-gather.sh</string>
+  </array>
+
+  <!-- 02:40 local time every night. The runner plans by the UTC date, so keep
+       the run well clear of midnight UTC. -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>2</integer>
+    <key>Minute</key>
+    <integer>40</integer>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>WorkingDirectory</key>
+  <string>__WORKSPACE__</string>
+
+  <!-- launchd's own capture of the wrapper's output; the runner also writes a
+       per-run log to __WORKSPACE__/logs/run-*.log -->
+  <key>StandardOutPath</key>
+  <string>__WORKSPACE__/logs/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__WORKSPACE__/logs/launchd.err.log</string>
+
+  <!-- low priority: background QoS, throttled disk I/O, nice 10 -->
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>Nice</key>
+  <integer>10</integer>
+</dict>
+</plist>

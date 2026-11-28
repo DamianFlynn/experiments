@@ -1170,7 +1170,8 @@ def get_clone_info(conn, project, repo, frm, to):
 # collect_pr_activity).
 WINDOW_FACT_KEYS = ("workflow_stats", "code_graph", "code_owners",
                     "label_taxonomy", "newcomers", "module_notes",
-                    "pr_history", "affiliations", "pr_activity")
+                    "pr_history", "affiliations", "pr_activity",
+                    "module_ownership", "linked_items")
 
 
 def _window_facts_key(project, repo, frm, to):

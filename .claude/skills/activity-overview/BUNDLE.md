@@ -289,6 +289,9 @@ the rest (engagement, code areas, trains, people/flow).
   `author`.
 - `prs` — PRs in scope (merged-in-window, plus open and closed-unmerged PRs): `{ number, title, body, author, author_association,
   labels, merged, merged_by, merged_at, closed_at, state, base, head, head_repo, closes:[issue#], url }`.
+  PRs, issues, comments and reviews add `author_type` when GitHub's account type for the
+  author is not `User` (`Bot`: an automation account, whatever its login says; records
+  gathered before it lack it — a re-gather fills it).
   **`closes`** (#62, #105) = the same-repo issues the PR closes: the closing keywords in its
   title/body (text inside an HTML comment `<!-- … -->` is not read: PR templates carry
   examples such as `Fixes #123` there, #97; a store gathered before that needs a re-gather to
@@ -1179,6 +1182,107 @@ score}], more: [{id, score}] (the trains that qualified beyond the cap — "N mo
 notable discussion"), rule: {min_exchanges, min_in_window, min_score, top_n, plumbing_min,
 silence_days}}`.
 
+### Every story of the window: `stories.all`, `plumbing_themes`
+
+For a view of a gathered story layer (it carries `pr_history`; other views and fixtures
+are unchanged), `link.build_story_list` adds **all** the stories, not a top N
+(`selected` / `more` / `quiet` stay as they were for older readers):
+
+- `stories.all` — `[{id, group, state, group_rule, title, modules, modules_source,
+  module_urls, substance, score, worthy, released?}]`, ordered by group (`landed`,
+  `in_flight`, `stalled`, `closed`, `plumbing`), then score.
+  - `modules` — module areas only (`link.module_kind`: never a CI or utilities folder),
+    from `link.train_modules`; `modules_source` says from what: `merged_commits` (the
+    train's merged commits), else for a train with no merged code `pr_commits` (its
+    open PRs' own commits in `pr_history`, as of the view's end), `issue_form` (an
+    issue form's `Module Name` field), `title_scope` (a conventional-commit scope that
+    is a module path, `fix(avm/res/sql/server): …`), or `none`. Never guessed from
+    prose. `module_urls` `{area: url}` — `link.module_url`, THE module link of every
+    view row (the folder's tree at `meta.clone_sha`).
+  - `substance` (`link.story_substance`) — `discussion` (a person's comment, review
+    comment or review text on the train's items), `decision_only` (no such turn, but a
+    person's verdict review or an item merged / closed by someone who is not
+    automation), `opening_only` (nothing beyond the opening posts). Automation
+    accounts never count.
+  - **story-worthy** (`worthy`, `link.story_worthy`), in order: a human conversation
+    turn in the window (`discussion.in_window`); an issue / PR of the train opened,
+    merged, closed or reopened in it; a human commit on one of its PRs in it. An open
+    train with conversation but none of these is **carried over** (a stalled story)
+    when its last human event is at most `STORY_CARRY_MAX_DAYS` (180) old, else listed
+    in `stories.excluded` `[{id, reason}]`.
+  - **state** (`link.story_group`): `landed` — the train shipped (a PR merged into the
+    walked branch); `closed` — closed without landing (rejected / abandoned); an open
+    train is `stalled` when carried over, when its last human event is more than
+    `STORY_STALLED_DAYS` (14) old at the view's end, or when an open PR's head checks
+    fail (not only awaiting approval) with no comment by its author since the head
+    commit; else `in_flight`. `group_rule` says which rule fired.
+  - **group** — `plumbing` when every PR of the train is authored by an automation
+    account and no person took a conversation turn (`group_rule` names the accounts;
+    its theme comes from its paths, `dependency_updates` for an update PR), or when
+    every PR of the train is plumbing (the module layer's class, or a sweep), whatever
+    its state (`state` keeps it); else the state. Every
+    PR must be classified: one the module layer did not classify (an open PR) is
+    classified from its own commits' paths in `pr_history` committed by the view's end;
+    a PR that cannot be classified keeps the train out of plumbing.
+  - `released` (landed stories) — **does landed mean released?** per module a PR of the
+    train touched (`link.train_released`): `{module, version, status, tag, date, url,
+    registry?}`, `status` `published` (a version tag of the module in the window: its
+    tag, date, tree `url`, the public registry reference `br/public:<module>:<version>`
+    for a Bicep module), `declared_not_published` (the changelog declared a version, no
+    tag), `unknown` (declared, tags not read for the whole view) or `no_version_change`.
+    **A version is the train's only when tied to it**: the changelog entry declaring it
+    has one of the train's PRs as its source, its tag sits on one of the train's commits
+    (the merge commit), or it is the module's first tag of the window on or after the
+    train's last merge commit (the walked branch is first-parent linear, so that is the
+    first tag containing the merge). A module whose versions in the window are not tied
+    to the train is `unknown` (`version` null, with a `reason`): a PR merged after a tag
+    is never reported as released in that earlier version.
+  - `stories.groups` `{group: count}`; `stories.all_rule` `{stalled_days,
+    carry_max_days, groups}`.
+- `plumbing_themes` (`link.build_plumbing_themes`) — the window's plumbing PRs grouped
+  by the shared paths they touch, so a writer can tell what was engineered: `[{id,
+  title_hint, paths, paths_more?, prs: [{number, title, author, state, merged_at,
+  url}], stories, related_stories?, modules, people, evidence_counts: {commits,
+  comments, docs, interface, patches}, subjects: [{pr, sha, subject}], issues}]`.
+  `stories` lists only the trains of the `plumbing` story group; a theme PR's train in
+  another group is in `related_stories` `[{id, group}]` (group null: not a story) — the
+  PR stays in the theme. `modules` `[{module, url}]` — the module areas of the theme's
+  paths, with `link.module_url`. Themes (`PLUMBING_THEMES`, the
+  theme covering most of a PR's files): `ci_workflows` (`.github/workflows/`,
+  `.github/actions/`, pipeline folders), `pipeline_utilities` (`utilities/`),
+  `test_environment` (`tests/`, `e2e/`), `docs_generation` (READMEs, `docs/`, other
+  Markdown), `repository_policy` (CODEOWNERS, LICENSE, `.github/` files, editor and
+  tool configuration), `dependency_updates` (an automation account's update PR),
+  `other_plumbing`. No prose: `title_hint` is a neutral label.
+- People rows of automation accounts gain `automation` `{kind, on_behalf_of?}`
+  (`link.annotate_automation`): `kind` `registry` (the people registry's operator tag
+  `automation`; the tag `not-automation` sets `automation: null` and wins over
+  everything else), `account_type` (GitHub's account type for the author, kept by
+  gather as `author_type` on PRs, issues, comments and reviews when it is not `User`),
+  `app_login` (a `name[bot]` login) or `automation_name` (a git name automation commits
+  under). Never from a display name alone. `on_behalf_of: {login, basis, pr, issue?}` — who the PR works for, from the record
+  only, in order: the person who assigned the agent (`assigned`), the person assigned to
+  the PR with it (`assignee`), the first person who requested a review (`requested
+  review`), the author of the issue the PR closes (`closes the issue of`); absent when the
+  record has none. An account with several PRs adds `on_behalf_of_by_pr` `{pr: {...}}`.
+- `module_changes.modules[]` gain `url` (`link.module_url`: the module folder at the
+  commit the structure was read at) and `versions.published[]` gain `url` (the tag's tree) and `registry`
+  (the public Bicep registry reference, where derivable).
+- Closed issues gain `closing` `{at, by, state_reason?, commit?, prs?, before_merge?}`:
+  who closed it (the closing event's actor), GitHub's reason, the closing commit, the
+  view's PRs that name it as closed, and those not yet merged when it closed.
+- PR rows that carry `head_repo` gain `is_fork` (another repository; null head
+  repository: a deleted fork). The view's own repository is `link.repo_slug`: `meta.repo`
+  as is when already qualified (a manifest member's view), else `owner/repo` — the one
+  place module, tag and item URLs and repository comparisons are built from.
+- **As of the view's end**, everywhere: themes, open-PR classification, automation
+  summaries, `closing` and story worthiness read only commits, events and closes up to
+  the view's instant. A commit read by its roll-up state only (`state_only`) is
+  `unknown` for a view that ends before the gather (`gathered_at`): GitHub's state has
+  no check times. A nightly gather of the open window reads it the same night, so its
+  view (ending after the read) keeps the state; `commits_incomplete` counts such
+  commits.
+
 ### Slice `conversation` (the story material)
 
 `link.py BUNDLE --slice <id>` adds `conversation` to every train's slice:
@@ -1300,6 +1404,12 @@ silence_days}}`.
   kept, omitted}` of the commit evidence rows.
 - **`bots`** — `{login: count}` of the automation comments, review comments and reviews
   left out of the timeline.
+- **`automation`** (only when any) — the automation accounts of the train, for what they
+  are: `[{login, is_bot: true, comments, review_comments, reviews, commits, prs_opened,
+  on_behalf_of?: {login, basis: assigned|requested review, pr}}]` — for a PR an
+  automation account opened, the person who handed it the work when the record shows it.
+- A `closed` lifecycle item carries `state_reason`, `commit` (the closing commit) and,
+  for an issue, `closing_prs` (the view's PRs that name it as closed), when recorded.
 - **`pr_history`** — `{pr number: status}`: `fetched` (with `, notes extracted` or `,
   notes skipped: <reason>`, or ` (commits on the base branch)`), `missing`,
   `fetch_failed`, `log_failed`, or `not_gathered` when the view has no PR history for it.
@@ -1316,7 +1426,10 @@ silence_days}}`.
   requested — "check results and review-thread resolved flags of PR(s) #N (<status>)";
   a partial read is named too: review threads beyond those read (`threads_omitted`),
   earlier lifecycle events (`events_omitted`), and the earliest commits whose checks were
-  not read (`commits_total` above the commits read).
+  not read (`commits_total` above the commits read). What gather's per-PR budgets left
+  out of the PR history is named the same way, with or without `pr_activity`: narrative
+  evidence rows of older commits (`narrative_omitted`) and the responses of review
+  comments (`responses_omitted`).
 - **`thread_coverage`** (only with the view's `pr_activity`) — `{pr number: {flagged,
   omitted}}`: how many of the PR's review threads in the ledger carry GitHub's resolved
   flag, and how many review threads gather did not read. Resolution coverage of a PR is
@@ -1338,14 +1451,22 @@ silence_days}}`.
     outstanding_change_requests: [{by, since, url}]}` and `checks` (`link.checks_outcome`
     from the view's `pr_activity`: `{status: "gathered", head, head_url, rollup, failing,
     pending, passing, gathered_at, commits_total, commits_covered, checks_omitted?,
-    completed_after_as_of?, reason?}` — the head is the latest covered commit committed
+    completed_after_as_of?, commits_incomplete?, reason?}` — the head is the latest
+    covered commit committed
     by the instant and its roll-up is as of the instant, a check completed after it
     counting as pending; a head whose checks were not all read (`checks_omitted`) is
     `incomplete` unless a visible check failed (never a pass from a partial page); when
     none of the commits read was committed by the instant (the read covers the latest
-    ten), `rollup: "unavailable"`, `head: null` and a `reason`;
+    ten), `rollup: "unavailable"`, `head: null` and a `reason`; `commits_incomplete`
+    counts the covered commits whose checks were only partly read (their result is
+    `incomplete`), so the history read is complete only without it;
+    A PR row of the outcome adds `head_repo` and `is_fork` when the view's PR carries them
+    ("from a fork of …"; `head_repo` null with `is_fork` true: the fork was deleted).
     `{status: capped|failed|not_found|not_requested, reason?, gathered_at}` when
-    the checks were not read; the string `"not gathered"` when the view has no such row);
+    the checks were not read; the string `"not gathered"` when the view has no such row;
+    `awaiting_approval` — the head's checks whose run waits for a maintainer's approval,
+    `action_required`, e.g. a first-time contributor's fork — and `history_status` when
+    not every commit was read);
     an open PR, and an open issue, add `last_event` `{at, kind, actor, url}` and `ball`;
   - `ball` — **who the next move is with, DERIVED by rule** from the sequence of recorded
     events, never from anyone's words (`derived: true`; `link.ball_with`), with the
@@ -1360,13 +1481,34 @@ silence_days}}`.
     `awaiting merge`; **R4 reviewer moved** — otherwise: `awaiting author`; **R5 failing
     checks** — when R2 or R3 fired and the head commit's checks are failing as of the
     instant (the item's `checks`), the next move is the author's: `awaiting author`, with
-    `checks_basis` `{head, failing}` (R1 and R4 stand). A `checks` item is never the last
+    `checks_basis` `{head, failing}` (R1 and R4 stand); **R6 checks awaiting approval** —
+    as R5, but every failing check waits for a maintainer's approval to run: `awaiting
+    maintainer`; **R7 module owner response requested** — when R2 stands (no change
+    request outstanding, checks not failing) and the PR carries the owner-response
+    label: `awaiting module owner` (the owners the request names, when recorded), with
+    `owner_basis` `{label, item}`; **R8 approval made stale by a later push** — when the
+    PR's `review_state` is `approved_stale`, no change request is outstanding and R2 fired
+    (or R4 on an event older than the author's last push): `awaiting reviewer` (the
+    approver), with `review_basis` `{approved_at, last_push}`. **Precedence**, so the ball
+    and the review state never disagree: failing checks (R5 / R6) over everything but R1
+    and R4; an outstanding change request over R7 and R8; a named person (R1) stands; then
+    R7 (the module owner was asked), then R8, then R2 / R3 / R4. A `checks` item is never the last
     event; a `review_requested` event names its requested reviewer for R2. For an open
     issue with no open PR: **I1** the reporter moved last: `awaiting maintainer
     response`; **I2** someone else named people: `awaiting mentioned`; **I3** otherwise
     `awaiting reporter`. `state` / `with` say who; `derived` is always true;
   - `waiting_on` (only when any) — open linked items that the PR author's latest message
     names (`{number, type, state, title, named_in}`);
+  - `owner_response_requested` (only when any) — the items carrying the owner-response
+    label: an open one **waits on the module owner** `[{item {type, number, url}, module,
+    label, since, waits_on: "the module owner", owners?, owners_source?}]`, a closed /
+    merged one **waited on them** (`waited_on`, `until`: its merge / close time); `owners`
+    are those an automation comment named, else the module's owners at the view's end
+    (`owners_source: "owner_file"`). Outcome items add `module_owners` `{module: [login]}`
+    (who "the module's owner" is), `module_info` and, for a PR, `proposes_new_module`;
+  - every item row carries `modules`, `modules_source` and `module_urls`
+    (`link.record_modules`: as `stories.all`, per item);
+  - `released` (a shipped train) — as `stories.all[].released`;
   - `linked` — the repository's issues / PRs named in the conversation (`#N`, or a
     github.com link to the repository's issue / pull; HTML comments — a template's
     "Fixes #123" — ignored; the train's own items excluded; at most `STORY_LINKED_MAX` 10,
@@ -1449,6 +1591,20 @@ without the clone):
          {"number": 6974, "status": "missing"}]}
 ```
 
+- **The whole record** — gather passes `all_prs`: every PR with commits of its own is
+  walked (not only the discussed ones), every commit of it; the walks' caps are safety
+  caps (`ACTIVITY_PR_HISTORY_MAX_PRS`, default 2,000 PRs; `ACTIVITY_PR_HISTORY_MAX_COMMITS`,
+  default 1,000 commits per PR; `PR_HISTORY_MAX_COMMITS` 1,000 listed; narrative 400,000
+  characters and responses 100,000 per PR; patch excerpts 200,000), each with a count of
+  what it left out. Fork PRs need nothing special: `refs/pull/<N>/head` lives in the base
+  repository, so a fork's commits, a deleted fork's, a closed PR's and commits by authors
+  with no login are read like any other.
+- `replaced` — per force-push of the PR (from `pr_activity`): `{at, actor, before, after,
+  status: read|unavailable, commits?, commits_omitted?, reason?}`: the commits the push
+  replaced (reachable from `before`, not from `after` nor the walked branch; subject, body,
+  paths; at most `PR_HISTORY_REPLACED_MAX` 100), the `before` and `after` commits fetched
+  by sha when the clone lacks them; `unavailable` with the reason when either end cannot
+  be established (without `after` the list could include commits the push retained).
 - `status` — `fetched`, `missing` (no `refs/pull/<N>/head` on the remote), `fetch_failed`
   / `log_failed` (with `reason`). `on_base: true` when the head is on the walked branch (a
   merge-commit merge: the base walk already has its commits).
@@ -1465,6 +1621,8 @@ without the clone):
   body (where a commit says why), trailer paragraphs (`Co-authored-by: ...`,
   `Signed-off-by: ...`) dropped, at most `PR_HISTORY_BODY_CAP` 1,500 characters. Stores
   gathered before these were kept have neither (the slice's `gaps` says so).
+- `added` (per commit; gathers that read the commits' change status) — the paths the
+  commit ADDED: a new module's entry file is how a proposed module is recognised
 - `patches` (walked PRs only) — `[{commit, path, kind: changelog|shared, added: [line],
   removed: [line], lines_omitted?}]`: what each commit wrote into a `CHANGELOG.md` or a
   shared repository file (`PR_HISTORY_PATCH_PATHSPECS`: `.github/`, `utilities/`,
@@ -1503,6 +1661,299 @@ consumer drops commits committed after the view's end (the as-of rule). A force-
 before the gather is invisible: only the current head is fetched. A view of exactly a
 gathered window carries the stored value verbatim; a wider view takes, per PR, the entry
 of the latest overlapping window that collected one, and adds `windows`.
+
+### One derived state per fact (story-layer views)
+
+What the October issue's writers and its top-to-bottom read found contradicting itself,
+derived once in link and carried on every row that needs it:
+
+- **`review_state`** on every PR row and on each PR item of a slice outcome
+  (`link.review_state`) — `{state, rule, as_of, basis? {reviewer, at, url}, last_push?,
+  requested?}`, `state` one of `none`, `requested` (a review requested, nobody reviewed:
+  `requested` names who), `automated_only` (only automation accounts reviewed),
+  `commented`, `changes_requested`, `approved`, `approved_stale` (approved, then the author
+  changed the PR: `last_push`, the latest own commit). The author's own reviews never
+  count. `link.approved_pr` (forecast, ready lists) refuses `approved_stale` and
+  `changes_requested`.
+- **The last human event** (`link.last_human_event`): openings, comments, review comments,
+  reviews, lifecycle events, merges / closes, merged commits, the PRs' own commits
+  (`pr_history`) and their recorded events (`pr_activity`: review requests, assignments),
+  by someone who can act (not automation, not the deleted-account login `ghost`). An open
+  train's `effort` gains `last_human_event {at, kind, actor, url}`, and its
+  `last_activity_at` / `idle_days` and the group rule follow it. The failing-checks stall
+  rule fires only when EVERY open PR of the train is failing with no answer by its author.
+  `stories.all[]` rows add `status_reason` (`link.status_reason`: "opened N days before the
+  window's end; PR #n: <review state>; last human event M days before the end (<kind> by
+  <actor>)") and `new_module_proposed` (the module areas whose entry file `main.bicep` /
+  `main.tf` the train's PRs' own commits ADD — `pr_history` commits' `added` paths, never
+  the title; a store gathered before `added` was kept has none).
+- **Own changes only.** A PR commit's diff is the PR's own change only with exactly one
+  parent (`link.own_change`): a merge of the base branch and a boundary commit read
+  against an empty tree carry thousands of the base's files. Net change, interface rows,
+  code notes, module derivation, open-PR classification and theme paths read own changes
+  only; such a commit stays on the timeline with `not_own_change` (why) and no `change`.
+  A commit committed before its PR opened (a reused branch) carries `before_pr_opened`.
+  A `checks` item whose commit is not in the PR's gathered history (replaced when the
+  branch was rewritten) carries `commit_not_in_history {committed_at, why}`.
+- **Texts as last gathered.** On a view whose records are projected to its end
+  (`meta.records_as_of`): numbers are handed out in order, so a PR `closes` /
+  `crossref_issues` reference to a number above every record created by the instant names
+  an item that did not exist then — it moves to `refs_after_window` and no train joins
+  through it; a PR or issue whose body names one, or whose description `pr_activity` saw
+  edited after the instant (`body_edited_at`), gains `body_as_of {state: "as last
+  gathered", why}` (also on its `opened` timeline item). PR `labels` are read as of the
+  end from the label history (the PR record's `label_events`: `labeled` / `unlabeled`
+  `{id, event, at, actor, [actor_type], label}`, gathered from the same timeline) with
+  `labels_as_of {state: "from label history" | "as last gathered", changed_after?}`.
+- **Who can hold the ball.** `ball_with` / the issue ball never take an event by an
+  automation account or the deleted-account login `ghost` as the last event (an
+  automation re-request never outranks an outstanding change request). An issue's other
+  party answering without a question is **I4**: `awaiting maintainer follow-up`. Automation
+  reviews are on the timeline as `automated_review` items (never a person's turn); people
+  rows are flagged from the API account type of PR / issue / comment / review authors and
+  of `pr_activity` event actors (`actor_type`).
+- **Releases.** `stories.all[].released` / outcome `released` rows add `tie` (`contained`
+  with `declared_by` [pr] when another PR's changelog / version file declared the version
+  — a sweep touching every module is never "the" release PR — or
+  `first_tag_after_merge`) and child-module versions the train declared or changed
+  (`child_of`). `module_changes.modules[].versions.published[]` gain `contents`:
+  `{source: "changelog", prs, items?}` or, for a tag with no changelog entry,
+  `{source: "commits_between_tags", from {tag} | {window_start}, to, prs, commits [{sha,
+  subject, pr, url}], commits_more?, interface?, note?}` (`note`: no commit changed the
+  module up to the tag, and which commit the tag sits on); a child version whose files nothing
+  changed gains `note` "republished with its parent, no change of its own". A
+  `child_module_moved` / `_removed` breaking candidate cites only the commit that moved /
+  removed the child.
+- **Plumbing.** A sweep that changes module source (`substantive_areas`) is product work,
+  not plumbing. A theme is chosen by counting each path for the FIRST theme it belongs to
+  (a workflow file is CI, not also a `.github/` policy file); module-specific e2e template
+  assets are test environment. Every automation account's PR open in, or carried into,
+  the window is in a theme (`carried_over` true when it had no event in it). Theme PR rows
+  add the whole `body`, `body_length`, `reviewers`, `review_state` and `closed_unmerged`;
+  `subjects[]` add the commit `body` (at most `PLUMBING_THEME_SUBJECTS_MAX`, 1000;
+  `subjects_omitted`).
+- **PR rows** add `fork_status` (`fork`, `deleted_fork`, `not_fork`, `unknown` when the
+  record has no `head_repo`) — also on slice outcome items — and, when closed without
+  merging, `closed_unmerged`: `{superseded_by, named_in, by, quote}` only on explicit text
+  ("superseded by #N", "replaced by", "consolidated into"...), else `{close_reason: "not
+  stated"}` (also on outcome items).
+- A review thread whose GitHub flag was read after the view's end adds `status_note`, one
+  sentence with both the flag and the as-of status.
+- Text caps: a timeline text keeps `STORY_ITEM_CAP` (20,000) characters within
+  `STORY_SLICE_BUDGET` (120,000); a changelog net excerpt keeps `STORY_NET_LINES_MAX`
+  (400) lines, the breaking section included (gather's patch excerpts:
+  `PR_HISTORY_PATCH_LINES`, 400).
+
+### Who did it, and why things belong together (story-layer views)
+
+- **A commit is its author's.** The last human event, `status_reason` and a ball's
+  `basis` name a commit's own author — the login the window's walked commits resolved its
+  git name to, else the git name — never the PR's author; the people of a train include
+  the authors of its PRs' own commits. `status_reason` names the item each fact is about:
+  "opened N days before the window's end (PR / issue #N); PR #M: <review state>; last human
+  event K days before the end (<kind> by <actor> on PR / issue #J)"; `last_human_event`
+  carries `on` `{type, number}`.
+- **Stacked PRs.** A commit several PRs' histories hold belongs to the PR opened first: the
+  others' copies get `belongs_to_pr` (`link.annotate_stacked_commits`) and are not their own
+  change (net change, modules, notes, theme paths); the timeline keeps them with
+  `belongs_to_pr` and `not_own_change`.
+- **Why a member is in its train.** Trains carry `joined_by` `[{item {type, number}, via:
+  closes | crossref, by {type, number}, quote | quote_absent}]` — the line of the PR's
+  description that names the issue, else "a closing reference GitHub records (not in the
+  description as gathered)".
+- **Where a closed PR's work went.** `closed_unmerged.content_landed_in` `[{pr, basis: same
+  commit | same commit subject | named in the merge commit message, commits [{sha,
+  subject}]}]` — merged PRs that hold the very same commit, or whose own commit subjects,
+  or whose merge commit's message, contain one of its commit subjects verbatim. Evidence
+  only: `superseded_by` still needs explicit text. What kind of work a PR is (its plumbing
+  class, theme paths) is read from its own commits, or — when another PR opened first
+  holds every one of them (an identical copy) — from those shared commits.
+- **Automation identities.** When reviews by automation account Y come only on PRs where a
+  review was requested from automation account X (which never submitted a review itself),
+  at least twice, Y's people row adds `automation.same_identity_as` `{login: X, basis,
+  prs}` and X's `reviews_as` [Y]. A slice's participant rows show an automation account's
+  `on_behalf_of` for that train's own PRs only.
+- **The module owner who is the author.** An owner response request whose module's only
+  owners are the item's own author names no owners (`author_is_module_owner: true`, also
+  on the outcome's `owner_response_requested` row) and never moves the ball to "awaiting
+  module owner": R2 falls through to the reviewers requested and not yet reviewing.
+- **Threads an automation account opened** are no person's thread in the story, but are
+  counted: `thread_coverage[pr].by_automation` `{threads, resolved}`.
+- **Theme PR rows** add `net_files` `{files, added, removed, commits, top: [{path, added,
+  removed}]}` — what a PR changed as a whole (gather `pr_net_files`), beside its
+  description.
+
+### What a story can name (story-layer views)
+
+- **Linked items outside the window** — the per-window fact `linked_items`
+  (`gather.collect_linked_items`: every issue / PR number the window's records link —
+  closing and cross references, `#N` and repository links in bodies, comments, review
+  comments and reviews — that is not a record of the window; ONE GraphQL
+  `issueOrPullRequest` request per `LINKED_ITEMS_BATCH` (50) numbers, at most
+  `LINKED_ITEMS_MAX` (500, `ACTIVITY_LINKED_ITEMS_MAX`) per window, the rest `capped`):
+  `{collected, gathered_at, items: [{number, type, title, state (when gathered),
+  created_at, closed_at?, merged?, merged_at?, state_reason?, url, author?}], missing:
+  [number], failed?, capped?, requests}`; a view of several windows takes, per number, the
+  latest window's row. A slice's `outcome.linked` row for such an item
+  (`link.linked_item_as_of`) gives `type`, `title`, `author`, `url`, `created_at`,
+  `state` AS OF the view's end (`not yet created` / `open` / `closed` / `merged`, from the
+  dates), `state_when_gathered`, `closed_at` / `merged_at` / `state_reason` when by the
+  end, `in_view: false`; a number not read says `not_read` ("not found", "not read
+  (capped or failed)").
+- **The module's owner** — `module_ownership.owners_at_end` `{module folder: [login]}`
+  (the replayed state for the view's end day: `start_state` and the window's events; also
+  `--recompute-ownership`) and CODEOWNERS rules naming people (`code_owners`, teams left
+  out) give `module_owner_of: [module]` on people rows and slice participants
+  (`link.module_owners`). An owner response request names those owners (`owners`,
+  `owners_source: "owner_file"`) when no automation comment named them. Slice
+  participants also carry `automation` when the people row has it.
+- **What a force-push replaced** — a `head_ref_force_pushed` timeline item (or one of its
+  own, `source: "pr_history"`) carries `replaced` `{status: read | unavailable, summary
+  ("force-push on <day> replaced N commit(s): <subjects>"), commits [{sha, subject,
+  files}] (at most 20; `commits_more`), reason?}` from `pr_history` rows' `replaced`.
+- **Net change per file** — gather `pr_net_files`: a `pr_history` row's `net_files`
+  `{head, base, files: [{path, added, removed}], files_omitted?}` — `git diff --numstat`
+  from the merge base to the PR's head as of the window's end (`added` / `removed` null for
+  a binary file; `net_files_unavailable` with the reason when the diff failed). A slice's
+  `outcome.net_change[pr].net_files` lists the files MORE than one own commit touched,
+  `{path, added, removed, commits}`, when the stored head is the head as of the end.
+- **Sibling PRs** — an outcome PR item's `related` `[{number, title, state, url, basis}]`
+  (`link.related_prs`): PRs of the same author opened within 7 days that the record links
+  explicitly (one names the other, or both reference the same item); never from timing
+  alone.
+- **Who a commit's author is** — a PR commit item carries `author_name` (the git name) and
+  `author_login` (the login the window's walked commits resolved that name to, null when
+  none did — identities are never merged by name), and `authored_by_other: true` when that
+  login is not the PR author.
+- **A failed pipeline** — an outcome issue item of an automated "[Failed pipeline]
+  <workflow>" issue carries `failed_pipeline` `{workflow, module?, run_url, run_id,
+  job_url?, jobs?, steps?}` parsed from its title and body (no log download; the October
+  2026 bodies name the run only).
+
+### `module_ownership` (raw, from the store)
+
+Who owns which module and the window's changes to it — "maintainer needed / added /
+removed" (`gather.collect_module_ownership`; a per-window fact, carried into the view
+as is for a view of exactly that window). Stored whenever ownership was collected, empty
+or not (an empty fact of a later window clears an earlier window's standing list); absent
+for stores gathered before it existed. Issues and PRs are read as they were at the
+window's end (`extract.record_as_of`: one created later is skipped, one closed later is
+open). Recompute it offline into an existing store from a clone of the repository with
+the window's history:
+`python3 gather.py --owner O --repo R --from F --to T --store S --clone-dir C --recompute-ownership`
+(no API call; the window's other facts are kept).
+
+**Every window is self-contained.** A window's fact holds everything its state is replayed
+from, so no reader ever needs another window:
+- `start_state` `{module folder: {owner_file?, owners, codeowners, orphan_marker,
+  marker_since?, owners_since?}}` — the COMPLETE ownership state at the window's start,
+  read from the tree of the newest first-parent commit before `from`
+  (`gather.ownership_start_state`): every per-module owner file and its owners (and the
+  day the file last changed), every orphan marker (the day it was added), the
+  individuals CODEOWNERS names for a folder (teams left out). On
+  Azure/bicep-registry-modules at 1 October 2026: 267 folders, about 45 KB.
+  `start_state_source` says `complete`, or `markers_only` for a caller that had no tree
+  before the window;
+- the window's own dated `events` in recorded order (`at`: commit / item time; `seq`:
+  gather's order — commit time, then the walk's order, one change's own events by kind);
+- `labelled_items` `[{module, marker, opened, closed?, source}]` (a label's own time is not
+  recorded: an item counts from the day it opened);
+- `window` `{from, to}`, `gathered_at`; `without_owner` and `owners_at_end` — the window's
+  end state, DERIVED by the same replay (kept as a cross-check: validate replays the fact
+  and refuses a stored end that differs), and `end_check` `{matches, differences}` — the
+  replay against an independent read of the end tree's owner files.
+
+The state of ANY day inside a window (`extract.ownership_state`): `start_state` plus that
+window's events up to the day, in recorded order, plus its labelled items open on the day
+— a module with an orphan marker, or whose owner file lists nobody (`since`: the day it
+changed), or named by an open owner-needed / orphaned item unless its latest change by
+the day (or before the window, as `start_state` dates it) gave it an owner on or after
+the item opened; `owners` `{module: [login]}` (owner file and CODEOWNERS individuals).
+
+**Module lifecycle and what a module is** (the same fact, the same replay). A module
+folder's lifecycle comes from the tree (`extract.module_lifecycle`): `deprecated` (a
+deprecation marker, `ACTIVITY_DEPRECATED_FILES`, default `DEPRECATED.md`), `orphaned` (an
+orphan marker), `live` (its entry file, `ACTIVITY_ENTRY_FILES`, default `main.bicep` /
+`main.tf`), `stub` (its metadata file only: reserved, not yet published or removed), `removed`
+(its entry file deleted in the window), or `proposed` (no entry file on the base, but an open PR's own commits by that day add the
+folder's entry and metadata files: `proposed_modules` `{module: {prs, commit,
+committed_at, info}}`, what the PR's own metadata file says the module is; a stub an open
+PR fills is `proposed`, not `stub`; `modules_at_end` rows add `proposed_by` [pr]), or
+`unknown` (a start state read before entry files were recorded). Every lifecycle marker's
+first lines are kept verbatim: `deprecated_text` for a deprecation marker and
+`marker_text` for an orphan marker (on `without_owner` rows too — it is the call to action).
+When several modules carry the SAME marker text (boilerplate, compared after
+normalising whitespace), the most-shared notice of each kind is said once:
+`marker_texts` `{deprecated | orphaned: {text, modules}}` holds it (`modules`: how many)
+and its rows say `marker_text_shared: true`; any other notice — another text shared by
+other modules included — stays on its own rows; `shared_marker_texts` `[{kind, text,
+modules: [module], count}]` lists every notice shared by more than one module. An owner
+file created with an empty `owners` list is an `owner_needed` event with `file_added:
+true` (metadata without an `owners` field is no owner file). A view that is not one
+stored window keeps the covering window's `proposed_modules` committed by its end. A deprecated module's `replacement` `{module, quote, file}` comes only
+from explicit text — its marker, README or CHANGELOG naming the module that replaces it
+("replaced by / superseded by / moved to / migrate to <module>", "use <module> instead");
+on the October 2026 tree all 12 markers are the same boilerplate naming none, and no README
+or CHANGELOG names one. Deleting a populated owner file is `owner_removed` with
+`file_removed: true` — the file (often the module) is gone, not an owner list emptied —
+so a removed module is never "without an owner". Provenance is honoured: a fact whose
+`start_state_source` is not `complete` (no tree before the window was read) has NO known
+ownership state — gather stores `without_owner: []` with `without_owner_unavailable`, and
+a view of it says so; its events are still reported. `start_state` rows add
+`entry`, `deprecated`, `deprecated_since`, `deprecated_text` (the marker's first lines,
+verbatim: it usually names the replacement) and `info` — what the module's metadata
+(owner) file says it is: `display_name` (`moduleDisplayName`), `description`
+(`moduleDescription`), `resource_type` (`canonicalType`), `alternative_names`. Lifecycle
+events in the window: `deprecated` (with `marker_text`), `undeprecated`, `module_added`
+/ `module_removed` (an entry file added / removed on the mainline under a module folder —
+the authoritative "new module"), `module_info_changed` (with the metadata's new `info`).
+The standing lists split by lifecycle: `without_owner` holds live, orphaned (and unknown)
+modules only — each row with `lifecycle` and `display_name` / `description` /
+`resource_type`; `deprecated_modules` and `stub_modules` list the others
+`[{module, lifecycle, display_name?, ..., deprecated_since?, deprecated_text?}]`;
+`modules_at_end` `{module: {lifecycle, display_name?, description?, resource_type?,
+alternative_names?, ...}}`. ONE source of module lifecycle: this tree-derived state and
+its events. `module_changes.modules[]` rows take `module_lifecycle`, `display_name`,
+`description`, `resource_type` and `lifecycle_events` from it, and
+`module_changes.lifecycle_check` `{new | removed | deprecated: {agree, only_module_layer,
+only_tree}}` cross-checks the module layer's own window statuses against the tree's
+events. `stories.all[]` rows add `module_info` `{area: {display_name?, description?,
+resource_type?, lifecycle}}`, and slice outcome items and `outcome.modules[]` rows carry
+the same. Every train of a story-layer view carries `modules` / `modules_source` (the
+module areas `stories.all` shows, `link.train_modules`) and, with no merged code,
+`pr_code_areas` (every area its PRs' own commits touched by the view's end; `code_areas`
+stays the merged commits' areas). Refresh offline from a clone (`--recompute-modules` is the same flag as
+`--recompute-ownership`): `python3 gather.py --owner O --repo R --from F --to T --store S
+--clone-dir C --recompute-modules`.
+
+**Views.** A view that is not exactly one gathered window reads its state from the ONE
+stored window covering its END day (`extract.covering_window`: the one gathered latest,
+then the latest end, the latest start), named in `as_of_window`: `without_owner` and
+`owners_at_end` are that window's replay for the view's end day (an owner added after a
+view's end is never in it). Events REPORTED are those of every overlapping window dated
+in the view, each change once (`extract.ownership_event_identity`: source commit / item,
+kind, module, people, day — never `at` / `seq`; a refreshed copy replaces a legacy one and
+its order is the refreshed fact's); `unread` is merged. No window covers the end day, or
+the covering fact is legacy (no `start_state`) and the day is not its own end: `without_owner`
+is empty, `owners_at_end` absent, and `without_owner_unavailable` says why (the legacy
+reason names `--recompute-ownership`). The carry-across-windows design (a later window's
+state rebuilt from earlier windows' events) was dropped: it needed every earlier window
+loaded, broke whenever windows overlapped, were legacy, or ordered one second's changes
+differently, and could not know an owner list emptied before the first gathered window.
+The same history stored as one month, a month plus carried days, adjacent months, weekly
+windows or a legacy fact plus a refreshed overlapping window reads back identically for
+every day a self-contained window covers. validate checks the type of every field a reader
+indexes, slices, sorts or keys on (`validate._OWNERSHIP_ROW_TYPES`,
+`OWNERSHIP_STATE_SHAPE`). Rewrite a stored window in this shape, offline, from a clone:
+`python3 gather.py --owner O --repo R --from F --to T --store S --clone-dir C --recompute-ownership`.
+
+- `without_owner` — the window's end state (above): modules carrying an orphan marker,
+  modules whose owner file lists nobody, and modules named by an open item with an
+  owner-needed / orphaned label unless the module gained an owner (or was adopted) on or
+  after that item was opened.
+- `unread` — owner-file / CODEOWNERS versions that could not be read or parsed (`reason`:
+  "not valid JSON"); no change is derived from them, never "no owners". A Terraform module repository has CODEOWNERS only: the other sources are
+  simply absent.
 
 ### `pr_activity` (raw, from the store)
 
@@ -1552,8 +2003,29 @@ no gather stored it (a store gathered before it, every fixture bundle):
   (`threads_omitted`). GitHub keeps no resolution time.
 - `events` — the PR lifecycle events from the issue timeline enrich_pr already fetched:
   `renamed`, `convert_to_draft`, `review_requested`, `review_request_removed`,
-  `review_dismissed`, `head_ref_force_pushed` (the latest `PR_EVENTS_MAX` 100,
-  `events_omitted`); a force-push gains `before` / `after` from the GraphQL read.
+  `review_dismissed`, `head_ref_force_pushed`, `assigned` (with `assignee`; who handed
+  a coding agent its work) (the latest `PR_EVENTS_MAX` 100,
+  `events_omitted`); a force-push gains `before` / `after` from the GraphQL read; an
+  event's `actor_type` is GitHub's account type of its actor when not `User` (`Bot`).
+- `body_edited_at` — when the PR description was last edited (GraphQL `lastEditedAt`):
+  edited after a view's end, the description is "as last gathered" for it.
+- **Every commit** (`collect_check_history`, the second phase): when a PR has more
+  commits than the latest 10, the older ones are read in pages of
+  `PR_CHECKS_HISTORY_PAGE` (100) with GitHub's roll-up state only — rows `{sha,
+  committed_at, state, rollup, checks: [], state_only: true}` (`rollup` from the state:
+  success passing, failure / error failing, pending / expected pending) — and the check
+  contexts of every commit whose state is not a success are then read
+  (`PR_CHECKS_DETAIL_BATCH` 20 commits per request, the flag dropped); a commit cut at 50
+  contexts without a visible failure is paged to the end (at most
+  `PR_CHECKS_MAX_CONTEXTS` 500), so `incomplete` is left only where a cap or a failed
+  request stopped the read. `history_status` (only for a PR with older commits):
+  `complete`, `capped` (`ACTIVITY_PR_CHECKS_MAX_COMMITS`, default 1,000 per PR, or the
+  window's `ACTIVITY_PR_CHECKS_MAX_REQUESTS`, default 400; `history_reason`) or `failed`
+  (`history_reason`). Cost: a page about 1 point, a detail request about 1 point. October
+  2026 of Azure/bicep-registry-modules (160 PRs, 1,284 commits, 28 PRs with more than 10):
+  about 31 page requests and about 15 detail requests (38 % of the commits read in full
+  were not passing) on top of the 16 first-phase requests / 96 points — about 63 requests
+  and 150 points, well inside the built-in CI token's 1,000 points an hour.
 - `requests` / `points` — the GraphQL requests made and the rate-limit points they cost.
 - `{"collected": false}` is never written: `--no-pr-checks` still stores the events.
 

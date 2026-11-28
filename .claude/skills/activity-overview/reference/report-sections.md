@@ -211,6 +211,15 @@ on — so a reader does not have to guess (a guess can be unfair to the people i
 sub-section (a story train that is a mention train gets one: its effort line, then the
 story); end the section with one line when `stories.more` is not empty: *"N more trains had
 notable discussion: <ids>"*. No story train → no stories, and nothing is said.
+When the view carries the full story list, stories.all (BUNDLE.md "Every story of the window"), every story of
+the month is listed there with its `group` (landed, in flight, stalled, closed, plumbing)
+and the rule that put it there (`group_rule`); a report that covers the whole month groups
+its stories by it and gives each a slice. For a landed story say whether it was released
+from `released` (published with its tag and date, declared but not published, unknown,
+no version change). Plumbing work is told per theme from `plumbing_themes` (what the PRs
+changed, their commit subjects and code-comment / docs evidence); automation accounts are
+named as automation accounts (`automation`, with the person who handed a coding agent its
+work when `on_behalf_of` shows it).
 
 1. **Get the slice** as for any train (`python3 link.py <bundle-view> --slice <train-id>`).
    The story material is `slice.conversation` (BUNDLE.md "Slice `conversation`"):
@@ -300,6 +309,19 @@ notable discussion: <ids>"*. No story train → no stories, and nothing is said.
    >    changelog words (quote the `changelog` items of the outcome block's `modules`), the PR's state
    >    (merged), and whether anything discussed was deferred or left out (say so, with the
    >    changelog or commit text that says it).
+   > 6a. *A closed story* (group `closed`: closed without landing) ends with **Where it
+   >    stands** too: how it closed (by whom, the issue's closing reason, a PR's
+   >    `closed_unmerged` — `superseded_by` only when the record says so, else "the record
+   >    states no reason"), and what, if anything, carries the work on.
+   > 6b. *Versions and breaking changes.* A changelog that declares a breaking change in a
+   >    minor version bump of a 0.x module (0.12 → 0.13) is stated as exactly that: "the
+   >    changelog declares it breaking; the version moved from 0.12.0 to 0.13.0". Call it
+   >    the project's versioning convention ("a 0.x minor version may break") only when the
+   >    repository's own contribution docs say so — quote that sentence with its file. (For
+   >    Azure/bicep-registry-modules the October 2026 tree says the opposite: its pull
+   >    request template, `.github/pull_request_template.md`, reads "Breaking changes and I
+   >    have bumped the MAJOR version in `version.json`." — so state the two facts and do
+   >    not explain the difference.)
    > 7. *Fairness.* Quote requests and answers in context: a short answer ("Agreed, no need
    >    for both.") comes with what it agreed to and what changed as a result. Do not let the
    >    choice of quotes suggest the work was compromised, rushed or watered down unless the
@@ -350,12 +372,30 @@ notable discussion: <ids>"*. No story train → no stories, and nothing is said.
    (`checks_said_unknown`); likewise for a thread's resolution against the PRs whose
    resolution coverage is complete (`thread_coverage`: all review threads flagged,
    none omitted by gather or the ledger cap; `resolved_said_unknown`). A qualified
-   claim ("the checks of #2 were not read") passes under partial coverage; and every code comment
+   claim ("the checks of #2 were not read") passes under partial coverage — see the table
+   below; and every code comment
    the story quotes in backticks (a span starting with `//`, `/*`, `#` or `<#`; a bare
    issue / PR reference such as `#7146` is not one) occurs in
    the slice (`code_comments_not_in_slice`).
    Else exit 1 with the lists. Drop or fix each listed sentence and check again; never
    publish a story that fails it.
+   The rules that refuse a statement of not-knowing — each scoped to the items the
+   sentence names (`#N` or a link), refusing only when coverage of every one of them is
+   complete — an item the slice holds no coverage for (a linked issue / PR outside the
+   train, or any issue / PR of another repository — a link or `owner/repo#N`) is never
+   covered, so a claim naming it always passes (a link or `owner/repo#N` naming the slice's
+   own repository, in any letter case, is its own `#N`); a sentence naming none is
+   refused only when every PR of the slice is covered. The checker never forces a story
+   to hide a real coverage limit (the full matrix is pinned in
+   `test_story_check_truth_table.py`):
+
+   | Rule | Refuses a sentence saying … is not in the record | Only when, for each item named |
+   |---|---|---|
+   | `checks_said_unknown` | CI / checks / check results of a PR | its outcome `checks` are gathered with a result (`passing`, `failing`, `pending`, `none`; not `incomplete` / `unavailable`); for a sentence about earlier commits, pushes or runs, or about commits a force-push replaced, also every commit of the PR read (`commits_covered` = `commits_total`) with a complete result each (no `commits_incomplete`) and no force-push recorded on the PR (the replaced commits' checks are never read, so such a history claim is never refused) |
+   | `resolved_said_unknown` | whether a PR's review threads were resolved | every review thread of the PR in the ledger carries `resolved_on_github`, `thread_coverage` shows none omitted by gather, and the ledger cap hid none (a PR with no ledger entry is never covered) |
+
+   No rule refuses a statement that commit evidence is missing (`evidence_omitted`,
+   `interface_unread`, `docs_unread`, history omissions in `not_gathered`).
    **What the check does not cover** — read the story once against rules 2–7: that each
    turning point is explained in substance, that decisions come from the outcome block
    and change summaries rather than tone, that every thread mentioned is closed or called
