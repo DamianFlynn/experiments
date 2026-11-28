@@ -30,7 +30,7 @@ A story gets **one** post, at the first event a reader can act on. `trigger` say
 | `merged_no_release` | a landed story whose PRs change no version (documentation, metadata): its merge day | the module when there is one, "no version change" |
 | `new_module_proposed` | an open PR whose own commits add a module's entry file (`new_module_proposed`, the tree's `proposed` lifecycle): the later of that commit's day and the opening of the PR that adds it (the tree's `proposed_modules[].prs`, not any open PR of the train) | the proposed module, that the PR is open (or proposed), and "not published" |
 | `breaking_declared_open` | an open PR whose own commits declare items under `### Breaking Changes` in a CHANGELOG (below): the later of that commit's day and the PR's opening | "breaking", that the PR is open (not merged) |
-| `owner_added` / `orphaned` / `deprecated` | a module event of `module_ownership` (one post per module and kind): the event's day; an `orphaned` signal that is only a label on a PR (no marker file in the module folder) is held `ORPHAN_LABEL_HOLD_DAYS` (7) and suppressed when the module gains an owner in that time | the module, the event in words ("owner", "orphaned", "deprecated"), a link to the event's source or the module; a deprecation states its replacement with its link when the record names one (`deprecated_modules[].replacement`, explicit text only), including the replacement's module link, else that no replacement is named; an `owner_added` post names each new owner (display name) |
+| `owner_added` / `orphaned` / `deprecated` | a module event of `module_ownership` (one post per module and kind): the event's day; an `orphaned` signal that is only a label on a PR (no marker file in the module folder) is held `ORPHAN_LABEL_HOLD_DAYS` (7) and suppressed when the module gains an owner in that time | the module, the event in words ("owner", "orphaned", "deprecated"), a link to the event's source or the module; a deprecation states its replacement with its link when the record names one (`deprecated_modules[].replacement`, explicit text only), including the replacement's module link, else that no replacement is named; an `owner_added` post names each new owner with a display name (`must_state.people`); owners without one, or do_not_name, are only counted (`people_unnamed`) and the post says that the module has a new owner without naming them |
 | `closed_not_planned` | a user-facing request or change (a story of the `closed` group: an issue or a PR touching a module, not plumbing) closed as not planned or without merging: the day it closed | that it was closed, the reason as stated (`closing.state_reason`, a PR's `superseded_by` with its link) or "no reason is stated", and where its content landed when the record shows it (`content_landed_in`: "its commit is part of #N"; never "superseded" without `superseded_by`) |
 | `closed_after_post` | closing the loop: a story that already had a post is closed without merging or withdrawn (every PR of the train closed unmerged, none open or merged): the day it closed. The one exception to one post per story: `post_id` is the first post's id plus `:closed`, with `first_post_id` | as for `closed_not_planned` |
 
@@ -102,6 +102,8 @@ Both forms state the same facts; neither adds one.
   One link, to the tag of the published version, else the pull request, else the module.
 - **LinkedIn**: a short paragraph or three, at most `LINKEDIN_LIMIT` (1,200) characters (URLs
   at their full length), plain text, at most `LINKEDIN_HASHTAGS` (3) hashtags.
+- **URLs** are read once (`_post_urls`): trailing sentence punctuation is not part of a link,
+  for the length, the required links and the voice-pass facts alike.
 - **Plain text** in both: no markdown links, bold, code spans or headings. A quote of record
   text that holds code spans is written without the backticks; the check matches it against
   the record with the record's backticks dropped.
@@ -140,10 +142,22 @@ issue check's record rules on the text (`quotes_not_in_view`, `items_not_in_view
 `review_state_mismatch`, `pr_state_mismatch`, `release_status_mismatch`,
 `superseded_not_in_view`, `do_not_name_named`, `affiliation_mismatch`,
 `automation_as_person`, `dates_without_year`, `characterising_words`). Two record rules are
-read for posts: release, open / merged / closed and review-state claims are read **as of the
-post's day** ("not yet published" is true before a later publication — publication dates keyed
-by repository, module and version —; "open" is true for a PR open that day; a review state
-whose basis came after the post's day is not held against it), and "community" in a sentence that names a person by display name
+read for posts. **Every state, review and publication claim is judged against ONE projection
+of the record as of the post's day** (`RecordAsOf`), never against the window's end:
+
+- a PR's state is replayed from its recorded lifecycle (closed, reopened, merged, in time
+  order; `merged_at` / `closed_at` when no event is recorded): not yet opened, open, merged or
+  closed without merging at the end of that day (`pr_state_on`);
+- its review state is `link.review_state` at the end of that day (reviews, comments and pushes
+  up to then);
+- a version is published when a tag of it is dated on or before the day; not published when it
+  is not and the view's tags cover the day; **unknown** when the tags were not read or the day
+  is past the view's coverage (`release_on`).
+
+The outline uses the same projection: a `merged_not_published` post due after the view's
+coverage ends is `pending` (listed under `pending` in the daily outline, `post_pending` in the
+check) until a view that covers its day settles it; a row's `must_state.prs` states each PR as
+it stood on the post's day. And "community" in a sentence that names a person by display name
 fails unless that person's affiliation is community. A do_not_name person's handle is never
 allowed, even when the registry marks it confirmed (logins compared case-insensitively).
 
@@ -152,8 +166,8 @@ plural, "we"), greeting and closing lines that state no fact, hashtags and emoji
 limits (`VOICE_PASS_MAY_CHANGE`). It may not change a fact. The check is written for that: it
 asks for facts, not wording, so it runs unchanged on the voiced text; with `--against` the
 earlier drafts file, it also fails `facts_changed` when a post's URLs, versions, item numbers,
-other numbers, quotes, dates, handles or the people it names (display names resolved to their
-logins) differ from its earlier version (`post_facts`), and when a post or channel of the
+other numbers, quotes, dates, handles, module paths or the people it names (display names
+resolved to their logins) differ from its earlier version (`post_facts`), and when a post or channel of the
 earlier file is missing from the new one. A voice
 pass that turns "not yet published" into "published" fails the record check even when no
 listed fact changed.

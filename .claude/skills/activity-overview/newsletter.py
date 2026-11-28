@@ -2942,7 +2942,7 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence=None
         if sid not in LINKED_SECTIONS and sid not in RELEASE_SECTIONS:
             continue
         for par, repo in _scoped_paragraphs(chunk, slugs):
-            if re.match(r"^\s*#", par):
+            if _is_heading(par):
                 continue
             plain = _delink(par)
             toks = areas_named(plain, None)
@@ -3151,7 +3151,109 @@ def _review_claim(snt):
     return out
 
 
-def state_claims(views, text):
+_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}(\s|$)")
+
+
+def _is_heading(par):
+    """A markdown heading: one to six `#` then whitespace ("#10 was merged."
+    is a sentence about item 10, not a heading)."""
+    return bool(_HEADING_RE.match(par))
+
+
+# --- the record as of a day ------------------------------------------------------
+
+def _instant(day):
+    return "{}T23:59:59Z".format(day)
+
+
+def pr_state_on(pr, day):
+    """A PR's state at the end of `day` (YYYY-MM-DD), replayed from the
+    record: `not_opened` before `created_at`; then its recorded lifecycle
+    events through the day (closed / reopened / merged, in time order);
+    `merged_at` / `closed_at` stand in when no event is recorded. One of
+    not_opened, open, merged, closed_unmerged; None without the record."""
+    if not pr or not pr.get("created_at"):
+        return None
+    if _day(pr["created_at"]) > day:
+        return "not_opened"
+    if pr.get("merged") and pr.get("merged_at") and _day(pr["merged_at"]) <= day:
+        return "merged"
+    events = sorted((e for e in pr.get("lifecycle") or [] if isinstance(e, dict)
+                     and e.get("event") in ("closed", "reopened", "merged")
+                     and e.get("created_at") and _day(e["created_at"]) <= day),
+                    key=lambda e: e["created_at"])
+    if events:
+        last = events[-1]["event"]
+        return {"closed": "closed_unmerged", "reopened": "open", "merged": "merged"}[last]
+    if pr.get("closed_at") and _day(pr["closed_at"]) <= day and not pr.get("merged"):
+        return "closed_unmerged"
+    return "open"
+
+
+def release_on(view, module, version, day):
+    """A module version's release status at the end of `day`: `published`
+    when a tag of it is dated on or before the day; `declared_not_published`
+    when it is not, and the view's tag coverage reaches the day; `unknown`
+    when the tags were not read for the window or the day is past the view's
+    coverage (its period end)."""
+    mc = view.get("module_changes") or {}
+    inp = mc.get("inputs") or {}
+    period = _period(view)
+    if not inp.get("tags_collected") or not period[1] or day > period[1]:
+        return "unknown"
+    vk = version_key(version)
+    # every date the record gives the version's tag (the module layer's
+    # published rows; the story rows' released versions carry it too)
+    dates, undated = [], False
+    for row in (view.get("stories") or {}).get("all") or []:
+        for x in row.get("released") or []:
+            if isinstance(x, dict) and x.get("status") == "published" and \
+                    x.get("module") == module and version_key(x.get("version")) == vk:
+                (dates.append(_day(x["date"])) if x.get("date") else None)
+    for m in mc.get("modules") or []:
+        for pub in (m.get("versions") or {}).get("published") or []:
+            if (pub.get("module") or m["area"]) == module and version_key(pub.get("version")) == vk:
+                if pub.get("date"):
+                    dates.append(_day(pub["date"]))
+                else:
+                    undated = True
+    if any(d <= day for d in dates):
+        return "published"
+    if dates:
+        return "declared_not_published"     # tagged, but after the day
+    if undated:
+        # a tag without a date: published by the window's end, when not known
+        return "published" if day >= period[1] else "unknown"
+    return "declared_not_published"
+
+
+class RecordAsOf:
+    """ONE projection of the record as of a day, for every state, review and
+    publication claim of a post: PR state (replayed close / reopen / merge
+    events), review state (link.review_state at the end of the day), release
+    status (tags dated on or before the day, unknown past the coverage)."""
+
+    def __init__(self, views, day):
+        self.day = day
+        self.views = {_slug(v): v for v in views}
+        self.prs = {(_slug(v), p.get("number")): p for v in views for p in v.get("prs") or []}
+
+    def pr_state(self, repo, number):
+        return pr_state_on(self.prs.get((repo, number)), self.day)
+
+    def review(self, repo, number):
+        pr = self.prs.get((repo, number))
+        v = self.views.get(repo)
+        if not pr or v is None or pr_state_on(pr, self.day) in (None, "not_opened"):
+            return None
+        return (link.review_state(v, pr, _instant(self.day)) or {}).get("state")
+
+    def release(self, repo, module, version):
+        v = self.views.get(repo)
+        return release_on(v, module, version, self.day) if v is not None else "unknown"
+
+
+def state_claims(views, text, as_of=None):
     """One state per fact: every sentence of the issue (stories, quotes and
     comments blanked of quoted text only) that names exactly ONE pull
     request and states its review state, or its open/merged/closed state, or
@@ -3160,8 +3262,11 @@ def state_claims(views, text):
     the release status) and with what the other sections say of the same
     PR or version. Returns {review_state_mismatch, pr_state_mismatch,
     release_status_mismatch}: each row names the claim, the view's state and
-    the sections that stated it."""
+    the sections that stated it. `as_of` (YYYY-MM-DD) judges every claim
+    against the record as of that day (`RecordAsOf`) instead of the window's
+    end: a post is true on the day it goes out."""
     slugs = [_slug(v) for v in views]
+    proj = RecordAsOf(views, as_of) if as_of else None
     prs = {}
     rel = {}
     closed = {}
@@ -3177,6 +3282,8 @@ def state_claims(views, text):
             rs = pr.get("review_state")
             prs[(sl, n)] = {"review": rs.get("state") if isinstance(rs, dict) else None,
                             "state": st}
+            if proj is not None:
+                prs[(sl, n)] = {"review": proj.review(sl, n), "state": proj.pr_state(sl, n)}
             if st == "closed_unmerged":
                 closed[(sl, n)] = pr.get("closed_unmerged") or {}
         for m in (v.get("module_changes") or {}).get("modules") or []:
@@ -3185,7 +3292,8 @@ def state_claims(views, text):
             for mod in mods:
                 for r in module_release(v, m, mod):
                     if r.get("version"):
-                        rel[(sl, mod, version_key(r["version"]))] = r.get("status")
+                        rel[(sl, mod, version_key(r["version"]))] = r.get("status") \
+                            if proj is None else proj.release(sl, mod, r["version"])
     known_areas = sorted({k[1] for k in rel}, key=len, reverse=True)
 
     blank = lambda m: re.sub(r"[^\n]", " ", m.group(0))   # noqa: E731
@@ -3196,7 +3304,7 @@ def state_claims(views, text):
     review, pstate, pub = {}, {}, {}
     for sid, chunk in _section_chunks(t):
         for par, repo in _scoped_paragraphs(chunk, slugs):
-            if re.match(r"^\s*#", par):
+            if _is_heading(par):
                 continue
             repo = repo if repo is not None else (slugs[0] if len(slugs) == 1 else None)
             if repo is None:
@@ -3471,17 +3579,6 @@ def _unmerged(pr):
     return bool(pr) and not pr.get("merged") and pr.get("state") in ("open", "closed")
 
 
-def _open_on(pr, day):
-    """Whether a PR was open on `day` (YYYY-MM-DD): opened by then and not yet
-    closed or merged; None when the record cannot say."""
-    if not pr or not pr.get("created_at"):
-        return None
-    if _day(pr["created_at"]) > day:
-        return False
-    end = pr.get("merged_at") if pr.get("merged") else pr.get("closed_at")
-    return not (end and _day(end) <= day)
-
-
 def _closed_state(kind, n, item, c):
     """What a closing post must state: the item, that it closed without
     landing, the reason as stated or None ("no reason is stated"), what
@@ -3636,10 +3733,15 @@ def social_candidates(views, hold_days=SOCIAL_HOLD_DAYS, automation=()):
                             unknown=[{k: x.get(k) for k in ("module", "version", "reason")}
                                      for x in unknown], held_from=mday)))
                     else:
-                        options.append((hold_end, "merged_not_published", dict(
-                            state, release="merged, not yet published",
-                            declared=[{k: x.get(k) for k in ("module", "version", "status")}
-                                      for x in later], held_from=mday)))
+                        st_ = dict(state, release="merged, not yet published",
+                                   declared=[{k: x.get(k) for k in ("module", "version", "status")}
+                                             for x in later], held_from=mday)
+                        if period[1] and hold_end > period[1]:
+                            # the view's tags end before the due day: "not yet
+                            # published" cannot be told; pending until a view covers it
+                            st_["pending"] = "the view's coverage ends {}; due {}".format(
+                                period[1], hold_end)
+                        options.append((hold_end, "merged_not_published", st_))
             for area in r.get("new_module_proposed") or []:
                 tree = ((v.get("module_ownership") or {}).get("proposed_modules") or {}).get(area) or {}
                 # the PR that adds the entry file (the tree's `prs`), not any open
@@ -3655,7 +3757,7 @@ def social_candidates(views, hold_days=SOCIAL_HOLD_DAYS, automation=()):
                 days = [x for x in (_day(tree.get("committed_at")),
                                     min(opened) if opened else None) if x]
                 day = max(days) if days else None
-                if day and all(_open_on(prs.get(n), day) is False for n in proposing):
+                if day and not any(pr_state_on(prs.get(n), day) == "open" for n in proposing):
                     day = None          # every proposing PR was closed by then
                 if day:
                     options.append((day, "new_module_proposed", {
@@ -3667,7 +3769,7 @@ def social_candidates(views, hold_days=SOCIAL_HOLD_DAYS, automation=()):
                 for b in _open_pr_breaking(v, n):
                     if b.get("at"):
                         bday = max(_day(b["at"]), _day(prs[n].get("created_at")) or _day(b["at"]))
-                        if _open_on(prs[n], bday) is False:
+                        if pr_state_on(prs[n], bday) != "open":
                             continue  # closed before it declared
                         options.append((bday, "breaking_declared_open", {
                             "pr": n, "changelog": b["path"], "items": b["items"],
@@ -3694,24 +3796,28 @@ def social_candidates(views, hold_days=SOCIAL_HOLD_DAYS, automation=()):
             if not options:
                 continue
             day, trig, state = sorted(options, key=lambda o: (o[0], SOCIAL_TRIGGERS.index(o[1])))[0]
+            proj = RecordAsOf([v], day)
             # closing the loop: a story that already had a post gets ONE closing
             # post when it is closed without merging or withdrawn
             later = [x for x in closes if _day(x[3]["at"]) > day and trig != "closed_not_planned"]
-            still = [n for n in numbers if (prs.get(n) or {}).get("state") == "open"
+            final = sorted(later, key=lambda x: x[3]["at"])[-1] if later else None
+            # eligible only when, on the day of the FINAL closure, every PR of the
+            # train is closed unmerged (replayed, not the window's end)
+            still = [n for n in numbers if final and
+                     pr_state_on(prs.get(n), _day(final[3]["at"])) in ("open", "merged")
                      or (prs.get(n) or {}).get("merged")]
-            if later and not still:
-                # eligible only once every PR is closed: the FINAL closure
-                kind, n, it, c = sorted(later, key=lambda x: x[3]["at"])[-1]
+            if final and not still:
+                kind, n, it, c = final
                 loop = dict(base, post_id=base["post_id"] + ":closed", first_post_id=base["post_id"],
                             day=_day(c["at"]), trigger="closed_after_post",
                             must_state=dict(_closed_state(kind, n, it, c), first_trigger=trig))
                 loops.append(loop)
             posts.append(dict(base, day=day, trigger=trig, must_state=dict(
                 state, modules=mods,
+                # each PR as it stood on the post's day (the projection)
                 prs=[{"number": n, "url": (prs.get(n) or {}).get("url"),
-                      "state": "merged" if (prs.get(n) or {}).get("merged") else
-                      (prs.get(n) or {}).get("state"),
-                      "review_state": review_state(v, n)} for n in numbers],
+                      "state": pr_state_on(prs.get(n), day),
+                      "review_state": proj.review(sl, n)} for n in numbers],
                 people=_story_people(v, numbers, automation))))
         # ownership and lifecycle events a reader can act on
         mo = v.get("module_ownership") or {}
@@ -3750,9 +3856,16 @@ def social_candidates(views, hold_days=SOCIAL_HOLD_DAYS, automation=()):
                           "must_state": {"module": e["module"],
                                          "module_url": module_url(v, e["module"])[0],
                                          "info": module_info(v, e["module"]),
-                                         "people": [_person(v, x).get("name") or x
+                                         # named by display name only; a nameless or
+                                         # do_not_name owner is counted, not named
+                                         "people": [_person(v, x)["name"]
                                                     for x in e.get("people") or []
-                                                    if not _person(v, x).get("do_not_name")],
+                                                    if _person(v, x).get("name")
+                                                    and not _person(v, x).get("do_not_name")],
+                                         "people_unnamed": sum(
+                                             1 for x in e.get("people") or []
+                                             if not _person(v, x).get("name")
+                                             or _person(v, x).get("do_not_name")),
                                          "source": e.get("source"), "via": e.get("via"),
                                          "marker_text": e.get("marker_text"),
                                          **({"replacement": (dict(
@@ -3827,7 +3940,8 @@ def daily_outline(views, day, posted=(), hold_days=SOCIAL_HOLD_DAYS, automation=
     ledger says is out (`already_posted`)."""
     cand = candidates or social_candidates(views, hold_days=hold_days, automation=automation)
     posted = set(posted or ())
-    rows = [p for p in cand["posts"] if p["day"] == day]
+    pending = [p for p in cand["posts"] if p["day"] == day and p["must_state"].get("pending")]
+    rows = [p for p in cand["posts"] if p["day"] == day and not p["must_state"].get("pending")]
     weekly = [w for w in cand["weekly"] if w["day"] == day]
     held = [{"post_id": p["post_id"], "story": p.get("story"), "merged_on":
              p["must_state"].get("held_from"), "posts_on": p["day"]}
@@ -3841,6 +3955,8 @@ def daily_outline(views, day, posted=(), hold_days=SOCIAL_HOLD_DAYS, automation=
             "posts": [p for p in rows if p["post_id"] not in posted],
             "weekly": [w for w in weekly if w["post_id"] not in posted],
             "held": held,
+            "pending": [{"post_id": p["post_id"], "story": p.get("story"),
+                         "reason": p["must_state"]["pending"]} for p in pending],
             "already_posted": sorted(p["post_id"] for p in rows + weekly
                                      if p["post_id"] in posted)}
 
@@ -3860,11 +3976,18 @@ POST_CHECK_KEYS = (  # plus release_claimed_while_unknown, set per post
     "dates_without_year", "numbers_not_in_view", "characterising_words")
 
 
+def _post_urls(text):
+    """The URLs of a plain-text post, trailing sentence punctuation removed
+    (as `post_facts` and the newsletter check read them)."""
+    return [u.rstrip(".,;:!?)") for u in _URL_RE.findall(text or "")]
+
+
 def x_length(text):
     """X's weighted length: every URL counts X_LINK_WEIGHT; a code point in the
     Latin / general-punctuation ranges counts 1, any other (most emoji, CJK) 2."""
     n = 0
-    rest = _URL_RE.sub(lambda m: "\0", text)
+    # a URL counts X_LINK_WEIGHT; punctuation after it is text
+    rest = _URL_RE.sub(lambda m: "\0" + m.group(0)[len(m.group(0).rstrip(".,;:!?)")):], text)
     n += rest.count("\0") * X_LINK_WEIGHT
     for ch in rest.replace("\0", ""):
         o = ord(ch)
@@ -3878,7 +4001,7 @@ def post_facts(text, names=None):
     versions, item numbers, other numbers, quotes, @handles, dates, and the
     people it names (`names`: {display name: login}, as canonical logins)."""
     t = text
-    urls = sorted(set(u.rstrip(".,;:") for u in _URL_RE.findall(t)))
+    urls = sorted(set(_post_urls(t)))
     t2 = _URL_RE.sub(" ", t)
     quotes = sorted({m.group(1) or m.group(2) for m in link._QUOTE_RE.finditer(t2)})
     dates = sorted({m.group(0) for m in link._DATE_IN_PROSE_RE.finditer(t2)})
@@ -3888,10 +4011,12 @@ def post_facts(text, names=None):
     t4 = _ITEM_RE.sub(" ", _VERSION_RE.sub(" ", t3))
     numbers = sorted(set(x.replace(",", "") for x, _ in _NUMBER_RE.findall(t4)))
     handles = sorted(set(_HANDLE_RE.findall(t2)))
+    modules = sorted({m.group(0).rstrip("/.-") for m in _AVM_PATH_RE.finditer(t2)})
     people = sorted({login_key(lg) for nm, lg in (names or {}).items()
                      if nm and re.search(r"(?<!\w)" + re.escape(nm) + r"(?!\w)", t2)})
     return {"urls": urls, "quotes": quotes, "dates": dates, "versions": versions,
-            "items": items, "numbers": numbers, "handles": handles, "people": people}
+            "items": items, "numbers": numbers, "handles": handles, "people": people,
+            "modules": modules}
 
 
 def _social_numbers(obj, out):
@@ -3940,7 +4065,7 @@ def check_posts(views, text, registry=None, against=None, hold_days=SOCIAL_HOLD_
     if registry:
         registry_names = {lg: (e or {}).get("name") for lg, e in (registry.get("people") or {}).items()
                           if isinstance(e, dict) and e.get("do_not_name")}
-    names, people_rows, hidden_logins, pub_dates = {}, {}, set(), {}
+    names, people_rows, hidden_logins = {}, {}, set()
     for v in views:
         hidden_logins |= _do_not_name(v)
         for login in set(v.get("people") or {}) | set(((v.get("affiliations") or {})
@@ -3949,10 +4074,6 @@ def check_posts(views, text, registry=None, against=None, hold_days=SOCIAL_HOLD_
             if pr_.get("name") and not pr_.get("do_not_name"):
                 names[pr_["name"]] = login
                 people_rows[pr_["name"]] = pr_
-        for m in (v.get("module_changes") or {}).get("modules") or []:
-            for pub in (m.get("versions") or {}).get("published") or []:
-                pub_dates[(_slug(v), pub.get("module") or m["area"],
-                           version_key(pub.get("version")))] = _day(pub.get("date"))
     for lg, e in ((registry or {}).get("people") or {}).items():
         if isinstance(e, dict) and e.get("do_not_name"):
             hidden_logins.add(lg)
@@ -3973,6 +4094,8 @@ def check_posts(views, text, registry=None, against=None, hold_days=SOCIAL_HOLD_
             r["channel_unknown"] = ch
         if row is None:
             r["post_unknown"] = pid
+        elif (row.get("must_state") or {}).get("pending"):
+            r["post_pending"] = row["must_state"]["pending"]
         elif row["day"] != day:
             r["day_mismatch"] = {"outline": row["day"], "written": day}
         # limits and form
@@ -4000,7 +4123,7 @@ def check_posts(views, text, registry=None, against=None, hold_days=SOCIAL_HOLD_
         if row is not None:
             ms = row.get("must_state") or {}
             low = body.lower()
-            urls = set(_URL_RE.findall(body))
+            urls = set(_post_urls(body))
             mods = ms.get("modules") or ([{"area": ms["module"], "url": ms.get("module_url")}]
                                          if ms.get("module") else [])
             if mods and not any(m.get("url") in urls or m["area"] in body for m in mods):
@@ -4090,7 +4213,8 @@ def check_posts(views, text, registry=None, against=None, hold_days=SOCIAL_HOLD_
                     not any((p or {}).get("url") in urls for p in ms.get("prs") or []) and \
                     not (ms.get("source") or {}).get("url") in urls and not \
                     any(m.get("url") in urls for m in mods) and not \
-                    any(x.get("url") in urls for x in ms.get("released") or []):
+                    any(x.get("url") in urls for x in ms.get("released") or []) and \
+                    (ms.get("item") or {}).get("url") not in urls:
                 missing.append("a link to the story, a pull request or the module")
         if missing:
             r["must_state_missing"] = missing
@@ -4115,40 +4239,9 @@ def check_posts(views, text, registry=None, against=None, hold_days=SOCIAL_HOLD_
             # a count the row itself gives (a weekly item's PRs) is a fact too
             full["numbers_not_in_view"] = [x for x in full["numbers_not_in_view"]
                                            if x not in allowed]
-        if full.get("pr_state_mismatch") or full.get("review_state_mismatch"):
-            # an open / review claim is read as of the post's day: a PR closed or
-            # reviewed after that day was open / unreviewed when the post went out
-            prs_ = {}
-            for v_ in views:
-                for x_ in v_.get("prs") or []:
-                    prs_[(_slug(v_), x_.get("number"))] = x_
-            repo_ = (row or {}).get("repo") or _slug(views[0])
-            full["pr_state_mismatch"] = [
-                x for x in full.get("pr_state_mismatch") or []
-                if not ({y.get("claim") for y in x.get("stated") or []} == {"open"} and
-                        _open_on(prs_.get((x.get("repo") or repo_, x.get("pr"))), day))]
-            keep = []
-            for x in full.get("review_state_mismatch") or []:
-                pr_ = prs_.get((x.get("repo") or repo_, x.get("pr"))) or {}
-                basis = ((pr_.get("review_state") or {}).get("basis") or {}).get("at")
-                if basis and _day(basis) > day:
-                    continue
-                keep.append(x)
-            full["review_state_mismatch"] = keep
-        if full.get("release_status_mismatch"):
-            # a release claim is read as of the post's day: "not yet published"
-            # is true before a later publication
-            keep = []
-            for x in full["release_status_mismatch"]:
-                mod, _, ver = x.get("version", "").rpartition("/")
-                repo_ = x.get("repo") or (row or {}).get("repo") or _slug(views[0])
-                pday = pub_dates.get((repo_, mod, version_key(ver)))
-                claims = {y.get("claim") for y in x.get("stated") or []}
-                if x.get("view") == "published" and claims == {"not_published"} and pday and \
-                        pday > day:
-                    continue
-                keep.append(x)
-            full["release_status_mismatch"] = keep
+        # every state, review and publication claim against the record as of
+        # the post's day (one projection, not the window's end)
+        full.update(state_claims(views, issue, as_of=day))
         for snt in _sentences(_URL_RE.sub(" ", plain)):
             if not re.search(r"\bcommunity\b", snt, re.I):
                 continue
