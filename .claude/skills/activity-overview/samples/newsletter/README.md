@@ -78,6 +78,14 @@ notice quoted, the twelve deprecation notices said once as one text, six propose
 what each is, for whom the coding agent opened each PR, and Jared Holgate's 44 merged pull
 requests broken down by theme.
 
+**How the work connects (store recomputed with the relation layer).** The issue gained a
+`### How the work connects` part at the end of the Stories section (the chain #7529 → #7374 →
+#7553, the stacked work carried over, closed work that landed elsewhere, follow-ups and a cause,
+links outside the repository), the dependency of #7374 on #7553 in the #6001 story, follow-ups
+named where the change is told (#7457 → #7455, #7506 → #7505), and the closing words of seven
+pipeline PRs and #7510, which the record now holds ("Superseded by …", "Consolidated into …").
+Every such sentence is checked against the relation layer (`relations_not_in_view`).
+
 The store, the view (105 MB), the work package and the slices are not kept here. All numbers
 come from that one October store; no month-over-month comparison is made. The "New modules"
 section is omitted with its reason, because no module was new in October 2026.

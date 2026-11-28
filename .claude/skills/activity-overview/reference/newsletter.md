@@ -159,6 +159,22 @@ is acknowledged with `<!-- story pending: <key> — <reason> -->`; a theme narra
 written with `<!-- theme pending: <theme id> — <reason> -->` (both listed as pending; anything
 neither written nor pending fails the check).
 
+**How the work connects.** From the view's relation layer (`story_graph`,
+`stories.all[].relations`; BUNDLE.md "How stories depend on each other"), every story row carries
+`relations`: its links to other stories that are not a bare mention (`blocked_by`, `depends_on`,
+`stacked_on`, `follow_up_of`, `caused_by`, `content_landed_in` and their inverses), each with the
+record's quote and item, and the other story's title, group, state and link (`in_issue: false`
+for a train the issue does not tell), or, for another repository, the external item with no
+state. A module story adds `waited_on_plumbing` (the plumbing it waited on); a plumbing theme
+adds `needed_by` (module stories that waited on its work) and `caused` — where "what was
+engineered" meets "why". The Stories section ends with a `### How the work connects` part from
+`connections`: the chains of waiting stories, the items most stories wait on
+(`most_blocking`), external targets, and the counts per relation. Write it in a few bullets:
+what waits on what and whether it still does, closed work that landed elsewhere, follow-ups and
+causes, and links outside the repository (named with their link, no state). The relation layer
+holds edges BETWEEN stories only; a dependency between two items of one story is in its slice
+text and is stated only with the slice's quote.
+
 **Writing many stories in parallel.** A month can hold dozens of `full` stories.
 
 ```bash
@@ -381,6 +397,7 @@ It fails (exit 1) and lists:
 | `release_status_missing` | in New modules, What changed and People: a sentence that names a PR or module and says landed / merged / shipped, with no release status ("released as", "published", "not yet published", "declared in the changelog", "no version change", "release status not known") in it or the next sentence |
 | `ownership_not_in_view` | a module named in the Module ownership section that `module_ownership` does not hold (events, without an owner now or at the start, deprecated, stub, labelled) |
 | `superseded_not_in_view` | a sentence saying "superseded" or "replaced by" about a PR closed without merging whose record holds no `superseded_by` (work that landed elsewhere, `content_landed_in`, is said with its basis instead) |
+| `relations_not_in_view` | a sentence saying a story is blocked by / waits on / depends on / is built on (stacked on) / follows up on / was caused by another item, or the inverse wording (blocks, needed by, followed by), that matches no edge of that kind in `story_graph` between the stories of the items it names (the subject: an item named before the cue, else the story block the sentence is in); a bare mention never counts; a present-tense "waits on" / "is blocked by" / "depends on" whose blocker is no longer open at the window's end; a relation between two items of the same story without the record's quote in the sentence. Quoted text is the author's words and is not read |
 | `heading_missing` (theme check only) | a theme narrative whose first line is not `### <title_hint>` of its theme |
 | `review_state_mismatch` / `pr_state_mismatch` / `release_status_mismatch` | **one state per fact**, over the whole issue including story blocks (quoted text and comments blanked): a sentence that names exactly one PR and states its review state ("approved", "approved before …", "changes requested", "waiting for a first review", "reviewed only by automation", "ready to merge") that the PR's `review_state` does not hold, or that another section's sentence about the same PR contradicts; the same for a PR's open / merged / closed-without-merging state, and for a module version said to be published or not yet published against its release status. A conditional sentence ("once", "if", "until"), or one counting many PRs ("10 were closed without merging and one, #N, is open"), states nothing about one PR |
 | `automation_as_person` | an automation account written as "Name (@login)", or mentioned in a sentence without the marker word "automation" |

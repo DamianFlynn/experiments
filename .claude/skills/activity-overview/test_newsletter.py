@@ -2953,6 +2953,30 @@ class TestStoryRelations(unittest.TestCase):
                   "its author wrote \"which is blocking #30\".\n")
         self.assertEqual(newsletter.relation_claims([v], quoted)["relations_not_in_view"], [])
 
+    def test_the_story_check_accepts_an_in_story_dependency_with_its_quote(self):
+        v = self.v()
+        v["issues"][0]["body"] = "This is blocking #10 until fixed."
+        v["prs"][0]["body"] = "Fixes #5."
+        slice_ = {"train": {"id": "train-issue-5", "outcome": "shipped", "evidence": []},
+                  "conversation": {"timeline": [{"kind": "opened", "url": R + "/issues/5",
+                                                 "text": "This is blocking #10 until fixed."}],
+                                   "outcome": {"items": []}}}
+        text = GOOD.replace("Landed. Something happened.",
+                            "Landed. Something happened: [#5](" + R + "/issues/5) said \"This is "
+                            "blocking #10 until fixed.\"")
+        text = text.replace("**What landed.** It landed.",
+                            "Issue [#5](" + R + "/issues/5) is blocking [#10](" + R + "/pull/10), "
+                            "in its own words \"This is blocking #10 until fixed.\"\n\n"
+                            "**What landed.** It landed.")
+        r = newsletter.check_newsletter([v], text, slices={"train-issue-5": slice_})
+        self.assertEqual(r["relations_not_in_view"], [])
+        # the story check finds the quote in the slice (its other rules are link.py's)
+        self.assertNotIn("quotes_not_in_slice", r["stories"]["train-issue-5"])
+        bare = text.replace(", in its own words \"This is blocking #10 until fixed.\"", ".")
+        r = newsletter.check_newsletter([v], bare, slices={"train-issue-5": slice_})
+        self.assertEqual(r["relations_not_in_view"][0]["problem"],
+                         "inside one story without a quote")
+
     def test_the_issue_and_post_checks_fail_an_unsupported_relation(self):
         v = self.v()
         text = GOOD.replace("A pipeline action was bumped in [#12](https://github.com/o/r/pull/12).",
