@@ -410,6 +410,12 @@ def load_streams(path):
         st["stale_hours"] = _int(s.get("stale_after_hours"),
                                  "{}: stale_after_hours".format(what), 1,
                                  cfg["stale_hours"])
+        if "token" in s:
+            # read only at the top level: here it would be silently ignored
+            # and the default store used instead
+            raise ConfigError("{}: 'token' is a top-level setting of the streams file "
+                              "(one token for every stream); move it out of the "
+                              "stream".format(what))
         cfg["streams"].append(st)
     return cfg
 
@@ -1488,15 +1494,24 @@ def token_settings(cfg, args=None):
     store = getattr(args, "store", None) or t.get("store", "auto")
     if store == "auto":
         store = "keychain" if sys.platform == "darwin" else "env-file"
+    # Every path comes back absolute, so the runner, `token renew` and the
+    # wrappers (`token where`) name the same file whatever their working
+    # directory: a streams-file path relative to the workspace, like the
+    # file's other paths; a --env-file given on the command line relative to
+    # the current directory.
+    workspace = cfg.get("workspace") or os.getcwd()
+    if getattr(args, "env_file", None):
+        env_file = os.path.abspath(os.path.expanduser(args.env_file))
+    else:
+        env_file = _resolve(workspace, t.get("env_file") or DEFAULT_ENV_FILE)
     return {"store": store,
-            "env_file": os.path.expanduser(getattr(args, "env_file", None)
-                                           or t.get("env_file") or DEFAULT_ENV_FILE),
+            "env_file": env_file,
             "keychain_service": t.get("keychain_service") or DEFAULT_KEYCHAIN_SERVICE,
             "account": os.environ.get("USER") or os.environ.get("LOGNAME") or "user",
             # the app route (store "app"): ids and where the key is, never the key
             "app_id": t.get("app_id"), "client_id": t.get("client_id"),
             "installation_id": t.get("installation_id"),
-            "private_key_file": os.path.expanduser(t["private_key_file"])
+            "private_key_file": _resolve(workspace, t["private_key_file"])
             if t.get("private_key_file") else None,
             "private_key_keychain_service": t.get("private_key_keychain_service"),
             "workspace": cfg.get("workspace")}

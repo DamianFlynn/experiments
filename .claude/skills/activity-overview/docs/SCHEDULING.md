@@ -70,6 +70,7 @@ directory; every other path is relative to the workspace. `~` is expanded.
 | `retention.log_days` | int ≥ 1 | `60` | run logs older than this are deleted |
 | `retention.store_months` | int ≥ 1 or `null` | `null` | keep only the newest N month stores (`null`: keep all) |
 | `env` | object | `{}` | env for every gather: `ACTIVITY_*` knobs (REFERENCE.md) and `TF_PLUGIN_CACHE_DIR` (made workspace-relative, created); never a credential |
+| `token` | object | `{}` | where the token comes from; ids and paths only, never a token or key. `store`: `app` (§7.1), or for a personal token `auto` (keychain on macOS, env file elsewhere), `keychain`, `env-file` (§7.2). App route: `client_id` (or `app_id`), optional `installation_id`, `private_key_file` (a mode-600 PEM outside the workspace; a relative path is relative to the workspace) and/or `private_key_keychain_service`. Personal token: `env_file` (default `~/.config/activity-overview/token.env`; a relative path is relative to the workspace, like the file's other paths), `keychain_service` (default `activity-gh-token`). Both: `probe_repo` (`owner/repo` read to prove a token; default the first enabled single-repository stream). Top level only: a `token` key inside a stream is refused |
 | `streams[]` | list | **required** | one entry per newsletter stream |
 
 Per stream:
@@ -88,8 +89,6 @@ Per stream:
 | `env` | object | `{}` | per-stream env overrides (caps), same rules as the global `env` |
 | `stale_after_hours` | int | global | per-stream staleness threshold |
 | `enabled` | bool | `true` | a disabled stream is skipped unless named with `--stream` |
-
-| `token` | object | `{}` | where the token comes from; ids and paths only, never a token or key. `store`: `app` (§7.1), or for a personal token `auto` (keychain on macOS, env file elsewhere), `keychain`, `env-file` (§7.2). App route: `client_id` (or `app_id`), optional `installation_id`, `private_key_file` (a mode-600 PEM outside the workspace) and/or `private_key_keychain_service`. Personal token: `env_file` (default `~/.config/activity-overview/token.env`), `keychain_service` (default `activity-gh-token`). Both: `probe_repo` (`owner/repo` read to prove a token; default the first enabled single-repository stream) |
 
 [`examples/streams.json`](../examples/streams.json) is the owner's list, all enabled:
 
@@ -717,10 +716,14 @@ macOS specifics:
 ## 11. Linux (cron)
 
 Copy [`examples/cron/activity-gather.sh`](../examples/cron/activity-gather.sh) to
-`$W/bin/` (fill `__SKILL_DIR__` / `__WORKSPACE__` as above), set up the token (the app
-route of §7.1 works the same on Linux: the key file and `token app-check`; or the personal
-token in the mode-600 env file with `python3 $AO/schedule.py token renew --streams
-$W/streams.json`, the env file being the default off macOS; §7.2), and add the line from
+`$W/bin/` (fill `__SKILL_DIR__` / `__WORKSPACE__` as above) and set up the token. The copied
+example selects the app route (`"store": "app"`), which works the same on Linux: the key
+file and `token app-check` (§7.1). For the personal-token fallback instead, **first** set
+`"store": "env-file"` in the streams file's token block. `token renew` refuses while the
+store is `app`, and a `--store env-file` on the command line alone would leave the wrapper,
+which follows the streams file, on the app route. Then run
+`python3 $AO/schedule.py token renew --streams $W/streams.json`, which writes the mode-600
+env file `token.env_file` (§7.2). Then add the line from
 [`examples/cron/crontab.txt`](../examples/cron/crontab.txt) with `crontab -e` (absolute
 paths). On a machine without a browser, `token renew` prints the page's address to open
 elsewhere. The runner is the same file on both systems; cron's time is local, the plan is

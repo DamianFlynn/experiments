@@ -48,6 +48,9 @@ case "$KIND" in
   app) ;;
   env-file)
     TOKEN_FILE="$(where env-file)"
+    # `where` prints an absolute path; a relative one is made explicit anyway,
+    # because `.` searches PATH for a name without a slash
+    case "$TOKEN_FILE" in /*) ;; *) TOKEN_FILE="./$TOKEN_FILE" ;; esac
     if [ "$(stat -c %a "$TOKEN_FILE" 2>/dev/null || stat -f %Lp "$TOKEN_FILE" 2>/dev/null)" != "600" ]; then
       echo "activity-gather: $TOKEN_FILE is missing or not mode 600 (schedule.py token renew writes it)" >&2
       exit 2

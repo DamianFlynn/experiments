@@ -74,6 +74,9 @@ case "$KIND" in
     export GITHUB_TOKEN ;;
   env-file)
     TOKEN_FILE="$(where env-file)"
+    # `where` prints an absolute path; a relative one is made explicit anyway,
+    # because `.` searches PATH for a name without a slash
+    case "$TOKEN_FILE" in /*) ;; *) TOKEN_FILE="./$TOKEN_FILE" ;; esac
     # GNU stat first: BSD `stat -f` means something else there and succeeds
     if [ "$(stat -c %a "$TOKEN_FILE" 2>/dev/null || stat -f %Lp "$TOKEN_FILE" 2>/dev/null)" != "600" ]; then
       echo "activity-gather: $TOKEN_FILE is missing or not mode 600" >&2

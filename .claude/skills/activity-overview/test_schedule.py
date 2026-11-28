@@ -2154,6 +2154,32 @@ class TestTokenWhere(Case):
         self.assertEqual(self.where(path, "account"),
                          schedule.token_settings(cfg)["account"])
 
+    def test_relative_paths_are_resolved_once(self):
+        path = streams_file(self.tmp, token={"store": "env-file", "env_file": "token.env",
+                                             "private_key_file": "../keys/app.pem"})
+        cfg = schedule.load_streams(path)
+        s = schedule.token_settings(cfg)
+        self.assertEqual(s["env_file"], os.path.join(self.ws, "token.env"))
+        self.assertEqual(s["private_key_file"], os.path.join(self.tmp, "keys", "app.pem"))
+        self.assertEqual(self.where(path, "env-file"), os.path.join(self.ws, "token.env"))
+        old = os.getcwd()
+        os.chdir(self.tmp)
+        self.addCleanup(os.chdir, old)
+        args = mock.Mock(store=None, env_file="cli.env")
+        self.assertEqual(schedule.token_settings(cfg, args)["env_file"],
+                         os.path.join(self.tmp, "cli.env"))
+
+    def test_a_token_block_inside_a_stream_is_refused(self):
+        """Review (low): `token` is read only at the top level; inside a stream
+        it was silently ignored and the default store used."""
+        path = streams_file(self.tmp, [{"id": "demo", "kind": "repo", "owner": "o",
+                                        "repo": "r", "token": {"store": "env-file"}}])
+        code, _out, err = self.run_cli(["check", "--streams", path])
+        self.assertEqual(code, 2)
+        self.assertIn("'token' is a top-level setting", err)
+        code, _out, err = self.run_cli(["run", "--streams", path, "--dry-run"])
+        self.assertEqual(code, 2)
+
     def test_renewing_somewhere_the_wrappers_do_not_read_is_flagged(self):
         env_file = os.path.join(self.tmp, "cfg", "token.env")
         path = streams_file(self.tmp, token={"store": "env-file", "env_file": env_file})
@@ -2212,7 +2238,7 @@ class TestWrappersFollowTheSettings(Case):
             fh.write(text)
         return script
 
-    def run_wrapper(self, script, extra_path=None):
+    def run_wrapper(self, script, extra_path=None, first_path=None, cwd=None):
         seen = os.path.join(self.tmp, "seen")
         env = {k: v for k, v in os.environ.items()
                if k not in ("GITHUB_TOKEN", "GH_TOKEN")}
@@ -2220,7 +2246,12 @@ class TestWrappersFollowTheSettings(Case):
                    USER=env.get("USER") or "tester")
         if extra_path:
             env["PATH"] = env.get("PATH", "") + os.pathsep + extra_path
-        proc = subprocess.run(["sh", script], env=env, capture_output=True, text=True)
+        if first_path:
+            env["PATH"] = first_path + os.pathsep + env.get("PATH", "")
+        if os.path.exists(seen):
+            os.remove(seen)
+        proc = subprocess.run(["sh", script], env=env, capture_output=True, text=True,
+                              cwd=cwd or self.tmp)
         got = None
         if os.path.exists(seen):
             with open(seen) as fh:
@@ -2269,6 +2300,30 @@ class TestWrappersFollowTheSettings(Case):
                 proc, got = self.run_wrapper(script)
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertEqual(got, "<none>")
+
+    def test_a_bare_env_file_name_is_the_checked_file_not_one_on_path(self):
+        """Review (medium): `token.env` passed the mode check in one place
+        while POSIX `.` searched PATH for it. The streams file's relative
+        path now means the workspace's file, and the wrapper reads exactly
+        the file it checked, wherever it runs and whatever is on PATH."""
+        decoy_dir = os.path.join(self.tmp, "decoy")
+        os.makedirs(decoy_dir)
+        with open(os.path.join(decoy_dir, "token.env"), "w") as fh:
+            fh.write("GITHUB_TOKEN=decoyvalue000000000\n")
+        os.chmod(os.path.join(decoy_dir, "token.env"), 0o600)
+        for which in ("cron", "launchd"):
+            for cwd in ("tmp", "workspace"):
+                with self.subTest(wrapper=which, cwd=cwd):
+                    shutil.rmtree(self.ws, ignore_errors=True)
+                    shutil.rmtree(os.path.join(self.tmp, "skill"), ignore_errors=True)
+                    script = self.wrapper(which, {"store": "env-file",
+                                                  "env_file": "token.env"})
+                    schedule.write_env_file(os.path.join(self.ws, "token.env"), self.VALUE)
+                    proc, got = self.run_wrapper(
+                        script, first_path=decoy_dir,
+                        cwd=self.tmp if cwd == "tmp" else self.ws)
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertEqual(got, self.VALUE)
 
     def test_a_missing_env_file_stops_with_its_name(self):
         missing = os.path.join(self.tmp, "nowhere", "gh.env")
