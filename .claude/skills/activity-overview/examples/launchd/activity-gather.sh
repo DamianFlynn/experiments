@@ -79,7 +79,13 @@ case "$KIND" in
     fi
     export GITHUB_TOKEN ;;
   env-file)
-    TOKEN_FILE="$(where env-file)"
+    # `where env-file` also checks the file's folder: it refuses (and names
+    # the fix) when the folder is writable by group or others
+    if ! TOKEN_FILE="$(where env-file)"; then
+      echo "activity-gather: the token file's folder is not safe (see the message above)" >&2
+      notify "The token file's folder is writable by others: see the job's log"
+      exit 2
+    fi
     # `where` prints an absolute path; a relative one is made explicit anyway,
     # because `.` searches PATH for a name without a slash
     case "$TOKEN_FILE" in /*) ;; *) TOKEN_FILE="./$TOKEN_FILE" ;; esac

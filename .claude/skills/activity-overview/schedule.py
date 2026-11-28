@@ -1524,12 +1524,108 @@ def run_security(argv, stdin_text=None):
     return proc.returncode, proc.stdout
 
 
-def write_env_file(path, token):
-    """Replace the env file atomically: a new mode-600 file in the same
-    directory (mode 700), fsynced, renamed over the old one."""
-    d = os.path.dirname(path)
-    if d:                      # a bare file name lives in the current directory
-        os.makedirs(d, mode=0o700, exist_ok=True)
+# --- the folder that holds a secret --------------------------------------------------
+#
+# The rule (token env file, app private key):
+#   * group- or other-WRITABLE folder: refused, on every path. Whoever can
+#     write the folder can replace or rename the file whatever its own mode
+#     (a planted token, or a planted key the runner would sign with).
+#   * group- or other-READABLE (not writable) folder: on a write path
+#     (`token renew`, `token app-key`) the folder is tightened to 700 when it
+#     is the user's own and not a shared location, and the output says so;
+#     otherwise, and on every read path, a warning: the file's own mode 600
+#     keeps its content private, the folder only exposes its names.
+#   * never chmod a folder the user does not own, or a shared location (the
+#     home directory, /, the temporary directories, the workspace): a
+#     writable one is refused, a readable one warned about, with the fix.
+
+
+class SecretDirError(ValueError):
+    """The folder holding a secret is unsafe; the message names the fix."""
+
+
+def _shared_locations(workspace=None):
+    import tempfile
+    places = {os.path.expanduser("~"), os.sep, "/tmp", "/var/tmp", tempfile.gettempdir()}
+    if workspace:
+        places.add(workspace)
+    return {os.path.realpath(p) for p in places}
+
+
+def _dir_of(path):
+    return os.path.dirname(os.path.abspath(path))
+
+
+def check_secret_dir(directory, workspace=None, what="the token"):
+    """Read paths: raise SecretDirError when `directory` is group- or
+    other-writable; return a warning (or None) when it is only group- or
+    other-readable."""
+    try:
+        st = os.stat(directory)
+    except OSError:
+        return None                      # a missing folder: the file check says so
+    mode = st.st_mode & 0o777
+    if mode & 0o022:
+        raise SecretDirError(
+            "{} is in {}, which is writable by group or others (mode {:o}): anyone who "
+            "can write the folder can replace the file. Fix: `chmod 700 {}` if it is "
+            "your own private folder, or move the file to one such as "
+            "~/.config/activity-overview (mode 700)".format(what, directory, mode,
+                                                             directory))
+    if mode & 0o055:
+        return ("{}'s folder {} is readable by group or others (mode {:o}); the file "
+                "itself is private, but `chmod 700 {}` (or a private folder) hides its "
+                "name too".format(what, directory, mode, directory))
+    return None
+
+
+def secure_secret_dir(directory, workspace=None, what="the token"):
+    """Write paths: create `directory` (700) if missing; tighten an existing
+    group/other-readable folder of the user's own to 700 unless it is a shared
+    location. Returns the notes to print; raises SecretDirError for a folder
+    that stays group/other-writable."""
+    if not os.path.isdir(directory):
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        os.chmod(directory, 0o700)       # makedirs' mode is filtered by the umask
+        return []
+    st = os.stat(directory)
+    mode = st.st_mode & 0o777
+    if not mode & 0o077:
+        return []
+    real = os.path.realpath(directory)
+    shared = real in _shared_locations(workspace)
+    mine = st.st_uid == os.getuid() if hasattr(os, "getuid") else False
+    if mine and not shared:
+        os.chmod(directory, 0o700)
+        return ["tightened {} from mode {:o} to 700 (it holds {})".format(
+            directory, mode, what)]
+    why = ("a shared location" if shared else "not your own folder")
+    if mode & 0o022:
+        raise SecretDirError(
+            "{} would go in {}, which is writable by group or others (mode {:o}) and is "
+            "{}, so its mode is not changed: put the file in a private folder such as "
+            "~/.config/activity-overview".format(what, directory, mode, why))
+    return ["{}'s folder {} is readable by group or others (mode {:o}) and is {}, so "
+            "its mode is not changed; a private folder such as ~/.config/activity-overview "
+            "would hide the file's name too".format(what, directory, mode, why)]
+
+
+_warned_dirs = set()
+
+
+def warn_once(message, key):
+    if key not in _warned_dirs:
+        _warned_dirs.add(key)
+        sys.stderr.write("warning: {}\n".format(message))
+
+
+def write_env_file(path, token, workspace=None):
+    """Replace the env file atomically: a new mode-600 file, fsynced, renamed
+    over the old one, in a folder made private first (secure_secret_dir: a
+    new folder is created 700; an existing group/other-readable one of the
+    user's own is tightened to 700; a group/other-writable one that cannot be
+    is refused before anything is written). Returns the notes to print."""
+    notes = secure_secret_dir(_dir_of(path), workspace, "the token")
     tmp = "{}.tmp-{}".format(path, os.getpid())
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
@@ -1545,6 +1641,7 @@ def write_env_file(path, token):
         except FileNotFoundError:
             pass
         raise
+    return notes
 
 
 def store_token(settings, token, security=run_security):
@@ -1553,10 +1650,10 @@ def store_token(settings, token, security=run_security):
     a pipe, never into an argv or a process listing; it is then read back and
     compared."""
     if settings["store"] == "env-file":
-        write_env_file(settings["env_file"], token)
-        return
+        return write_env_file(settings["env_file"], token, settings.get("workspace"))
     keychain_write_checked(settings["account"], settings["keychain_service"], token,
                            security)
+    return []
 
 
 class KeychainWriteError(RuntimeError):
@@ -1794,6 +1891,13 @@ def load_app_key(settings, security=run_security, isdir=os.path.isdir):
         if reasons:
             raise AuthError("the app's private key file {} looks synced ({}); keep it "
                             "on a local, non-synced disk".format(path, "; ".join(reasons)))
+        try:
+            warn = check_secret_dir(_dir_of(path), settings.get("workspace"),
+                                    "the app's private key")
+        except SecretDirError as exc:
+            raise AuthError(str(exc))
+        if warn:
+            warn_once(warn, ("key-dir", _dir_of(path)))
         try:
             with open(path, "rb") as fh:
                 head = fh.read(64)
@@ -2038,8 +2142,18 @@ def app_key_import(settings, path, security=run_security):
         sys.stderr.write("schedule.py: error: set token.private_key_keychain_service in "
                          "the streams file first\n")
         return EXIT_USAGE
+    path = os.path.expanduser(path)
+    # the key's folder is made private first (a write path, like `token renew`)
     try:
-        with open(os.path.expanduser(path), "rb") as fh:
+        notes = secure_secret_dir(_dir_of(path), settings.get("workspace"),
+                                  "the app's private key")
+    except SecretDirError as exc:
+        sys.stderr.write("token app-key: {}\n".format(exc))
+        return EXIT_FAILED
+    for note in notes:
+        sys.stderr.write("token app-key: {}\n".format(note))
+    try:
+        with open(path, "rb") as fh:
             pem = fh.read()
     except OSError as exc:
         sys.stderr.write("token app-key: cannot read {}: {}\n".format(path, exc.strerror))
@@ -2077,6 +2191,15 @@ def cmd_token(cfg, args, http_get=None, prompt=None, open_browser=None,
         # the wrappers' one source for where the token is: the same settings
         # `token renew` writes to (never the token itself)
         where = token_settings(cfg)
+        if args.field == "env-file" and where["store"] == "env-file":
+            # the wrappers read the file right after this: its folder first
+            try:
+                warn = check_secret_dir(_dir_of(where["env_file"]), where["workspace"])
+            except SecretDirError as exc:
+                sys.stderr.write("schedule.py: error: {}\n".format(exc))
+                return EXIT_FAILED
+            if warn:
+                sys.stderr.write("warning: {}\n".format(warn))
         out("{}\n".format(where[WHERE_FIELDS[args.field]]))
         return EXIT_OK
     if args.token_cmd in ("app-check", "app-key") or (
@@ -2102,6 +2225,15 @@ def cmd_token(cfg, args, http_get=None, prompt=None, open_browser=None,
                          "token.store to match (docs/SCHEDULING.md 7.2)\n")
         return EXIT_USAGE
     if args.token_cmd == "status":
+        if settings["store"] == "env-file":
+            try:
+                warn = check_secret_dir(_dir_of(settings["env_file"]),
+                                        settings["workspace"])
+            except SecretDirError as exc:
+                out("token: REFUSED: {}\n".format(exc))
+                return EXIT_FAILED
+            if warn:
+                out("WARNING: {}\n".format(warn))
         token = read_stored_token(settings, security)
         if not token:
             out("no stored token ({})\n".format(
@@ -2153,18 +2285,21 @@ def cmd_token(cfg, args, http_get=None, prompt=None, open_browser=None,
         sys.stderr.write("token renew: warning: it lives {} days; organisations "
                          "with an 8-day limit will refuse it\n".format(info["days_left"]))
     try:
-        store_token(settings, token, security)
+        notes = store_token(settings, token, security)
     except KeychainWriteError as exc:
         # say what the item holds now, never more than was checked
         sys.stderr.write("token renew: storing failed: {}\n".format(
             redact(str(exc), [token])))
         return EXIT_FAILED
-    except (OSError, RuntimeError, ConfigError) as exc:
+    except (OSError, RuntimeError, ConfigError, SecretDirError) as exc:
         # the env file is replaced by one rename at the very end, and a
-        # ConfigError stops before any write: the old token is untouched
+        # ConfigError / SecretDirError stops before any write: the old token
+        # is untouched
         sys.stderr.write("token renew: storing failed: {}; the old token stays in "
                          "place\n".format(redact(str(exc), [token])))
         return EXIT_FAILED
+    for note in notes or []:
+        sys.stderr.write("token renew: {}\n".format(note))
     sys.stderr.write("token renew: stored in {}\n".format(
         settings["env_file"] if settings["store"] == "env-file"
         else "the keychain item " + settings["keychain_service"]))

@@ -299,6 +299,27 @@ history (and, for an external program, in the process list), whatever the mode o
 file it is then written to. Every way of entering one below reads a file or prompts; a test
 scans the docs and examples so a secret-on-the-command-line instruction cannot come back.
 
+**The folder that holds a secret** (the token env file, the app's private key file). The
+file's own mode 600 keeps its content private, but whoever can **write** its folder can
+replace or rename the file. So:
+
+- **Group- or other-writable folder: refused, on every path.** That covers writing
+  (`token renew`, `token app-key`) and reading: the runner and `token status` /
+  `token app-check` through the key, and the wrappers through `token where --field env-file`.
+  The message names the folder, its mode and the fix (`chmod 700 <folder>`, or a private
+  folder such as `~/.config/activity-overview`). A planted token or key is worse than no
+  run.
+- **Group- or other-readable (not writable) folder:**
+  - On a write path, the folder is tightened to 700 when it is your own and not a shared
+    location, and the output says `tightened <folder> from mode 755 to 700`.
+  - Otherwise, and on every read path, there is a warning only: the content stays private,
+    and the folder exposes just the file's name.
+- **Never chmod-ed:** a folder you do not own, or a shared location (your home directory,
+  `/`, the temporary directories, the workspace). A writable one is refused, a readable one
+  warned about, each with the fix.
+
+Read paths never change a mode; only the two write commands do, and they say so.
+
 ### 7.1 The app route
 
 **How it works.** For each gather (each stream and window, and each `--resume` pass), the
@@ -557,8 +578,13 @@ python3 $AO/schedule.py token renew --streams $W/streams.json --kick
    It never claims the old token is still there unless that was read back. `token app-key`
    writes the app's key the same way. The env file is written as a new mode-600 file in its
    directory, fsynced and renamed over the old one: until that rename, the old file is
-   untouched. A missing directory is created mode 700; an existing one keeps its mode
-   (neither `token renew` nor the wrappers check or tighten it), so `chmod 700` it as above.
+   untouched. Its directory is made private first, by the rule in §7 ("The folder that
+   holds a secret"):
+   - a missing directory is created mode 700;
+   - an existing one of your own that group or others can read is tightened to 700, and
+     `token renew` says so;
+   - a group- or other-writable directory that cannot be tightened (a shared location, or
+     not yours) is refused before anything is written, and the old token stays.
 5. `--kick` then starts a run: on macOS `launchctl kickstart gui/<uid>/local.activity-overview.gather`
    (the scheduled job, which reads the new token where the streams file says). If
    `launchctl` exits non-zero, `token renew` says the job was **not** started (e.g. it is not

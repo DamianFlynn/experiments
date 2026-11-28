@@ -2325,6 +2325,22 @@ class TestWrappersFollowTheSettings(Case):
                     self.assertEqual(proc.returncode, 0, proc.stderr)
                     self.assertEqual(got, self.VALUE)
 
+    def test_a_writable_token_folder_stops_both_wrappers(self):
+        folder = os.path.join(self.tmp, "loose")
+        target = os.path.join(folder, "gh.env")
+        schedule.write_env_file(target, self.VALUE)
+        os.chmod(folder, 0o777)
+        self.addCleanup(os.chmod, folder, 0o700)
+        for which in ("cron", "launchd"):
+            with self.subTest(wrapper=which):
+                shutil.rmtree(self.ws, ignore_errors=True)
+                shutil.rmtree(os.path.join(self.tmp, "skill"), ignore_errors=True)
+                script = self.wrapper(which, {"store": "env-file", "env_file": target})
+                proc, got = self.run_wrapper(script)
+                self.assertEqual(proc.returncode, 2, proc.stderr)
+                self.assertIn("chmod 700 " + folder, proc.stderr)
+                self.assertIsNone(got)                   # nothing sourced, nothing run
+
     def test_a_missing_env_file_stops_with_its_name(self):
         missing = os.path.join(self.tmp, "nowhere", "gh.env")
         script = self.wrapper("cron", {"store": "env-file", "env_file": missing})
@@ -2332,6 +2348,178 @@ class TestWrappersFollowTheSettings(Case):
         self.assertEqual(proc.returncode, 2)
         self.assertIn(missing, proc.stderr)
         self.assertIsNone(got)
+
+
+class TestSecretFolders(AppCase):
+    """The folder holding the token file or the app key: tightened on write
+    when it is the user's own private folder, refused on every path when
+    group/other-writable, warned about when only group/other-readable, and
+    never chmod-ed when shared or not the user's."""
+
+    def folder(self, name, mode):
+        d = os.path.join(self.tmp, name)
+        os.makedirs(d, exist_ok=True)
+        os.chmod(d, mode)
+        return d
+
+    def mode(self, d):
+        return os.stat(d).st_mode & 0o777
+
+    def renew(self, env_file, **token):
+        path = streams_file(self.tmp, token=dict({"store": "env-file",
+                                                  "env_file": env_file}, **token))
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = schedule.main(["token", "renew", "--streams", path, "--no-browser"],
+                                 http_get=FakeAPI(), prompt=lambda t: NEW_TOKEN,
+                                 now=FakeClock().now)
+        return code, err.getvalue()
+
+    # --- write paths --------------------------------------------------------
+
+    def test_a_new_folder_is_created_private(self):
+        old = os.umask(0o022)
+        self.addCleanup(os.umask, old)
+        target = os.path.join(self.tmp, "new", "token.env")
+        self.assertEqual(schedule.write_env_file(target, NEW_TOKEN), [])
+        self.assertEqual(self.mode(os.path.dirname(target)), 0o700)
+
+    def test_an_own_loose_folder_is_tightened_and_said(self):
+        for start in (0o755, 0o750, 0o775, 0o777):
+            with self.subTest(mode=oct(start)):
+                d = self.folder("cfg", start)
+                code, err = self.renew(os.path.join(d, "token.env"))
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.mode(d), 0o700)
+                self.assertIn("tightened {} from mode {:o} to 700".format(d, start), err)
+
+    def test_a_private_folder_is_left_alone_quietly(self):
+        d = self.folder("cfg", 0o700)
+        code, err = self.renew(os.path.join(d, "token.env"))
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("tightened", err)
+
+    def test_a_shared_folder_is_never_chmodded(self):
+        # the workspace: readable -> warned and written; writable -> refused
+        os.makedirs(self.ws)
+        os.chmod(self.ws, 0o755)
+        code, err = self.renew("token.env")                 # relative: the workspace
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.mode(self.ws), 0o755)
+        self.assertIn("is a shared location, so its mode is not changed", err)
+        os.chmod(self.ws, 0o777)
+        self.addCleanup(os.chmod, self.ws, 0o755)
+        with open(os.path.join(self.ws, "token.env"), encoding="utf-8") as fh:
+            before = fh.read()
+        code, err = self.renew("token.env")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.mode(self.ws), 0o777)
+        self.assertIn("writable by group or others (mode 777)", err)
+        self.assertIn("old token stays in place", err)
+        with open(os.path.join(self.ws, "token.env"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), before)
+
+    def test_the_home_folder_and_temp_dirs_count_as_shared(self):
+        home = self.folder("home", 0o755)
+        with mock.patch.dict(os.environ, {"HOME": home}):
+            notes = schedule.secure_secret_dir(home)
+            self.assertEqual(self.mode(home), 0o755)
+            self.assertIn("shared location", notes[0])
+            import tempfile
+            shared = schedule._shared_locations()
+            self.assertIn(os.path.realpath(tempfile.gettempdir()), shared)
+            self.assertIn(os.path.realpath("/tmp"), shared)
+
+    def test_a_folder_that_is_not_ours_is_never_chmodded(self):
+        readable = self.folder("theirs", 0o755)
+        writable = self.folder("theirs-w", 0o777)
+        with mock.patch.object(schedule.os, "getuid", lambda: os.stat(readable).st_uid + 1):
+            notes = schedule.secure_secret_dir(readable)
+            self.assertIn("not your own folder", notes[0])
+            self.assertEqual(self.mode(readable), 0o755)
+            with self.assertRaises(schedule.SecretDirError) as cm:
+                schedule.secure_secret_dir(writable)
+            self.assertIn("put the file in a private folder", str(cm.exception))
+            self.assertEqual(self.mode(writable), 0o777)
+
+    def test_app_key_import_tightens_the_key_folder(self):
+        d = self.folder("keys2", 0o755)
+        key = os.path.join(d, "app.pem")
+        shutil.copy(self.key, key)
+        os.chmod(key, 0o600)
+        path = self.app_cfg(private_key_keychain_service="app-key")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = schedule.main(["token", "app-key", "--streams", path, "--import", key],
+                                 security=FakeSecurity())
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertEqual(self.mode(d), 0o700)
+        self.assertIn("tightened", err.getvalue())
+
+    # --- read paths -----------------------------------------------------------
+
+    def test_check_secret_dir(self):
+        self.assertIsNone(schedule.check_secret_dir(self.folder("a", 0o700)))
+        self.assertIn("readable by group or others",
+                      schedule.check_secret_dir(self.folder("b", 0o750)))
+        for mode in (0o770, 0o707, 0o777):
+            with self.subTest(mode=oct(mode)):
+                d = self.folder("c", mode)
+                with self.assertRaises(schedule.SecretDirError) as cm:
+                    schedule.check_secret_dir(d)
+                self.assertIn("chmod 700 {}".format(d), str(cm.exception))
+                self.assertEqual(self.mode(d), mode)        # a read never chmods
+
+    def test_the_app_key_folder(self):
+        os.chmod(self.keydir, 0o777)
+        s = {"private_key_file": self.key, "workspace": self.ws}
+        with self.assertRaises(schedule.AuthError) as cm:
+            schedule.load_app_key(s, isdir=lambda p: False)
+        self.assertIn("writable by group or others", str(cm.exception))
+        self.assertIn("chmod 700 " + self.keydir, str(cm.exception))
+        os.chmod(self.keydir, 0o755)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(schedule.load_app_key(s, isdir=lambda p: False),
+                             ("file", self.key))
+        self.assertIn("readable by group or others", err.getvalue())
+        self.assertEqual(self.mode(self.keydir), 0o755)
+        # app-check stops before any call with the folder writable
+        os.chmod(self.keydir, 0o777)
+        api = FakeAppAPI()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = schedule.main(["token", "app-check", "--streams", self.app_cfg()],
+                                 api=api, sign=fake_sign, now=FakeClock().now)
+        self.assertEqual(code, 1)
+        self.assertEqual(api.calls, [])
+        self.assertIn("writable by group or others", out.getvalue())
+
+    def test_token_status_and_where_on_the_env_file(self):
+        d = self.folder("cfg", 0o700)
+        target = os.path.join(d, "token.env")
+        schedule.write_env_file(target, NEW_TOKEN)
+        path = streams_file(self.tmp, token={"store": "env-file", "env_file": target})
+        os.chmod(d, 0o777)
+        code, out, _err = self.run_cli(["token", "status", "--streams", path],
+                                       http_get=FakeAPI())
+        self.assertEqual(code, 1)
+        self.assertIn("REFUSED", out)
+        code, out, err = self.run_cli(["token", "where", "--streams", path,
+                                       "--field", "env-file"])
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("chmod 700 " + d, err)
+        os.chmod(d, 0o755)
+        code, out, _err = self.run_cli(["token", "status", "--streams", path],
+                                       http_get=FakeAPI())
+        self.assertEqual(code, 0)
+        self.assertIn("WARNING: the token's folder {} is readable".format(d), out)
+        code, out, err = self.run_cli(["token", "where", "--streams", path,
+                                       "--field", "env-file"])
+        self.assertEqual((code, out.strip()), (0, target))
+        self.assertIn("readable by group or others", err)
+        self.assertEqual(self.mode(d), 0o755)               # reads never chmod
 
 
 class TestOwnersStreams(unittest.TestCase):
