@@ -1065,6 +1065,7 @@ def connect_stories(views, stories_sec, plumbing_sec, multi=False):
     for th in plumbing_sec.get("themes") or []:
         for k in th.get("stories") or []:
             theme_of[k] = th.get("id")
+    theme_ids = {th.get("id") for v in views for th in v.get("plumbing_themes") or []} - {None}
     view_rows = {}
     for v in views:
         for e in (v.get("stories") or {}).get("all") or []:
@@ -1100,8 +1101,10 @@ def connect_stories(views, stories_sec, plumbing_sec, multi=False):
             row["inner_relations"] = inner_rows
         if rels:
             row["relations"] = rels
+            # a plumbing target: a plumbing kind or theme id, or a plumbing story
             waited = [x for x in rels if x["relation"] in WAITING_RELATIONS
-                      and x.get("other_kind") in PLUMBING_KINDS]
+                      and (x.get("other_kind") in PLUMBING_KINDS or x.get("other_kind") in theme_ids
+                           or (x.get("other") or {}).get("group") == "plumbing")]
             if waited and row.get("group") != "plumbing":
                 row["waited_on_plumbing"] = waited
     # plumbing themes: the module stories they were needed by, or that they caused
@@ -1125,9 +1128,16 @@ def connect_stories(views, stories_sec, plumbing_sec, multi=False):
         if caused:
             th["caused"] = caused
     # the connections part
+    # one graph: a single view's own, or the stream's (link.stream_story_graph)
+    # so a chain or a most-blocking count across members is computed over the
+    # whole stream, not member by member
     chains, most, external, counts, capped = [], [], [], {}, False
-    for v in views:
-        g = v.get("story_graph") or {}
+    if len(views) > 1:
+        graphs = [link.stream_story_graph(
+            [{"repo": _slug(v), "bundle": v} for v in join_members(views)])]
+    else:
+        graphs = [v.get("story_graph") or {} for v in views]
+    for g in graphs:
         capped = capped or bool(g.get("chains_capped"))
         for ch in g.get("chains") or []:
             chains.append([_story_ref(k, rows_by_key, multi, trains) for k in ch])
@@ -3213,6 +3223,7 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence=None
                  "automation_as_person",
                  "review_state_mismatch", "pr_state_mismatch", "release_status_mismatch",
                  "superseded_not_in_view", "relations_not_in_view",
+                 "relation_denials_contradicted",
                  "markers_malformed",
                  "sections_missing",
                  "omitted_section_present", "sections_out_of_order", "title_missing",
@@ -3347,27 +3358,6 @@ def pr_state_on(pr, day):
     return "open"
 
 
-def issue_state_on(issue, day):
-    """An issue's state at the end of `day`, replayed from the record:
-    `not_opened` before `created_at`; then its recorded closed / reopened
-    events through the day; `closing.at` / `closed_at` stand in when no
-    event is recorded. One of not_opened, open, closed; None without it."""
-    if not issue or not issue.get("created_at"):
-        return None
-    if _day(issue["created_at"]) > day:
-        return "not_opened"
-    events = sorted((e for e in issue.get("lifecycle") or [] if isinstance(e, dict)
-                     and e.get("event") in ("closed", "reopened")
-                     and e.get("created_at") and _day(e["created_at"]) <= day),
-                    key=lambda e: e["created_at"])
-    if events:
-        return "closed" if events[-1]["event"] == "closed" else "open"
-    closed = (issue.get("closing") or {}).get("at") or issue.get("closed_at")
-    if closed and _day(closed) <= day and issue.get("state") == "closed":
-        return "closed"
-    return "open"
-
-
 def release_on(view, module, version, day):
     """A module version's release status at the end of `day`: `published`
     when a tag of it is dated on or before the day; `declared_not_published`
@@ -3408,67 +3398,23 @@ def release_on(view, module, version, day):
 
 
 # --- relation claims -----------------------------------------------------------
+#
+# No second parser and no second "does it hold" rule: the claims are read by
+# link.parse_relation_claims and judged by link.relation_holds, the functions
+# the view itself is built with. What stays here is prose scope: which
+# repository a paragraph speaks for, which story a sentence sits in, the day
+# judged, and how a failure is reported.
 
-# (claim, pattern, the edge relations that make it true, inverse wording?).
-# A specific cue needs its specific kind; only the generic "waits on" wording
-# may match several kinds. "built on" / "on top of" are the record's own
-# depends-on cues, and a stack is built on its base.
-_RELATION_CUES = (
-    ("blocked_by", re.compile(r"\bblocked\s+(?:by|on)\b|\bon\s+hold\s+until\b", re.I),
-     {"blocked_by"}, False),
-    ("waits_on", re.compile(r"\b(?:waits?|waiting|waited)\s+(?:on|for)\b", re.I),
-     {"blocked_by", "depends_on", "stacked_on"}, False),
-    ("depends_on", re.compile(r"\b(?:depends|depended|depending)\s+on\b", re.I),
-     {"depends_on"}, False),
-    ("stacked_on", re.compile(r"\bstack(?:s|ed)\s+on\b", re.I), {"stacked_on"}, False),
-    ("built_on", re.compile(r"\bbuilt\s+on\b|\bon\s+top\s+of\b", re.I),
-     {"depends_on", "stacked_on"}, False),
-    ("follow_up_of", re.compile(r"\bfollow(?:-|\s)?ups?\s+(?:to|of|on|for)\b|"
-                                r"\bfollows\s+up\s+on\b|\bcontinuation\s+of\b", re.I),
-     {"follow_up_of"}, False),
-    ("caused_by", re.compile(r"\bcaused\s+by\b|\bregression\s+from\b|\bbroken\s+by\b|"
-                             r"\bintroduced\s+by\b", re.I), {"caused_by"}, False),
-    ("blocks", re.compile(r"\bblock(?:s|ing)\b", re.I), {"blocked_by"}, True),
-    ("needed_by", re.compile(r"\b(?:needed|required)\s+by\b|\bprerequisite\s+for\b", re.I),
-     {"depends_on"}, True),
-    ("followed_by", re.compile(r"\bfollowed\s+(?:up\s+)?by\b|\bcontinued\s+in\b", re.I),
-     {"follow_up_of"}, True),
-)
-# present tense: the waiting must hold on the day judged
-_STILL_RE = re.compile(r"\b(?:still|is|are|remains?|now)\s+(?:\w+\s+)?(?:blocked|waiting|stacked)\b|"
-                       r"\bwaits\s+(?:on|for)\b|\bdepends\s+on\b|\bstacks\s+on\b", re.I)
-_REF_RE = re.compile(
-    r"\[(?:(?:PR|pull request|issue)\s+)?(?:[\w.-]+/[\w.-]+)?#\d+\]"
-    r"\((https?://github\.com/([\w.-]+/[\w.-]+)/(?:pull|issues)/(\d+))\)"
-    r"|\[[^\]\n]*\]\(https?://[^)\s]*\)"
-    r"|(https?://github\.com/([\w.-]+/[\w.-]+)/(?:pull|issues)/(\d+))(?![\w/#-])"
-    r"|(?<![\w/.])([\w.-]+/[\w.-]+)#(\d+)\b"
-    r"|(?<![\w/.&#\]])#(\d+)\b", re.I)
-
-
-def _refs(text, repo):
-    """[(start, end, repo, number)] of every item reference in a sentence:
-    a markdown link or bare URL to a github.com issue / PR (its own
-    repository), `owner/repo#N`, or a local `#N` (the paragraph's
-    repository; None when that is not resolved)."""
-    out = []
-    for m in _REF_RE.finditer(text):
-        if not any(m.group(k) for k in (1, 4, 7, 9)):
-            continue        # a link to evidence (a comment, a commit): not an item
-        if m.group(1):
-            out.append((m.start(), m.end(), m.group(2), int(m.group(3))))
-        elif m.group(4):
-            out.append((m.start(), m.end(), m.group(5), int(m.group(6))))
-        elif m.group(7):
-            out.append((m.start(), m.end(), m.group(7), int(m.group(8))))
-        else:
-            out.append((m.start(), m.end(), repo, int(m.group(9))))
-    return out
-
-
-_CONNECTOR_RE = re.compile(
-    r"^[\s,;:()]*(?:(?:and|or|as\s+well\s+as|both|the|its|PRs?|pull\s+requests?|"
-    r"issues?)\b[\s,;:()]*)*$", re.I)
+# the relations a present-tense claim asserts are still in force
+_PRESENT_KINDS = ("blocked_by", "depends_on", "stacked_on", "blocks", "needed_by",
+                  "stacked_under")
+_REASON_TEXT = {"no_evidence": "no such relation in the record",
+                "after_day": "stated in the record only after the day",
+                "task_done": "the blocker is no longer open",
+                "text_not_current": "the blocker is no longer open",
+                "source_not_open": "the blocker is no longer open",
+                "target_not_open": "the blocker is no longer open",
+                "state_unknown": "an end the record does not hold"}
 
 
 def join_members(views):
@@ -3500,124 +3446,81 @@ def join_members(views):
     return out
 
 
-def _edge_day(e):
-    """The day the record first states a relation (its `as_of`, else the
-    basis's own date)."""
-    return e.get("as_of") or _day((e.get("basis") or {}).get("at"))
+def _root_item(view, train_id):
+    """The item a story is about (its root issue, else its first PR / issue):
+    the default subject of a sentence inside its block or post."""
+    t = next((x for x in view.get("trains") or [] if x.get("id") == train_id), None)
+    if not t:
+        return None
+    n = t.get("root_issue") or (t.get("prs") or [None])[0] or (t.get("issues") or [None])[0]
+    return {"slug": _slug(view), "number": n} if n is not None else None
 
 
 def relation_claims(views, text, as_of=None, subject_story=None):
-    """Every relation a sentence asserts, parsed into (subject item, kind,
-    each target item), must be held by the record (`story_graph`), ONE edge
-    per asserted pair:
+    """Every relation a sentence asserts, read by `link.parse_relation_claims`
+    and judged by `link.relation_holds` — one edge of evidence per (subject,
+    target) pair, of the kind claimed (an inverse cue from the waiting
+    side), dated on or before the day judged (`as_of`, else the window's
+    end); a present-tense waiting claim also needs the relation still in
+    force that day (both ends open by `link.item_state`, not a ticked task,
+    the text current). In-story, cross-story and cross-member evidence
+    alike. Scope is ours: a paragraph's repository (its links or the
+    nearest repository heading), the story block a sentence sits in (its
+    root item is the default subject), a post's own story (`subject_story`).
 
-    - the subject is the item referenced right before the cue (in the same
-      clause), else the story block the sentence is in, else the post's own
-      story (`subject_story`); every target is an item referenced after the
-      cue up to the next cue; each reference is resolved to its own
-      repository and number (a link or `owner/repo#N` names its own; a local
-      `#N` the paragraph's), an item of no view is an external target;
-    - the edge joins the subject's story to the target's story with a kind
-      the cue allows (a specific cue its specific kind; "waits on" any
-      waiting kind), and its evidence is dated on or before the day judged
-      (`as_of`, else the window's end);
-    - a present-tense claim ("still waits on", "is blocked by", "depends
-      on") needs both ends open on that day, each end projected by its own
-      repository and item type (PR or issue, close / reopen replayed), and a
-      text edge not marked done (`task_done`) or no longer current
-      (`text_current: false`);
-    - a pair inside one story is held by the story's `inner_relations` when
-      the view has them; without them it passes only when the relation
-      sentence itself quotes the record saying it (a quote with the same
-      kind of cue and the target's reference).
+    A negated claim ("is not blocked by", "no longer waits on") asserts
+    nothing to check, but one that denies a relation the record holds in
+    force on that day is a contradiction (`relation_denials_contradicted`).
+    For a view without the in-story layer (no `inner_relations` anywhere), a
+    pair inside one story passes on a quote in the same sentence that the
+    shared parser reads as the same relation to the same target.
 
-    Every cue of a sentence is checked; quoted text is the record's words
-    and is not read for cues. Returns {"relations_not_in_view": [...]}."""
+    Returns {"relations_not_in_view": [...], "relation_denials_contradicted": [...]}."""
     views = join_members(views)
     slugs = [_slug(v) for v in views]
-    low_slugs = {x.lower(): x for x in slugs}
-    item_story, edges, inner, inner_layer = {}, {}, {}, set()
+    low = {x.lower(): x for x in slugs}
+    target = views[0] if len(views) == 1 else [{"repo": _slug(v), "bundle": v} for v in views]
+    by_slug = {_slug(v): v for v in views}
+    inner_layer = {_slug(v) for v in views
+                   if any("inner_relations" in r for r in (v.get("stories") or {}).get("all") or [])}
+    story_of = {}
     for v in views:
-        sl = _slug(v)
         for t in v.get("trains") or []:
-            key = "{}:{}".format(sl, t["id"])
             for n in list(t.get("prs") or []) + list(t.get("issues") or []):
-                item_story.setdefault((sl, n), [])
-                if key not in item_story[(sl, n)]:
-                    item_story[(sl, n)].append(key)
-        for e in (v.get("story_graph") or {}).get("edges") or []:
-            if e.get("relation") == "mentions":
-                continue
-            to = e.get("to")
-            if isinstance(to, dict):
-                to_key = "ext:{}#{}".format((to.get("repo") or "").lower(), to.get("number"))
-            else:
-                to_key = to
-            edges.setdefault((e.get("from"), to_key), []).append(e)
-        for r in (v.get("stories") or {}).get("all") or []:
-            if "inner_relations" in r:
-                inner_layer.add(sl)       # the view holds the in-story layer
-            # {from_item, to_item, relation, quote, as_of, waiting?, task_done?, ...},
-            # stored from the waiting side like the story edges
-            for x in r.get("inner_relations") or []:
-                if x.get("relation") == "mentions":
-                    continue
-                inner.setdefault((sl, (x.get("from_item") or {}).get("number")), []).append(x)
-
-    def _inner_holds(sl, subj_ref, tr, ok_rels, inverse, day, still):
-        """A pair inside one story held by the story's `inner_relations`:
-        a relation of the cue's kind from the waiting item to the other
-        (reversed for an inverse cue), stated on or before the day; for a
-        present-tense claim, waiting, not a ticked task, its text current,
-        and both items open on the day."""
-        pairs = []
-        if subj_ref is not None:
-            a, b = subj_ref[3], tr[3]
-            pairs = [(b, a)] if inverse else [(a, b)]
-        rows = []
-        for (s_, frm), xs in inner.items():
-            if s_ != sl:
-                continue
-            for x in xs:
-                to = (x.get("to_item") or {}).get("number")
-                if pairs and (frm, to) not in pairs:
-                    continue
-                if not pairs and tr[3] not in ((frm if inverse else to),):
-                    continue
-                if x.get("relation") in ok_rels and (x.get("as_of") or "") <= day:
-                    rows.append((frm, to, x))
-        if not still:
-            return bool(rows)
-        proj = RecordAsOf(views, day)
-        return any(x.get("waiting") is not False and not x.get("task_done")
-                   and x.get("text_current") is not False
-                   and proj.item_state(sl, frm) == "open" and proj.item_state(sl, to) == "open"
-                   for frm, to, x in rows)
-
-    def stories_of(repo, n):
-        """Every story an item belongs to (an item can sit in several trains);
-        an item of another repository is its external key."""
-        if repo is None:
-            return []
-        sl = low_slugs.get(repo.lower())
-        if sl is None:
-            return ["ext:{}#{}".format(repo.lower(), n)]
-        return list(item_story.get((sl, n)) or [])
+                story_of.setdefault((_slug(v), n), set()).add(t["id"])
 
     blank = lambda m: re.sub(r"[^\n]", " ", m.group(0))   # noqa: E731
     t = _COMMENT_RE.sub(lambda m: m.group(0) if m.group(0).lstrip("<!- ").startswith(
         ("story:", "/story")) else blank(m), text)
     t = _FENCE_RE.sub(blank, t)
-    quoted = link._QUOTE_RE.sub(blank, t)
+    quoted = link._QUOTE_RE.sub(blank, t)        # the record's words are not our claims
     blocks = [(m.start(), m.end(), m.group(1)) for m in _STORY_BLOCK_RE.finditer(t)]
-    out = []
-    views_by = {_slug(v): v for v in views}
+    bad, denied = [], []
 
-    def judged_day(repo):
-        if as_of:
-            return as_of
-        v = views_by.get(low_slugs.get((repo or "").lower(), "")) or (views[0] if views else {})
-        return _period(v)[1]
+    def item(ref, repo):
+        sl = ref.get("slug") or repo
+        return {"repo": low.get((sl or "").lower(), sl), "number": ref["number"]}
+
+    def default_subject(par_pos, repo):
+        for a, b, key in blocks:
+            if a <= par_pos < b:
+                sl, _, tid = key.rpartition(":") if ":" in key else (repo, "", key)
+                v = by_slug.get(low.get((sl or repo or "").lower(), sl)) or \
+                    (views[0] if len(views) == 1 else None)
+                return _root_item(v, tid) if v else None
+        if subject_story:
+            sl, _, tid = subject_story.rpartition(":")
+            v = by_slug.get(low.get(sl.lower(), sl))
+            return _root_item(v, tid) if v else None
+        return None
+
+    def quoted_says(orig, kind, tgt, repo):
+        for qm in link._QUOTE_RE.finditer(orig):
+            for c in link.parse_relation_claims(qm.group(1) or qm.group(2), repo):
+                if c["relation"] == kind and not c["negated"] and any(
+                        x["number"] == tgt["number"] for x in c["targets"]):
+                    return True
+        return False
 
     pos = 0
     for sid, chunk in _section_chunks(quoted):
@@ -3627,130 +3530,48 @@ def relation_claims(views, text, as_of=None, subject_story=None):
             if _is_heading(par):
                 continue
             repo = repo if repo is not None else (slugs[0] if len(slugs) == 1 else None)
+            if repo is None:
+                continue
             par_pos = quoted.find(par, start)
             orig_par = t[par_pos:par_pos + len(par)] if par_pos >= 0 else par
-            block_story = None
-            for a, b, key in blocks:
-                if a <= par_pos < b:
-                    block_story = key if ":" in key else "{}:{}".format(repo or slugs[0], key)
-            off = 0
-            for snt in _sentences(par):
-                s_at = par.find(snt, off)
-                off = s_at + len(snt) if s_at >= 0 else off
-                orig_snt = orig_par[s_at:s_at + len(snt)] if s_at >= 0 else snt
-                cues = sorted(((m.start(), m.end(), claim, ok, inv)
-                               for claim, rx, ok, inv in _RELATION_CUES for m in rx.finditer(snt)),
-                              key=lambda c: c[0])
-                # an inverse cue inside a longer forward one ("blocked by") is not a cue
-                cues = [c for c in cues if not any(o[0] <= c[0] and c[1] <= o[1] and o != c
-                                                   for o in cues)]
-                if not cues:
+            dflt = default_subject(par_pos, repo)
+            day = as_of or _period(by_slug.get(repo) or views[0])[1]
+            for c in link.parse_relation_claims(par, repo, dflt):
+                if c["relation"] in ("mentions", "mentioned_by") or not c["subject"]:
                     continue
-                refs = _refs(snt, repo)
-                for i, (c0, c1, claim, ok_rels, inverse) in enumerate(cues):
-                    prev_end = cues[i - 1][1] if i else 0
-                    nxt = cues[i + 1][0] if i + 1 < len(cues) else len(snt)
-                    before = [r for r in refs if prev_end <= r[0] < c0] or \
-                        [r for r in refs if r[1] <= c0]
-                    # the targets: references right after the cue, joined only by
-                    # connectors ("#12 and #13", "#12, #13 or #14")
-                    targets, last = [], c1
-                    for r in refs:
-                        if r[0] < c1 or r[0] >= nxt:
-                            continue
-                        if not _CONNECTOR_RE.match(snt[last:r[0]]):
-                            break
-                        targets.append(r)
-                        last = r[1]
-                    if not targets:
+                subj = item(c["subject"], repo)
+                present = c["tense"] == "present" and c["relation"] in _PRESENT_KINDS
+                snt = " ".join(par[c["span"][0]:c["span"][1]].split())[:200]
+                orig = orig_par[c["span"][0]:c["span"][1]]
+                for tgt in c["targets"]:
+                    obj = item(tgt, repo)
+                    res = link.relation_holds(target, subj, obj, c["relation"], day=day,
+                                              present=present or c["negated"])
+                    row = {"claim": c["relation"], "subject": "{}#{}".format(*subj.values()),
+                           "target": "{}#{}".format(*obj.values()), "sentence": snt}
+                    if c["negated"]:
+                        if res["holds"]:
+                            denied.append(dict(row, problem="denies a relation the record "
+                                                            "holds in force on the day"))
                         continue
-                    # the subjects: the reference right before the cue and those
-                    # joined to it by connectors ("#7310 and #7333 are stacked on")
-                    subj_refs = []
-                    if before:
-                        subj_refs = [before[-1]]
-                        for r in reversed(before[:-1]):
-                            if not _CONNECTOR_RE.match(snt[r[1]:subj_refs[0][0]]):
-                                break
-                            subj_refs.insert(0, r)
-                    groups = [(r, stories_of(r[2], r[3])) for r in subj_refs] or \
-                        [(None, [x for x in (block_story or subject_story,) if x])]
-                    for subj_ref, subjs in groups:
-                        if not subjs:
-                            continue
-                        still = bool(_STILL_RE.search(snt[max(prev_end, (subj_ref or (c0,))[0]):nxt]))
-                        for tr in targets:
-                            row = {"claim": claim, "target": "{}#{}".format(tr[2], tr[3]),
-                                   "sentence": " ".join(snt.split())[:200]}
-                            objs = stories_of(tr[2], tr[3])
-                            if not objs:
-                                row["problem"] = "the target is not an item of the record"
-                                out.append(row)
+                    if res["holds"]:
+                        continue
+                    same = story_of.get((subj["repo"], subj["number"]), set()) & \
+                        story_of.get((obj["repo"], obj["number"]), set())
+                    if same and res["reason"] == "no_evidence":
+                        if subj["repo"] not in inner_layer:
+                            if quoted_says(orig, c["relation"], tgt, repo):
                                 continue
-                            pairs = [(a, b) for a in subjs for b in objs if a != b]
-                            if not pairs:
-                                # inside one story: the story's own relations, or the
-                                # record's words in this very sentence
-                                ok_inner = False
-                                tsl = low_slugs.get((tr[2] or "").lower())
-                                if tsl in inner_layer:
-                                    ok_inner = _inner_holds(
-                                        tsl, subj_ref, tr, ok_rels, inverse,
-                                        judged_day(tr[2]),
-                                        still and not inverse and claim in (
-                                            "blocked_by", "waits_on", "depends_on",
-                                            "stacked_on", "built_on"))
-                                else:
-                                    rx = next(x[1] for x in _RELATION_CUES if x[0] == claim)
-                                    for qm in link._QUOTE_RE.finditer(orig_snt):
-                                        qtext = qm.group(1) or qm.group(2)
-                                        if rx.search(qtext) and re.search(
-                                                r"#{}\b|/(?:pull|issues)/{}\b".format(tr[3], tr[3]),
-                                                qtext):
-                                            ok_inner = True
-                                if not ok_inner:
-                                    row["problem"] = "inside one story without a quote" \
-                                        if tsl not in inner_layer else \
-                                        "inside one story, not in its inner relations"
-                                    out.append(row)
-                                continue
-                            day = judged_day(tr[2])
-                            held = [e for a, b in pairs
-                                    for e in edges.get((b, a) if inverse else (a, b), [])
-                                    if e.get("relation") in ok_rels]
-                            cands = [e for e in held
-                                     if _edge_day(e) is None or _edge_day(e) <= day]
-                            if not cands:
-                                later = held
-                                row["problem"] = "stated in the record only after the day" if later \
-                                    else "no such relation in the record"
-                                out.append(row)
-                                continue
-                            if still and not inverse and claim in ("blocked_by", "waits_on",
-                                                                    "depends_on", "stacked_on",
-                                                                    "built_on"):
-                                proj = RecordAsOf(views, day)
-                                ok_still = False
-                                for e in cands:
-                                    if e.get("relation") not in WAITING_RELATIONS:
-                                        continue
-                                    b = e.get("basis") or {}
-                                    if b.get("task_done") or b.get("text_current") is False or \
-                                            e.get("task_done") or e.get("text_current") is False:
-                                        continue
-                                    ends = [(subj_ref[2] if subj_ref else repo, subj_ref[3])
-                                            if subj_ref else None, (tr[2], tr[3])]
-                                    if ends[0] is None:
-                                        src = b.get("item") or {}
-                                        sl_ = (e.get("from") or "").split(":")[0]
-                                        ends[0] = (sl_, src.get("number"))
-                                    if all(proj.item_state(low_slugs.get((r_ or "").lower(), r_), n_)
-                                           == "open" for r_, n_ in ends if n_ is not None):
-                                        ok_still = True
-                                if not ok_still:
-                                    row["problem"] = "the blocker is no longer open"
-                                    out.append(row)
-    return {"relations_not_in_view": out}
+                            bad.append(dict(row, reason="no_evidence",
+                                            problem="inside one story without a quote"))
+                        else:
+                            bad.append(dict(row, reason="no_evidence",
+                                            problem="inside one story, not in its inner "
+                                                    "relations"))
+                        continue
+                    bad.append(dict(row, reason=res["reason"],
+                                    problem=_REASON_TEXT.get(res["reason"], res["reason"])))
+    return {"relations_not_in_view": bad, "relation_denials_contradicted": denied}
 
 
 class RecordAsOf:
@@ -3763,18 +3584,6 @@ class RecordAsOf:
         self.day = day
         self.views = {_slug(v): v for v in views}
         self.prs = {(_slug(v), p.get("number")): p for v in views for p in v.get("prs") or []}
-        self.issues = {(_slug(v), i.get("number")): i for v in views for i in v.get("issues") or []}
-
-    def item_state(self, repo, number):
-        """The state of any item (PR or issue) of `repo` on the day, by its
-        own type: open, merged, closed_unmerged, closed, not_opened, unknown
-        (past the coverage) or None (not in the record)."""
-        v = self.views.get(repo)
-        if v is not None and not absence_provable(v, self.day):
-            return "unknown"
-        if (repo, number) in self.prs:
-            return pr_state_on(self.prs[(repo, number)], self.day)
-        return issue_state_on(self.issues.get((repo, number)), self.day)
 
     def pr_state(self, repo, number):
         v = self.views.get(repo)
@@ -3946,7 +3755,8 @@ THEME_CHECK_KEYS = (
     "items_not_in_view", "modules_not_in_view", "versions_not_in_view", "people_not_in_view",
     "name_mismatch", "do_not_name_named", "affiliation_mismatch", "automation_as_person",
     "review_state_mismatch", "pr_state_mismatch", "release_status_mismatch",
-    "superseded_not_in_view", "relations_not_in_view", "candidates_worded_as_declared",
+    "superseded_not_in_view", "relations_not_in_view", "relation_denials_contradicted",
+    "candidates_worded_as_declared",
     "dates_without_year", "numbers_not_in_view",
     "characterising_words", "modules_not_linked", "versions_not_linked", "markers_malformed")
 
@@ -4544,6 +4354,7 @@ POST_CHECK_KEYS = (  # plus release_claimed_while_unknown, set per post
     "versions_not_in_view", "people_not_in_view", "do_not_name_named", "affiliation_mismatch",
     "automation_as_person", "review_state_mismatch", "pr_state_mismatch",
     "release_status_mismatch", "superseded_not_in_view", "relations_not_in_view",
+    "relation_denials_contradicted",
     "candidates_worded_as_declared",
     "dates_without_year", "numbers_not_in_view", "characterising_words")
 
@@ -4976,11 +4787,12 @@ WORK_PACKAGE_RULES = """
    (`content_landed_in`) where the change is told — with the quote's substance and a link to
    the other item. A target with `waiting: false` is no longer waited on: say it was waited
    on, not that it still is. An external target (another repository) is named with its link
-   and no state. A relation between two items of the same story is not in `relations`: state
-   it only with the slice's own quote. The issue check fails a dependency the record does not
-   hold (`relations_not_in_view`). `inner_relations` in the row file are the same links between
-   two items of THIS story (from the waiting item): state them as facts, with a link, no quote
-   needed. A relation whose basis is a ticked task (`task_done`) or text edited after the window
+   and no state. A relation between two items of the same story is not in `relations`; it is in
+   `inner_relations` in the row file (from the waiting item): state those as facts, with a link,
+   no quote needed. Only when the row has no `inner_relations` key at all (a view without that
+   layer) is an in-story dependency stated with the slice's own quote. The issue check fails a
+   dependency the record does not hold (`relations_not_in_view`) and a denial ("no longer waits
+   on") of one it holds in force (`relation_denials_contradicted`). A relation whose basis is a ticked task (`task_done`) or text edited after the window
    (`text_current: false`) is not waited on any more: say the task is ticked or the text changed,
    never that it still waits. When `connections.chains_capped` is set, say the chains were
    capped (the record's walk stopped before their end).

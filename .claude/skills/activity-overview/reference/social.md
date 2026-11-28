@@ -110,8 +110,9 @@ Both forms state the same facts; neither adds one.
   for the length, the required links and the voice-pass facts alike.
 - **Dependencies**: a post for a story that waits on another item may say so in the LinkedIn
   form, from the story's `relations` (not required on X); the check applies the issue's relation
-  rule (`relations_not_in_view`) as of the post's day, with the post's own story as the subject
-  of a sentence that names none.
+  rule (`relations_not_in_view`, `relation_denials_contradicted`: the shared parser and
+  `link.relation_holds`) as of the post's day, with the post's own story as the subject of a
+  sentence that names none.
 - **Plain text** in both: no markdown links, bold, code spans or headings. A quote of record
   text that holds code spans is written without the backticks; the check matches it against
   the record with the record's backticks dropped.
