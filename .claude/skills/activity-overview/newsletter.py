@@ -1011,6 +1011,133 @@ def _theme_index(view, multi):
 
 STORY_KINDS = ("new", "changed", "breaking")
 
+# The relations a story can state as a dependency (from its own side), and
+# their inverses; `mentions` is never one. `waiting` relations can be "still
+# waiting" while both ends are open.
+DEPENDENCY_RELATIONS = ("blocked_by", "depends_on", "stacked_on", "follow_up_of", "caused_by",
+                        "content_landed_in")
+INVERSE_RELATIONS = {"blocks": "blocked_by", "needed_by": "depends_on",
+                     "stacked_under": "stacked_on", "followed_by": "follow_up_of",
+                     "causes": "caused_by", "content_from": "content_landed_in"}
+WAITING_RELATIONS = ("blocked_by", "depends_on", "stacked_on")
+PLUMBING_KINDS = ("plumbing", "ci_workflows", "pipeline_utilities", "test_environment",
+                  "docs_generation", "dependency_updates", "repository_policy",
+                  "other_plumbing")
+
+
+def _story_ref(key, rows_by_key, multi, trains=None):
+    """{key, title, group, state, url, in_issue} of a story key of the
+    relation layer (`owner/repo:train-id`), in the outline's own key form; a
+    train the issue does not tell (carried over past the idle limit) is
+    named by its root item, `in_issue: false`."""
+    local = key if multi or not isinstance(key, str) else key.split(":", 1)[-1]
+    row = rows_by_key.get(local)
+    if row:
+        return {"key": local, "title": row.get("title"), "group": row.get("group"),
+                "state": row.get("state"), "url": row.get("url"), "in_issue": True}
+    t = (trains or {}).get(key) or (trains or {}).get(local) or {}
+    return {"key": local, "title": t.get("title"), "group": None, "state": t.get("state"),
+            "url": t.get("url"), "in_issue": False}
+
+
+def connect_stories(views, stories_sec, plumbing_sec, multi=False):
+    """How the work connects, from the view's relation layer (`story_graph`,
+    `stories.all[].relations`): every story row gains `relations` (its
+    non-mention relations, each with the quote, the item, and the other
+    story's title, group, state and link, or the external item), a module
+    story `waited_on_plumbing`, every plumbing theme `needed_by` / `caused`
+    (the module stories that waited on it or that it caused), and the
+    stories section a `connections` part (chains, the items most stories
+    wait on, external targets, counts per relation)."""
+    rows_by_key = {r["key"]: r for r in stories_sec.get("all") or []}
+    trains = {}
+    for v in views:
+        items = {("pr", p.get("number")): p for p in v.get("prs") or []}
+        items.update({("issue", i.get("number")): i for i in v.get("issues") or []})
+        for t in v.get("trains") or []:
+            root = items.get(("issue", t.get("root_issue"))) if t.get("root_issue") else None
+            root = root or items.get(("pr", (t.get("prs") or [None])[0])) or \
+                items.get(("issue", (t.get("issues") or [None])[0])) or {}
+            trains["{}:{}".format(_slug(v), t["id"])] = {
+                "title": root.get("title"), "url": root.get("url"),
+                "state": "merged" if root.get("merged") else root.get("state")}
+    theme_of = {}
+    for th in plumbing_sec.get("themes") or []:
+        for k in th.get("stories") or []:
+            theme_of[k] = th.get("id")
+    view_rows = {}
+    for v in views:
+        for e in (v.get("stories") or {}).get("all") or []:
+            view_rows[story_key(v, e["id"], multi)] = e
+    for key, row in rows_by_key.items():
+        rels = []
+        for rel in (view_rows.get(key) or {}).get("relations") or []:
+            kind = rel.get("relation")
+            if kind in ("mentions", "mentioned_by"):
+                continue
+            item = {"relation": kind, "basis": {k: (rel.get("basis") or {}).get(k)
+                                                for k in ("quote", "item", "author", "at", "url",
+                                                          "kind", "inverse_of")
+                                                if (rel.get("basis") or {}).get(k) is not None},
+                    "other_kind": rel.get("other_kind"), "other_item": rel.get("other_item"),
+                    "other_state": rel.get("other_state"), "waiting": rel.get("waiting"),
+                    "as_of": rel.get("as_of")}
+            if rel.get("external") or isinstance(rel.get("other"), dict):
+                item["external"] = rel.get("other") if isinstance(rel.get("other"), dict) else True
+                item["other_state"] = None      # another repository: no state claimed
+            else:
+                item["other"] = _story_ref(rel.get("other"), rows_by_key, multi, trains)
+                if rel.get("cross_member"):
+                    item["cross_member"] = True
+            rels.append(item)
+        if rels:
+            row["relations"] = rels
+            waited = [x for x in rels if x["relation"] in WAITING_RELATIONS
+                      and x.get("other_kind") in PLUMBING_KINDS]
+            if waited and row.get("group") != "plumbing":
+                row["waited_on_plumbing"] = waited
+    # plumbing themes: the module stories they were needed by, or that they caused
+    for th in plumbing_sec.get("themes") or []:
+        mine = set(th.get("stories") or [])
+        needed, caused = [], []
+        for key, row in rows_by_key.items():
+            if row.get("group") == "plumbing" or key in mine:
+                continue
+            for x in row.get("relations") or []:
+                other = (x.get("other") or {}).get("key")
+                if other in mine and x["relation"] in WAITING_RELATIONS:
+                    needed.append({"story": key, "title": row.get("title"), "url": row.get("url"),
+                                   "relation": x["relation"], "via": other,
+                                   "quote": x["basis"].get("quote")})
+                if other in mine and x["relation"] == "caused_by":
+                    caused.append({"story": key, "title": row.get("title"), "url": row.get("url"),
+                                   "via": other, "quote": x["basis"].get("quote")})
+        if needed:
+            th["needed_by"] = needed
+        if caused:
+            th["caused"] = caused
+    # the connections part
+    chains, most, external, counts = [], [], [], {}
+    for v in views:
+        g = v.get("story_graph") or {}
+        for ch in g.get("chains") or []:
+            chains.append([_story_ref(k, rows_by_key, multi, trains) for k in ch])
+        for m in g.get("most_blocking") or []:
+            most.append(dict(_story_ref(m.get("story"), rows_by_key, multi, trains),
+                             waiting_stories=m.get("waiting_stories"),
+                             stories=[_story_ref(k, rows_by_key, multi, trains)
+                                      for k in m.get("stories") or []]))
+        for e in g.get("edges") or []:
+            counts[e.get("relation")] = counts.get(e.get("relation"), 0) + 1
+            if e.get("external") and e.get("relation") != "mentions":
+                external.append({"from": _story_ref(e.get("from"), rows_by_key, multi, trains),
+                                 "relation": e.get("relation"), "target": e.get("to"),
+                                 "quote": (e.get("basis") or {}).get("quote")})
+    stories_sec["connections"] = {
+        "chains": chains, "most_blocking": [m for m in most if (m.get("waiting_stories") or 0) > 1],
+        "external": external, "counts": counts,
+        "omit": None if (chains or most or external) else "no relation between stories"}
+
 
 def section_stories(views, caps, multi=False):
     """Every story of the window, grouped by state (STORY_GROUPS), with the
@@ -2071,11 +2198,13 @@ def outline(views, cadence=None, automation=()):
     plumbing["prs"].sort(key=lambda r: (-r["areas"], r["number"]))
     plumbing["prs_omitted"] = max(0, len(plumbing["prs"]) - caps["plumbing_prs"])
     plumbing["prs"] = plumbing["prs"][:caps["plumbing_prs"]]
+    stories_sec = section_stories(views, caps, multi)
+    connect_stories(views, stories_sec, plumbing, multi)
     sections = [
         {"id": "new_modules", **new_mods},
         {"id": "module_changes", **changes},
         {"id": "breaking", **breaking},
-        {"id": "stories", **section_stories(views, caps, multi)},
+        {"id": "stories", **stories_sec},
         {"id": "ownership", **ownership},
         {"id": "people", **section_people(views, caps, multi, automation)},
         {"id": "coming", **coming},
