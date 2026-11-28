@@ -3024,6 +3024,8 @@ class TestRelationClaimsParsed(TestStoryRelations):
         a["story_graph"]["edges"].append(
             {"from": "o/r:train-pr-30", "to": {"repo": "o/s", "number": 11,
                                                  "url": "https://github.com/o/s/pull/11"},
+             # the reference as written: the join resolves edges from it
+             "ref": {"repo": "o/s", "number": 11, "url": "https://github.com/o/s/pull/11"},
              "relation": "depends_on", "external": True, "as_of": "2026-10-04",
              "basis": {"kind": "text", "quote": "needs o/s#11"}})
         return a, b
@@ -3109,10 +3111,51 @@ class TestRelationClaimsParsed(TestStoryRelations):
         self.assertTrue(newsletter.relation_claims([v], text)["relations_not_in_view"])
         # with the story's inner relations, those decide
         v["stories"]["all"][-2]["inner_relations"] = [
-            {"from_item": {"type": "pr", "number": 33}, "to_item": {"type": "pr", "number": 30},
-             "relation": "blocked_by", "basis": {"quote": "blocking #30"}}]
+            {"from_item": {"type": "pr", "number": 33, "url": R + "/pull/33"},
+             "to_item": {"type": "pr", "number": 30, "url": R + "/pull/30"},
+             "relation": "blocked_by", "quote": "which is blocking #33", "author": "sam",
+             "as_of": "2026-10-04", "url": R + "/pull/30", "waiting": True,
+             "inverse_of": "blocks"}]
         bare = "## Stories\n\n[#30](" + R + "/pull/30) is blocked by [#33](" + R + "/pull/33).\n"
         self.assertTrue(newsletter.relation_claims([v], bare)["relations_not_in_view"])
+        # the in-story fact as the layer holds it: told without a quote
+        told = "## Stories\n\n[#30](" + R + "/pull/30) is blocking [#33](" + R + "/pull/33).\n"
+        self.assertEqual(newsletter.relation_claims([v], told)["relations_not_in_view"], [])
+        still = "## Stories\n\n[#33](" + R + "/pull/33) still waits on [#30](" + R + "/pull/30).\n"
+        self.assertEqual(newsletter.relation_claims([v], still)["relations_not_in_view"], [])
+        self.assertTrue(newsletter.relation_claims([v], still, as_of="2026-10-03")
+                        ["relations_not_in_view"])        # stated only on 4 October
+        v["stories"]["all"][-2]["inner_relations"][0]["task_done"] = True
+        self.assertEqual(newsletter.relation_claims([v], still)["relations_not_in_view"][0]
+                         ["problem"], "inside one story, not in its inner relations")
+        row = next(r for r in section(newsletter.outline([v]), "stories")["all"]
+                   if r["key"] == "train-pr-30")
+        self.assertEqual(row["inner_relations"][0]["relation"], "blocked_by")
+
+    def test_j9_a_ticked_task_or_an_edited_text_is_not_waited_on(self):
+        v = self.v()
+        e = next(x for x in v["story_graph"]["edges"] if x["relation"] == "depends_on")
+        e.update(waiting=True)
+        v["prs"][2].update(state="open", merged=False, created_at="2026-09-30T10:00:00Z")
+        v["prs"][2].pop("merged_at", None)
+        text = ("## Stories\n\n[#30](" + R + "/pull/30) still waits on [#12](" + R +
+                "/pull/12).\n")
+        self.assertEqual(newsletter.relation_claims([v], text)["relations_not_in_view"], [])
+        e["basis"]["task_done"] = True
+        self.assertTrue(newsletter.relation_claims([v], text)["relations_not_in_view"])
+        e["basis"].pop("task_done")
+        e["basis"]["text_current"] = False
+        self.assertTrue(newsletter.relation_claims([v], text)["relations_not_in_view"])
+        # past tense stays true
+        self.assertEqual(newsletter.relation_claims(
+            [v], text.replace("still waits on", "waited on"))["relations_not_in_view"], [])
+        # the outline carries the flags, and a capped walk
+        v["story_graph"]["chains_capped"] = True
+        st = section(newsletter.outline([v]), "stories")
+        row = next(r for r in st["all"] if r["key"] == "train-pr-30")
+        dep = next(x for x in row["relations"] if x["relation"] == "depends_on")
+        self.assertIs(dep["basis"]["text_current"], False)
+        self.assertTrue(st["connections"]["chains_capped"])
 
 
 class TestThemeCheck(unittest.TestCase):

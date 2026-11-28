@@ -1077,7 +1077,8 @@ def connect_stories(views, stories_sec, plumbing_sec, multi=False):
                 continue
             item = {"relation": kind, "basis": {k: (rel.get("basis") or {}).get(k)
                                                 for k in ("quote", "item", "author", "at", "url",
-                                                          "kind", "inverse_of")
+                                                          "kind", "inverse_of", "subject",
+                                                          "task_done", "text_current")
                                                 if (rel.get("basis") or {}).get(k) is not None},
                     "other_kind": rel.get("other_kind"), "other_item": rel.get("other_item"),
                     "other_state": rel.get("other_state"), "waiting": rel.get("waiting"),
@@ -1093,6 +1094,10 @@ def connect_stories(views, stories_sec, plumbing_sec, multi=False):
                                                and rel["other"].split(":", 1)[0] != own):
                     item["cross_member"] = True
             rels.append(item)
+        inner_rows = [x for x in (view_rows.get(key) or {}).get("inner_relations") or []
+                      if x.get("relation") != "mentions"]
+        if inner_rows:
+            row["inner_relations"] = inner_rows
         if rels:
             row["relations"] = rels
             waited = [x for x in rels if x["relation"] in WAITING_RELATIONS
@@ -1120,9 +1125,10 @@ def connect_stories(views, stories_sec, plumbing_sec, multi=False):
         if caused:
             th["caused"] = caused
     # the connections part
-    chains, most, external, counts = [], [], [], {}
+    chains, most, external, counts, capped = [], [], [], {}, False
     for v in views:
         g = v.get("story_graph") or {}
+        capped = capped or bool(g.get("chains_capped"))
         for ch in g.get("chains") or []:
             chains.append([_story_ref(k, rows_by_key, multi, trains) for k in ch])
         for m in g.get("most_blocking") or []:
@@ -1133,12 +1139,16 @@ def connect_stories(views, stories_sec, plumbing_sec, multi=False):
         for e in g.get("edges") or []:
             counts[e.get("relation")] = counts.get(e.get("relation"), 0) + 1
             if e.get("external") and e.get("relation") != "mentions":
+                b_ = e.get("basis") or {}
                 external.append({"from": _story_ref(e.get("from"), rows_by_key, multi, trains),
                                  "relation": e.get("relation"), "target": e.get("to"),
-                                 "quote": (e.get("basis") or {}).get("quote")})
+                                 "quote": b_.get("quote"),
+                                 **{k: b_[k] for k in ("task_done", "text_current") if k in b_}})
     stories_sec["connections"] = {
         "chains": chains, "most_blocking": [m for m in most if (m.get("waiting_stories") or 0) > 1],
         "external": external, "counts": counts,
+        # the data side's bounded walk stopped: say "chains were capped"
+        "chains_capped": capped,
         # omitted only when the record holds no relation but bare mentions
         "omit": None if any(k != "mentions" for k in counts) else
         "no relation between stories"}
@@ -3526,7 +3536,7 @@ def relation_claims(views, text, as_of=None, subject_story=None):
     views = join_members(views)
     slugs = [_slug(v) for v in views]
     low_slugs = {x.lower(): x for x in slugs}
-    item_story, edges, inner = {}, {}, {}
+    item_story, edges, inner, inner_layer = {}, {}, {}, set()
     for v in views:
         sl = _slug(v)
         for t in v.get("trains") or []:
@@ -3545,11 +3555,44 @@ def relation_claims(views, text, as_of=None, subject_story=None):
                 to_key = to
             edges.setdefault((e.get("from"), to_key), []).append(e)
         for r in (v.get("stories") or {}).get("all") or []:
+            if "inner_relations" in r:
+                inner_layer.add(sl)       # the view holds the in-story layer
+            # {from_item, to_item, relation, quote, as_of, waiting?, task_done?, ...},
+            # stored from the waiting side like the story edges
             for x in r.get("inner_relations") or []:
-                def num(z):
-                    return z.get("number") if isinstance(z, dict) else z
-                inner.setdefault((sl, num(x.get("from_item") or x.get("from"))), []).append(
-                    (num(x.get("to_item") or x.get("to")), x.get("relation"), x))
+                if x.get("relation") == "mentions":
+                    continue
+                inner.setdefault((sl, (x.get("from_item") or {}).get("number")), []).append(x)
+
+    def _inner_holds(sl, subj_ref, tr, ok_rels, inverse, day, still):
+        """A pair inside one story held by the story's `inner_relations`:
+        a relation of the cue's kind from the waiting item to the other
+        (reversed for an inverse cue), stated on or before the day; for a
+        present-tense claim, waiting, not a ticked task, its text current,
+        and both items open on the day."""
+        pairs = []
+        if subj_ref is not None:
+            a, b = subj_ref[3], tr[3]
+            pairs = [(b, a)] if inverse else [(a, b)]
+        rows = []
+        for (s_, frm), xs in inner.items():
+            if s_ != sl:
+                continue
+            for x in xs:
+                to = (x.get("to_item") or {}).get("number")
+                if pairs and (frm, to) not in pairs:
+                    continue
+                if not pairs and tr[3] not in ((frm if inverse else to),):
+                    continue
+                if x.get("relation") in ok_rels and (x.get("as_of") or "") <= day:
+                    rows.append((frm, to, x))
+        if not still:
+            return bool(rows)
+        proj = RecordAsOf(views, day)
+        return any(x.get("waiting") is not False and not x.get("task_done")
+                   and x.get("text_current") is not False
+                   and proj.item_state(sl, frm) == "open" and proj.item_state(sl, to) == "open"
+                   for frm, to, x in rows)
 
     def stories_of(repo, n):
         """Every story an item belongs to (an item can sit in several trains);
@@ -3649,12 +3692,15 @@ def relation_claims(views, text, as_of=None, subject_story=None):
                                 # inside one story: the story's own relations, or the
                                 # record's words in this very sentence
                                 ok_inner = False
-                                if inner and subj_ref:
-                                    for to_n, rel, _x in inner.get((low_slugs.get(
-                                            (subj_ref[2] or "").lower()), subj_ref[3]), []):
-                                        if to_n == tr[3] and rel in ok_rels:
-                                            ok_inner = True
-                                elif not inner:
+                                tsl = low_slugs.get((tr[2] or "").lower())
+                                if tsl in inner_layer:
+                                    ok_inner = _inner_holds(
+                                        tsl, subj_ref, tr, ok_rels, inverse,
+                                        judged_day(tr[2]),
+                                        still and not inverse and claim in (
+                                            "blocked_by", "waits_on", "depends_on",
+                                            "stacked_on", "built_on"))
+                                else:
                                     rx = next(x[1] for x in _RELATION_CUES if x[0] == claim)
                                     for qm in link._QUOTE_RE.finditer(orig_snt):
                                         qtext = qm.group(1) or qm.group(2)
@@ -3663,8 +3709,9 @@ def relation_claims(views, text, as_of=None, subject_story=None):
                                                 qtext):
                                             ok_inner = True
                                 if not ok_inner:
-                                    row["problem"] = "inside one story without a quote" if not inner \
-                                        else "inside one story, not in its inner relations"
+                                    row["problem"] = "inside one story without a quote" \
+                                        if tsl not in inner_layer else \
+                                        "inside one story, not in its inner relations"
                                     out.append(row)
                                 continue
                             day = judged_day(tr[2])
@@ -4931,7 +4978,12 @@ WORK_PACKAGE_RULES = """
    on, not that it still is. An external target (another repository) is named with its link
    and no state. A relation between two items of the same story is not in `relations`: state
    it only with the slice's own quote. The issue check fails a dependency the record does not
-   hold (`relations_not_in_view`).
+   hold (`relations_not_in_view`). `inner_relations` in the row file are the same links between
+   two items of THIS story (from the waiting item): state them as facts, with a link, no quote
+   needed. A relation whose basis is a ticked task (`task_done`) or text edited after the window
+   (`text_current: false`) is not waited on any more: say the task is ticked or the text changed,
+   never that it still waits. When `connections.chains_capped` is set, say the chains were
+   capped (the record's walk stopped before their end).
 """
 
 
