@@ -414,9 +414,11 @@ of them public facts, never the token). Each attempt's `token` holds `minted` (h
 tokens it used) and the last expiry. The 2-day expiry warning does not apply to this kind.
 A missing, unreadable or loosely-moded key, an `openssl` failure, a refused JWT, no (or more
 than one) installation, and a refused installation token each end the attempt as
-`token_failed` with a plain `auth_error`. `status` then prints
-`TOKEN: the app could not mint a token: … - run schedule.py token app-check`, and
-`token remind` (the wrappers' notification) prints the same line.
+`token_failed` with a plain `auth_error`. `status` then prints a `TOKEN:` line that names
+`schedule.py token app-check`, and so does `token remind` (the wrappers' notification).
+This holds also when the run's first mint succeeded and a later gather's mint failed.
+Under the app route the advice is never `token renew`, which refuses while
+`token.store` is `app`.
 
 **Rotating and revoking the key.** Keys do not expire, and an app can hold up to 25.
 - *Rotate:* generate a new key on the app's page, move it over `~/.config/activity-overview/app.pem`
@@ -543,7 +545,10 @@ python3 $AO/schedule.py token status --streams $W/streams.json   # login, expiry
 
 **Without a calendar.** Each nightly run makes one identity call and records
 `token_expires_at` and `token_days_left` in `status.json`; `schedule.py status` and
-`latest` print a warning when **2 days or fewer** remain or the token was refused.
+`latest` print a warning when **2 days or fewer** remain (or the token has expired) or the
+token was refused. They and `token remind` count the days left from `token_expires_at` at
+the moment they are run, not from the last run's `token_days_left`. So a token that expires
+after the runs stopped is still caught.
 `schedule.py token remind` prints that warning as one line (no network, from
 `status.json`), and the wrappers call it after every run: the macOS wrapper posts it as a
 notification (`osascript … display notification`, the message passed as an argument), the

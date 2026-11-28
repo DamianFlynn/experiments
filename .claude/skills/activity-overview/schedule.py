@@ -1432,6 +1432,31 @@ def describe_token(info):
     return "{} - no expiry reported".format(info.get("login"))
 
 
+def token_as_of(info, now):
+    """A saved token entry with `days_left` recomputed from its `expires_at`
+    at `now`: a reader long after the last run must not trust the days left
+    that run saw (a personal token expires whether or not runs happen)."""
+    if not info or info.get("kind") == "app":
+        return info
+    expires = parse_iso(info.get("expires_at"))
+    if expires is None:
+        return info
+    return dict(info, days_left=round((expires - now).total_seconds() / 86400.0, 1))
+
+
+def token_route(cfg, top=None):
+    """'app' or 'personal': the last run's token kind, else the streams file's."""
+    return ((top or {}).get("token") or {}).get("kind") or (
+        "app" if token_settings(cfg)["store"] == "app" else "personal")
+
+
+def auth_advice(cfg, top=None):
+    """What to run when GitHub refused a token, for the route in use."""
+    if token_route(cfg, top) == "app":
+        return "run `schedule.py token app-check` (docs/SCHEDULING.md 7.1)"
+    return "run `schedule.py token renew` (docs/SCHEDULING.md 7.2)"
+
+
 def token_warning(info):
     """A one-line warning when the token is refused or expires within
     TOKEN_WARN_DAYS days, else None."""
@@ -1447,6 +1472,9 @@ def token_warning(info):
         return "the token was refused: {} - run `schedule.py token renew`".format(
             info["error"])
     left = info.get("days_left")
+    if left is not None and left <= 0:
+        return ("the token expired {} - run `schedule.py token renew`".format(
+            info.get("expires_at")))
     if left is not None and left <= TOKEN_WARN_DAYS:
         return ("the token expires {} ({} day(s) left) - run `schedule.py token "
                 "renew` before then".format(info.get("expires_at"), left))
@@ -1485,7 +1513,8 @@ def write_env_file(path, token):
     """Replace the env file atomically: a new mode-600 file in the same
     directory (mode 700), fsynced, renamed over the old one."""
     d = os.path.dirname(path)
-    os.makedirs(d, mode=0o700, exist_ok=True)
+    if d:                      # a bare file name lives in the current directory
+        os.makedirs(d, mode=0o700, exist_ok=True)
     tmp = "{}.tmp-{}".format(path, os.getpid())
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
@@ -1995,13 +2024,13 @@ def cmd_token(cfg, args, http_get=None, prompt=None, open_browser=None,
         return EXIT_OK if info["ok"] else EXIT_FAILED
     if args.token_cmd == "remind":
         top = read_json(os.path.join(cfg["workspace"], "status.json"), {}) or {}
-        info = dict(top.get("token") or {})
+        info = token_as_of(dict(top.get("token") or {}), now())
         refused = [sid for sid, e in (top.get("streams") or {}).items()
                    if e.get("auth_error")]
         msg = token_warning(info)
         if not msg and refused:
-            msg = "GitHub refused the token for {} - run `schedule.py token renew`".format(
-                ", ".join(sorted(refused)))
+            msg = "GitHub refused the token for {} - {}".format(
+                ", ".join(sorted(refused)), auth_advice(cfg, top))
         if msg:
             out(msg.replace('"', "'").replace("\\", "/") + "\n")
         return EXIT_OK
@@ -2281,7 +2310,7 @@ def latest(cfg, stream_id, lo, hi, now, max_age_hours=None, accept_stale=False,
     if out["single_store"]:
         out["next"] = next_commands(cfg, stream, used[0][1], lo, hi, cadence)
     top = read_json(os.path.join(cfg["workspace"], "status.json"), {}) or {}
-    warn = token_warning(top.get("token"))
+    warn = token_warning(token_as_of(top.get("token"), now))
     out["warnings"] = [warn] if warn else []
     if problems and not accept_stale:
         out["refusal"] = "; ".join(problems)
@@ -2361,12 +2390,14 @@ def cmd_status(cfg, args, now=utc_now):
     lines.append("last run: {} {} (exit {}), log {}".format(
         last.get("run_id", "never"), last.get("result", "-"),
         last.get("exit_code", "-"), last.get("log", "-")))
+    t = now()
+    app_route = token_route(cfg, top) == "app"
     if top.get("token"):
-        lines.append("token: {}".format(describe_token(top["token"])))
-        warn = token_warning(top["token"])
+        info = token_as_of(top["token"], t)
+        lines.append("token: {}".format(describe_token(info)))
+        warn = token_warning(info)
         if warn:
             lines.append("TOKEN: " + warn)
-    t = now()
     for s in cfg["streams"]:
         st = read_json(stream_status_path(cfg, s), {}) or {}
         lines.append("{}{}: {}".format(s["id"], "" if s["enabled"] else " (disabled)",
@@ -2382,8 +2413,13 @@ def cmd_status(cfg, args, now=utc_now):
                 if (e.get("last_attempt") or {}).get("error") else ""))
             auth = (e.get("last_attempt") or {}).get("auth_error")
             if auth:
-                lines.append("  TOKEN: {} - replace the token (docs/SCHEDULING.md "
-                             "\"Keeping the token valid\"), then re-run".format(auth))
+                if app_route:
+                    lines.append("  TOKEN: {} - run `schedule.py token app-check` to see "
+                                 "what GitHub answers (docs/SCHEDULING.md 7.1), then "
+                                 "re-run".format(auth))
+                else:
+                    lines.append("  TOKEN: {} - replace the token (docs/SCHEDULING.md "
+                                 "\"Keeping the token valid\"), then re-run".format(auth))
     sys.stdout.write("\n".join(lines) + "\n")
     return EXIT_OK if last.get("exit_code") == 0 else EXIT_FAILED
 

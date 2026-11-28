@@ -1956,6 +1956,88 @@ class TestAppCheck(AppCase):
         self.assertIn("needs no weekly renewal", err)
 
 
+class TestReviewFindings(AppCase):
+    """PR review: the advice names the route in use, readers recompute the
+    days left from the expiry, and a bare env-file name works."""
+
+    def test_a_later_app_mint_failure_points_to_app_check(self):
+        mints = {"n": 0}
+        api = FakeAppAPI()
+        real = api.__call__
+
+        def flaky(method, url, bearer, body=None, timeout=30):
+            if url.endswith("/access_tokens"):
+                mints["n"] += 1
+                if mints["n"] > 1:              # the run's check succeeds, the gather's fails
+                    return 403, {}, json.dumps({"message": "denied"})
+            return real(method, url, bearer, body, timeout)
+        path = self.app_cfg()
+        code, _out, _err = self.run_cli(["run", "--streams", path], api=flaky,
+                                        sign=fake_sign, env={"PATH": "/bin"})
+        self.assertEqual(code, 1)
+        with open(os.path.join(self.ws, "status.json"), encoding="utf-8") as fh:
+            top = json.load(fh)
+        self.assertIsNone(top["token"]["error"])
+        self.assertIn("installation token", top["streams"]["demo"]["auth_error"])
+        _code, out, _err = self.run_cli(["token", "remind", "--streams", path])
+        self.assertIn("token app-check", out)
+        self.assertNotIn("token renew", out)
+        _code, out, _err = self.run_cli(["status", "--streams", path])
+        self.assertIn("token app-check", out)
+        self.assertNotIn("Keeping the token valid", out)
+
+    def test_the_personal_route_still_points_to_renew(self):
+        path = streams_file(self.tmp)
+        self.run_cli(["run", "--streams", path],
+                     runner=Runner(gather=lambda a: (1, "", LIFETIME_403)))
+        _code, out, _err = self.run_cli(["token", "remind", "--streams", path])
+        self.assertIn("token renew", out)
+
+    def test_readers_recompute_days_left_from_the_expiry(self):
+        path = streams_file(self.tmp)
+        # the last run, on 2026-11-20, saw 5 days left ...
+        self.run_cli(["run", "--streams", path],
+                     http_get=FakeAPI(expiry="2026-11-25 02:00:00 UTC"))
+        with open(os.path.join(self.ws, "status.json"), encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["token_days_left"], 5.0)
+        # ... then runs stopped; on 2026-11-24 a day is left, on 2026-11-26 none
+        for when, needle in (("2026-11-24T02:00:00Z", "(1.0 day(s) left)"),
+                             ("2026-11-26T02:00:00Z", "expired 2026-11-25T02:00:00Z")):
+            clock = FakeClock(start=T(when))
+            with self.subTest(when=when):
+                _code, out, _err = self.run_cli(["status", "--streams", path], clock=clock)
+                self.assertIn(needle, out)
+                _code, out, _err = self.run_cli(["token", "remind", "--streams", path],
+                                                clock=clock)
+                self.assertIn(needle, out)
+                lout = io.StringIO()
+                with contextlib.redirect_stdout(lout), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    schedule.main(["latest", "--streams", path, "--stream", "demo",
+                                   "--month", "2026-11", "--accept-stale"], now=clock.now)
+                self.assertIn(needle, json.loads(lout.getvalue())["warnings"][0])
+        _code, out, _err = self.run_cli(["status", "--streams", path])   # 2026-11-20
+        self.assertNotIn("TOKEN:", out)
+
+    def test_a_bare_env_file_name(self):
+        old = os.getcwd()
+        os.chdir(self.tmp)
+        self.addCleanup(os.chdir, old)
+        schedule.write_env_file("token.env", NEW_TOKEN)
+        with open(os.path.join(self.tmp, "token.env"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "GITHUB_TOKEN={}\n".format(NEW_TOKEN))
+        self.assertEqual(os.stat("token.env").st_mode & 0o777, 0o600)
+        path = streams_file(self.tmp)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = schedule.main(["token", "renew", "--streams", path, "--store", "env-file",
+                                  "--env-file", "renewed.env", "--no-browser"],
+                                 http_get=FakeAPI(), prompt=lambda t: NEW_TOKEN,
+                                 now=FakeClock().now)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertTrue(os.path.isfile(os.path.join(self.tmp, "renewed.env")))
+
+
 class TestOwnersStreams(unittest.TestCase):
     """examples/streams.json is the owner's stream list; the group streams'
     manifests ship in examples/manifests/ and load as gather loads them."""
