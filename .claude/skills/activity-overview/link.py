@@ -7578,6 +7578,12 @@ _CARRY_RE = re.compile(r"(?i)^" + _MEV + r"[ \t]*(?:,|and|but)?[ \t]*(?:(?:is|wa
 _BUT_RE = re.compile(r"(?i)^[ \t]*,?[ \t]*but[ \t]+(?:(?:by|on|for|of|to|in|from|into)[ \t]+)?"
                      r"(?=\(?[ \t]*" + _R0 + r")")
 _TASK_RE = re.compile(r"^\s*[-*]\s+\[([ xX])\]\s+")
+# a list item: bullet or number, then an optional task box
+_LIST_ITEM_RE = re.compile(r"^([ \t]*)(?:[-*+]|\d+[.)])[ \t]+(?:\[([ xX])\][ \t]+)?")
+# a cue that ends its line with a colon ("Depends on:", "#30 depended on:")
+_COLON_CUE_RES = tuple((rel, re.compile(r"(?i)\b(?:" + cue + r")[ \t]*(?:\*\*|__)?[ \t]*:"
+                                        r"[ \t]*(?:\*\*|__)?[ \t]*$"))
+                       for rel, cue in RELATION_CUE_PHRASES)
 
 
 def _ref_of(slug, number, own_slug, url=None):
@@ -7603,11 +7609,14 @@ def _blank_unread(text):
 def relation_clauses(text):
     """The clauses a cue and its references must share: the text (code
     fences, inline code, HTML comments and quoted blocks blanked) split at
-    sentence ends, line breaks and semicolons. [(start, clause)], `start`
-    the clause's offset in `text`."""
+    sentence ends, line breaks and semicolons (never after a numbered list
+    item's own marker, "1. #12"). [(start, clause)], `start` the clause's
+    offset in `text`."""
     text = _blank_unread(text)
     out, pos = [], 0
     for m in re.finditer(r"(?<=[.!?])\s+|\n+|;\s*", text):
+        if "\n" not in m.group(0) and re.search(r"(?:^|\n)[ \t]*\d+[.)]$", text[:m.start()]):
+            continue                    # "1. #12": the marker, not a sentence end
         if text[pos:m.start()].strip():
             out.append((pos, text[pos:m.start()]))
         pos = m.end()
@@ -7741,15 +7750,39 @@ def parse_relation_claims(text, own_slug=None, default_subject=None):
     {slug (None: this repository), number, [url]}; `subject` one of
     `subjects` (one claim per subject); `query_kind` the kind to check the
     claim with in relation_holds — the relation, or the generic "waits_on"
-    for "waits on / waiting for / waited on" (any waiting relation)."""
+    for "waits on / waiting for / waited on" (any waiting relation).
+
+    A cue that ends its line with a colon ("Depends on:", "**Blocked
+    by:**", "#30 depended on:") carries into the list right below it:
+    each bullet or numbered item — up to the first line that is not an
+    item, or a blank line — is a target by the references that open it
+    (after its task box, whose state the claim takes), with the colon
+    line's subjects; an item with its own cue keeps its own relation;
+    items nested deeper than the first are details of their parent and
+    targets of nothing; the quote is the colon line and the item. A colon
+    line without a cue ("Changes:") carries nothing."""
     claims = []
+    text = text or ""
+    carry, last_end = None, None
     for start, clause in relation_clauses(text):
         masked, refs = _mask(clause, own_slug)
         task = _TASK_RE.match(masked)
         task_state = ("done" if task.group(1) in "xX" else "open") if task else None
         claimed, prev_end, prev_subjects = set(), None, None
         span = (start, start + len(clause))
-        quote = (text or "")[span[0]:span[1]].strip()[:300]     # the words as written
+        quote = text[span[0]:span[1]].strip()[:300]     # the words as written
+        gap = text[last_end:start] if last_end is not None else "\n"
+        last_end = span[1]
+        item = _LIST_ITEM_RE.match(masked)
+        under = None                    # this clause is an item of a colon cue's list
+        if carry is not None and "\n" in gap:
+            indent = len(item.group(1).expandtabs(4)) if item else -1
+            if gap.count("\n") > 1 or not item or indent < carry["min_indent"]:
+                carry = None
+            elif carry["indent"] is None or indent <= carry["indent"]:
+                carry["indent"] = indent if carry["indent"] is None else carry["indent"]
+                under = carry
+            # deeper: a detail of the item above, a target of nothing
         cues = []
         for rel, rx in _CUE_RES:
             for m in rx.finditer(masked):
@@ -7800,6 +7833,43 @@ def parse_relation_claims(text, own_slug=None, default_subject=None):
                     end += but.end() + more.end()
             taken.append((a, end))
             prev_end, prev_subjects = end, subjects
+        if under is not None and not taken:
+            lead = re.match(_MCHAIN, masked[item.end():])
+            if lead:
+                targets = [int(i) for i in re.findall(_MREF, lead.group(0))]
+                box = item.group(2)
+                for subj in under["subjects"]:
+                    claims.append({"subject": subj, "subjects": under["subjects"],
+                                   "relation": under["relation"],
+                                   "query_kind": under["query_kind"],
+                                   "targets": [refs[i] for i in targets],
+                                   "tense": under["tense"], "negated": under["negated"],
+                                   "task": None if box is None else
+                                   ("done" if box in "xX" else "open"),
+                                   "span": span,
+                                   "quote": (under["quote"] + "\n" + quote)[:300]})
+                claimed.update(targets)
+        if not taken:
+            for rel, rx in _COLON_CUE_RES:
+                m = rx.search(masked)
+                if not m:
+                    continue
+                before = masked[:m.start()]
+                subj = _SUBJ_RE.search(before)
+                subjects = [refs[int(i)] for i in re.findall(_MREF, subj.group(1))] \
+                    if subj else [default_subject]
+                claimed.update(int(i) for i in re.findall(_MREF, subj.group(1))) \
+                    if subj else None
+                cue = masked[m.start():m.end()]
+                carry = {"relation": rel, "subjects": subjects,
+                         "query_kind": "waits_on" if rel == "blocked_by"
+                         and _WAIT_WORD_RE.match(cue) else rel,
+                         "tense": "past" if (_PAST_RE.search(before)
+                                             or _PAST_CUE_RE.match(cue)) else "present",
+                         "negated": bool(_NEG_RE.search(before)), "quote": quote,
+                         "indent": None,
+                         "min_indent": len(item.group(1).expandtabs(4)) + 1 if item else 0}
+                break
         for i, r in enumerate(refs):
             if i in claimed:
                 continue

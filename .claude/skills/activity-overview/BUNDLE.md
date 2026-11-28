@@ -1822,7 +1822,15 @@ similarity (`link.build_story_relations`), as of the view's end:
   carries across coordinated predicates ("#31 is a follow-up to #11 and was caused by
   #12": both are #31's; `basis.tense` past). Code (fences, inline code), HTML comments
   and quoted blocks (lines starting with `>`: someone else's words) are not read.
-  "See #N", "fixes / closes #N" are `mentions`. A task-list line
+  "See #N", "fixes / closes #N" are `mentions`. A cue that ends its line with a colon
+  ("Depends on:", "**Blocked by:**", "#30 depended on:") carries into the list right
+  below it: each bullet or numbered item, up to the first line that is not an item or
+  a blank line, is a target by the references that open it (after its task box, whose
+  state `basis.task_done` takes), with the colon line's subjects, and the quote is the
+  colon line plus the item; an item with its own cue keeps its own relation; items
+  nested deeper than the first are details of their parent and targets of nothing (a
+  colon cue that is itself an item carries into its own sub-items only); a colon line
+  without a cue ("Changes:") carries nothing. A task-list line
   naming an item (`- [ ] #N`, `- [ ] https://github.com/o/r/pull/N`) is `depends_on`,
   with `basis.task_done` (its box ticked: a
   ticked task waits on nothing). Any other reference is `mentions` — a bare reference is
