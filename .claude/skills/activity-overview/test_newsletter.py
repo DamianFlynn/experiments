@@ -2921,8 +2921,15 @@ class TestStoryRelations(unittest.TestCase):
                         "/pull/12).\n")
         self.assertEqual((r[0]["problem"], r[0]["reason"]),
                          ("the blocker is no longer open", "target_not_open"))
-        # "waits on" is another kind (blocked_by) than the record's "needs"
+        # "waits on" is the generic waiting kind: it matches the record's "needs"
+        # (depends_on), and #12 merged, so it is no longer waited on
         r = self.claims("## Stories\n\n[#30](" + R + "/pull/30) still waits on [#12](" + R +
+                        "/pull/12).\n")
+        self.assertEqual((r[0]["claim"], r[0]["reason"]), ("waits_on", "target_not_open"))
+        self.assertEqual(self.claims("## Stories\n\n[#30](" + R + "/pull/30) waited on [#12](" +
+                                     R + "/pull/12).\n"), [])
+        # a specific kind still needs its own evidence
+        r = self.claims("## Stories\n\n[#30](" + R + "/pull/30) was blocked by [#12](" + R +
                         "/pull/12).\n")
         self.assertEqual(r[0]["reason"], "no_evidence")
         # on 3 October #12 (opened 30 September, merged 4 October) was still open
@@ -3224,6 +3231,106 @@ class TestRelationClaimsParsed(TestStoryRelations):
                         "/pull/12) ([comment](" + R + "/pull/12#issuecomment-1)) and [#13](" + R +
                         "/pull/13).\n")
         self.assertEqual([x["target"] for x in r], ["o/r#13"])
+
+    # adversarial round: wrongly accepted before
+    def test_m1_a_heading_and_an_emphasised_cue_are_read(self):
+        r = self.claims("## Stories\n\n### #30 depends on #13\n\nText.\n")
+        self.assertEqual([(x["subject"], x["target"]) for x in r], [("o/r#30", "o/r#13")])
+        r = self.claims("## Stories\n\n#30 **depended on** #13.\n")
+        self.assertEqual([(x["subject"], x["target"]) for x in r], [("o/r#30", "o/r#13")])
+        self.assertEqual(self.claims("## Stories\n\n#30 **depended on** #12.\n"), [])
+
+    def test_m2_a_denial_of_a_non_waiting_relation_is_judged_as_stated(self):
+        # #31 is merged: "in force" is a waiting notion, a follow-up stays one
+        r = newsletter.relation_claims([self.v()], "## Stories\n\n#31 is no longer a follow-up "
+                                                   "to #11.\n")
+        self.assertEqual([(x["subject"], x["target"]) for x in r["relation_denials_contradicted"]],
+                         [("o/r#31", "o/r#11")])
+        r = newsletter.relation_claims([self.v()], "## Stories\n\n#30 never depended on #12.\n")
+        self.assertEqual(len(r["relation_denials_contradicted"]), 1)
+        # a waiting relation no longer in force may be denied in the present
+        r = newsletter.relation_claims([self.v()], "## Stories\n\n#30 no longer waits on #12.\n")
+        self.assertEqual(r["relation_denials_contradicted"], [])
+
+    def test_m3_generic_waiting_against_an_external_and_a_compound(self):
+        self.assertEqual(self.claims("## Stories\n\n#30 waited on x/y#9.\n"), [])
+        r = self.claims("## Stories\n\n#30 still waits on https://github.com/x/y/issues/9.\n")
+        self.assertEqual((r[0]["claim"], r[0]["reason"]), ("waits_on", "state_unknown"))
+        r = self.claims("## Stories\n\n#30 was not blocked by #12 but by #13.\n")
+        self.assertEqual([(x["claim"], x["target"]) for x in r], [("blocked_by", "o/r#13")])
+
+
+class TestSharedReferences(unittest.TestCase):
+    """State, supersession and item checks read references with link.item_refs
+    and states with link.item_state / link.record_superseded."""
+
+    def v(self):
+        v = TestStoryRelations().v()
+        v["prs"].append({"number": 40, "title": "fix: x", "author": "sam", "url": R + "/pull/40",
+                         "state": "open", "merged": False, "created_at": "2026-10-02T10:00:00Z",
+                         "lifecycle": [{"event": "closed", "created_at": "2026-10-05T10:00:00Z"},
+                                       {"event": "reopened", "created_at": "2026-10-07T10:00:00Z"}]})
+        v["prs"].append({"number": 22, "title": "fix: y", "author": "sam", "url": R + "/pull/22",
+                         "state": "closed", "merged": False, "created_at": "2026-10-02T10:00:00Z",
+                         "closed_at": "2026-10-08T10:00:00Z",
+                         "closed_unmerged": {"superseded_by": 11, "quote": "superseded by #11",
+                                             "at": "2026-10-08T10:00:00Z"}})
+        return v
+
+    def st(self, text, **kw):
+        return newsletter.state_claims([self.v()], "## Stories\n\n" + text + "\n", **kw)
+
+    def test_a_reopened_pr_and_one_not_yet_opened(self):
+        u = "[#40](" + R + "/pull/40)"
+        self.assertEqual(self.st(u + " is still open.")["pr_state_mismatch"], [])
+        self.assertEqual(self.st(u + " was closed without merging.", as_of="2026-10-06")
+                         ["pr_state_mismatch"], [])
+        r = self.st(u + " was closed without merging.")["pr_state_mismatch"]
+        self.assertEqual((r[0]["pr"], r[0]["view"]), (40, "open"))
+        r = self.st(u + " is still open.", as_of="2026-10-01")["pr_state_mismatch"]
+        self.assertEqual(r[0]["view"], "not_opened")
+        self.assertEqual(newsletter.pr_state_on(self.v()["prs"][-2], "2026-10-06"),
+                         "closed_unmerged")
+
+    def test_every_link_form_names_its_item(self):
+        for txt in ("[#12](" + R + "/pull/12#issuecomment-1) is still open.",
+                    "[the bump](" + R + "/pull/12) is still open.",
+                    "o/r#12 is still open."):
+            r = self.st(txt)["pr_state_mismatch"]
+            self.assertEqual((r[0]["pr"], r[0]["view"]), (12, "merged"), txt)
+        # another repository's #12, and a comment link with other text, are not #12 here
+        self.assertEqual(self.st("o/s#12 is still open.")["pr_state_mismatch"], [])
+        self.assertEqual(self.st("A [comment](" + R + "/pull/12#issuecomment-1) is still open.")
+                         ["pr_state_mismatch"], [])
+
+    def test_supersession_is_the_records_answer(self):
+        a, b = "[#22](" + R + "/pull/22)", "[#11](" + R + "/pull/11)"
+        self.assertEqual(self.st(a + " was superseded by " + b + ".")["superseded_not_in_view"], [])
+        r = self.st(a + " was superseded by [#10](" + R + "/pull/10).")["superseded_not_in_view"]
+        self.assertEqual((r[0]["pr"], r[0]["by"], r[0]["reason"]), (22, 10, "other_item"))
+        r = self.st(a + " was replaced by " + b + ".", as_of="2026-10-07")["superseded_not_in_view"]
+        self.assertEqual(r[0]["reason"], "after_day")
+        # "consolidated into" is where content went, not a supersession claim
+        self.assertEqual(self.st(a + " was consolidated into [#10](" + R + "/pull/10).")
+                         ["superseded_not_in_view"], [])
+
+    def test_items_not_in_view_reads_every_link_form(self):
+        anchor = "A pipeline action was bumped in [#12](https://github.com/o/r/pull/12)."
+        for add in (" See [o/r#99](" + R + "/pull/99).", " See [this one](" + R + "/pull/99).",
+                    " See o/r#99.", " See #99."):
+            r = newsletter.check_newsletter([self.v()], GOOD.replace(anchor, anchor + add),
+                                            slices={"train-issue-5": SLICE})
+            self.assertEqual(r["items_not_in_view"], [99], add)
+        # another repository's item is checked as a URL; code is not prose
+        for add in (" See [x/y#9](https://github.com/x/y/issues/9).", " The log said `#99`."):
+            r = newsletter.check_newsletter([self.v()], GOOD.replace(anchor, anchor + add),
+                                            slices={"train-issue-5": SLICE})
+            self.assertEqual(r["items_not_in_view"], [], add)
+
+    def test_post_facts_keep_owner_repo_references_whole(self):
+        f = newsletter.post_facts("Fixed in #12 and o/s#4, version 1.2.3, 5 modules.")
+        self.assertEqual((f["items"], f["numbers"], f["versions"]), (["12", "o/s#4"], ["5"],
+                                                                     ["1.2.3"]))
 
 
 class TestThemeCheck(unittest.TestCase):
