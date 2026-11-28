@@ -1524,28 +1524,17 @@ def run_security(argv, stdin_text=None):
     return proc.returncode, proc.stdout
 
 
-# --- the folder that holds a secret --------------------------------------------------
+# --- secrets on disk: one resolution step, one policy --------------------------------
 #
-# The rule for the folder that directly holds the secret (token env file,
-# app private key); the whole path above it is checked by verify_secret_chain:
-#   * group- or other-WRITABLE folder (even with the sticky bit). Whoever can
-#     write the folder can replace or rename the file whatever its own mode
-#     (a planted token, or a planted key the runner would sign with).
-#       - read paths (runs, `token status`, `token app-check`, `token where`
-#         for the wrappers): refused;
-#       - write paths (`token renew`, `token app-key`): tightened to 700 when
-#         the folder is the user's own and not a shared location, and the
-#         output says so; refused otherwise, before anything is written.
-#   * group- or other-READABLE (not writable) folder: on a write path
-#     tightened to 700 the same way (the user's own, not shared); otherwise,
-#     and on every read path, a warning: the file's own mode 600 keeps its
-#     content private, the folder only exposes its names.
-#   * never chmod a folder the user does not own, or a shared location (the
-#     home directory, /, the temporary directories, the workspace).
+# The token env file and the app's private key are only ever reached through
+# resolve_secret_path(): the path as typed is never used again once it is
+# resolved, and every rule below applies to the RESOLVED location (the real
+# file, its real parent folder) and to the open handle. The policy table is
+# the docstring of resolve_secret_path; docs/SCHEDULING.md 7 has the same.
 
 
 class SecretDirError(ValueError):
-    """The folder holding a secret is unsafe; the message names the fix."""
+    """A secret's path, folder or file is unsafe; the message names the fix."""
 
 
 def _shared_locations(workspace=None):
@@ -1555,44 +1544,6 @@ def _shared_locations(workspace=None):
         places.add(workspace)
     return {os.path.realpath(p) for p in places}
 
-
-def _dir_of(path):
-    return os.path.dirname(os.path.abspath(path))
-
-
-# --- the whole path to a secret ------------------------------------------------------
-#
-# Checking only the folder that holds a secret is not enough: a mode-700
-# /shared/private under a world-writable /shared can be renamed away by
-# another user and replaced with their own folder and file. So every path to
-# a secret is walked component by component from / (verify_secret_chain):
-#
-#   * every directory on the way, the root included, is owned by the user or
-#     by root;
-#   * no directory on the way is writable by group or others, except one with
-#     the sticky bit (like /tmp) where the next component down is owned by the
-#     user or root: the sticky bit lets only an entry's owner (or root) rename
-#     or remove it, so nobody else can swap that entry;
-#   * a symlink on the way is a substitution point too: its own directory is
-#     checked like any other (above), the link must be owned by the user or
-#     root, and its target is then walked from / in the same way (relative
-#     targets from the link's directory; `..` is followed through the real,
-#     already-walked directories, never lexically);
-#   * the secret file itself must be a regular file owned by the user.
-#
-# On top of the chain, the folder that directly holds the secret keeps its
-# stricter rule (check_secret_dir / secure_secret_dir below: never writable
-# by group or others, even with the sticky bit).
-#
-# Deliberately NOT covered: access control lists (only the mode bits and
-# owners are read); a directory owned by root but administered by someone
-# else (root is trusted on the whole path); and the time between the check
-# and the use. That window is narrowed where it is cheap: a secret the runner
-# reads is opened once, without following a final symlink, and the open
-# handle is checked (fstat: the same file the walk saw, regular, the user's);
-# the wrappers source the env file by path, but the real path `token where`
-# prints contains no symlink left to swap. Changing a directory on a checked
-# path needs its owner (the user) or root, which the walk already trusts.
 
 MAX_SYMLINKS = 40
 
@@ -1626,193 +1577,313 @@ def _swappable(what, original, folder, mode, entry):
             folder, mode & 0o7777, entry, folder))
 
 
-def verify_secret_chain(path, what="the token", allow_missing=False):
-    """Walk `path` from / and apply the rule above. Returns (real_path, st):
-    the path with every symlink resolved and the lstat of its last
-    component (None when it does not exist and `allow_missing`). Raises
-    SecretDirError naming the offending component and the fix."""
+class Resolved:
+    """Where a requested secret path really is (resolve_secret_path):
+    `real` the resolved path of the last component, `st` its lstat (None when
+    missing); `parent` / `parent_st` the real folder that holds it (parent_st
+    None when that folder does not exist yet); `to_create` the real folders
+    that a write would have to create, outermost first."""
+
+    def __init__(self, real, st, parent, parent_st, to_create=()):
+        self.real, self.st = real, st
+        self.parent, self.parent_st = parent, parent_st
+        self.to_create = list(to_create)
+
+
+def resolve_secret_path(path, what="the token", allow_missing=False, final="file"):
+    """Resolve the path of a secret (the token env file, the app's private
+    key; `final="dir"` for a folder meant to hold one, whose own parent is
+    then a directory on the path) by walking it component by component
+    from / WITHOUT normalising it first: a relative path is only joined with
+    the working directory, never passed through abspath/normpath, so `..`
+    is followed through the real folders after every symlink, as the kernel
+    does. Returns a Resolved; raises SecretDirError naming the component at
+    fault and the fix.
+
+    The policy, applied to the resolved location (R: read paths, i.e. runs,
+    `token status`, `token app-check`, `token where` for the wrappers;
+    W: `token renew`, which writes the env file fresh; I: `token app-key
+    --import`, whose source bytes are about to be trusted):
+
+    component             owner            g/o write              g/o read   sticky
+    --------------------  ---------------  ---------------------  ---------  -----------------
+    directory on the      you or root,     refuse (R, W, I),      accept     a g/o-writable dir
+      path (/ included)   else refuse      unless sticky (next)              with the sticky bit
+                                                                             is accepted when the
+                                                                             next entry is yours
+                                                                             or root's, else
+                                                                             refused
+    symlink on the path   you or root,     (a link's own mode     -          -
+      (a final one too)   else refuse      means nothing; its
+                                           folder is a directory
+                                           on the path, above)
+    parent folder of the  you or root      R: refuse.             R: warn.   no exception: a
+      resolved file       (as a directory  W: tighten to 700 if   W, I:      sticky g/o-writable
+                          on the path)     yours and not shared,  tighten    parent counts as
+                                           else refuse.           if yours   writable
+                                           I: refuse (no chmod    and not
+                                           makes bytes others     shared,
+                                           could write trusted)   else warn
+    the resolved file     you, else        R, I: refuse.          R: refuse  -
+                          refuse; regular  W: replaced by a       (mode 600
+                          file only        fresh mode-600 file    required).
+                                                                  I: warn
+
+    "Shared" folders are never chmod-ed: the home directory, /, the
+    temporary directories, the workspace. A folder a write has to create is
+    created mode 700 inside a folder that passes the directory rule (a
+    g/o-writable one only with the sticky bit). After the walk a secret is
+    opened once, without following a final symlink, and the open handle must
+    be the file the walk saw (same device and inode); the file rule is
+    checked again on that handle.
+
+    Not covered: access control lists (only mode bits and owners are read);
+    a root-owned directory someone else administers (root is trusted on the
+    whole path); a change by the user or root after the check; and the
+    wrappers, which source the env file by the real path `token where`
+    prints (no symlink left in it), between that check and their read."""
     import stat as statmod
     uid = _uid()
-    original = os.path.abspath(os.path.expanduser(path))
-    pending = [p for p in original.split(os.sep) if p]
+    typed = os.path.expanduser(path)
+    if not os.path.isabs(typed):
+        typed = os.path.join(os.getcwd(), typed)       # joined, never normalised
+    pending = typed.split(os.sep)[1:]
     cur = os.sep
     st_cur = os.lstat(cur)
     if not _owner_ok(cur, st_cur, uid):
-        raise _chain_error(what, original, "/ is owned by uid {}".format(
-            owner_of(cur, st_cur)))
+        raise _chain_error(what, typed, "/ is owned by uid {}".format(owner_of(cur, st_cur)))
     links = 0
-    st = st_cur
     while pending:
         name = pending.pop(0)
         if name in ("", "."):
             continue
         if name == "..":
-            cur = os.path.dirname(cur) or os.sep
-            st_cur = st = os.lstat(cur)
+            cur = os.path.dirname(cur) or os.sep       # `cur` is real: exact
+            st_cur = os.lstat(cur)
             continue
         nxt = os.path.join(cur, name)
         dmode = st_cur.st_mode
+        # the last component of a FILE request: its folder is the parent of
+        # the resolved file, judged by the stricter parent-folder rule
+        # (_folder_rule) instead of the directory rule below. A symlink there
+        # is still a substitution point and is checked as one.
+        last_of_file = final == "file" and not [p for p in pending if p not in ("", ".")]
         try:
             st = os.lstat(nxt)
         except FileNotFoundError:
             if not allow_missing:
-                raise _chain_error(what, original, "{} does not exist".format(nxt))
-            # what is missing will be created in `cur`: it must be a folder
-            # nobody else can swap the new entry in (sticky: the new entry is
-            # ours, so it is protected)
-            if dmode & 0o022 and not dmode & statmod.S_ISVTX:
-                raise _swappable(what, original, cur, dmode, nxt)
-            return os.path.join(nxt, *pending), None
+                raise _chain_error(what, typed, "{} does not exist".format(nxt))
+            # a write creates what is missing inside `cur`: nobody else may be
+            # able to swap the new entry there (sticky: the new entry is ours)
+            if dmode & 0o022 and not dmode & statmod.S_ISVTX and not last_of_file:
+                raise _swappable(what, typed, cur, dmode, nxt)
+            rest = [p for p in pending if p not in ("", ".")]
+            if ".." in rest:
+                raise _chain_error(what, typed, "the path goes up (`..`) through {}, "
+                                   "which does not exist".format(nxt))
+            if not rest:
+                return Resolved(nxt, None, cur, st_cur)
+            folders = [os.path.join(nxt, *rest[:i]) for i in range(len(rest))]
+            return Resolved(os.path.join(nxt, *rest), None, folders[-1], None, folders)
         # may anyone but the user or root replace `nxt` inside `cur`?
-        if dmode & 0o022:
-            sticky = bool(dmode & statmod.S_ISVTX)
-            if not sticky:
-                raise _swappable(what, original, cur, dmode, nxt)
+        is_link = statmod.S_ISLNK(st.st_mode)
+        if dmode & 0o022 and (is_link or not last_of_file):
+            if not dmode & statmod.S_ISVTX:
+                raise _swappable(what, typed, cur, dmode, nxt)
             if not _owner_ok(nxt, st, uid):
                 raise _chain_error(
-                    what, original,
+                    what, typed,
                     "{} is writable by others with the sticky bit, which protects only "
                     "entries owned by you or root, but {} is owned by uid {}".format(
                         cur, nxt, owner_of(nxt, st)))
-        if statmod.S_ISLNK(st.st_mode):
+        if is_link:
             links += 1
             if links > MAX_SYMLINKS:
-                raise _chain_error(what, original, "too many symlinks")
+                raise _chain_error(what, typed, "too many symlinks")
             if not _owner_ok(nxt, st, uid):
                 raise _chain_error(
-                    what, original,
+                    what, typed,
                     "{} is a symlink owned by uid {} (neither you nor root): its owner "
                     "can point it anywhere. Fix: use the real path, or a link you own".format(
                         nxt, owner_of(nxt, st)))
             target = os.readlink(nxt)
-            if not os.path.isabs(target):
-                target = os.path.join(cur, target)
-            # the target is walked from / like the original path
-            pending = [p for p in target.split(os.sep) if p] + pending
-            cur = os.sep
-            st_cur = os.lstat(cur)
+            if os.path.isabs(target):
+                pending = target.split(os.sep)[1:] + pending
+                cur, st_cur = os.sep, os.lstat(os.sep)
+            else:
+                pending = target.split(os.sep) + pending  # from the link's folder
             continue
-        if pending and not statmod.S_ISDIR(st.st_mode):
-            raise _chain_error(what, original, "{} is not a directory".format(nxt))
+        if pending and [p for p in pending if p not in ("", ".")] \
+                and not statmod.S_ISDIR(st.st_mode):
+            raise _chain_error(what, typed, "{} is not a directory".format(nxt))
         if statmod.S_ISDIR(st.st_mode) and not _owner_ok(nxt, st, uid):
             raise _chain_error(
-                what, original,
+                what, typed,
                 "{} is owned by uid {} (neither you nor root), who could replace "
                 "everything below it. Fix: keep the file under folders owned by you or "
                 "root".format(nxt, owner_of(nxt, st)))
         cur, st_cur = nxt, st
-    return cur, st
+    parent = os.path.dirname(cur) or os.sep
+    return Resolved(cur, st_cur, parent, os.lstat(parent))
 
 
-def open_secret_file(path, what="the token"):
-    """Open a secret once, after verify_secret_chain: no final symlink is
-    followed (O_NOFOLLOW), and the open handle must be the file the walk saw
-    (same device and inode), a regular file, owned by the user. Returns the
-    bytes. Raises SecretDirError."""
+def verify_secret_chain(path, what="the token", allow_missing=False):
+    """(real path, lstat or None) of a secret path: resolve_secret_path."""
+    r = resolve_secret_path(path, what, allow_missing)
+    return r.real, r.st
+
+
+def _folder_rule(folder, st, mode, workspace, what):
+    """The rule for the real folder that holds a secret (see the table in
+    resolve_secret_path). `mode` "read", "write" (a file about to be written
+    fresh: a writable folder of your own is tightened first), or "import"
+    (bytes about to be trusted: a writable folder is refused as on a read,
+    since tightening it now cannot make bytes someone else could have written
+    trustworthy; a readable one is tightened as on a write). Returns the
+    messages to show (tightened / warnings); raises SecretDirError."""
+    m = st.st_mode & 0o777
+    if not m & 0o077:
+        return []
+    if mode == "import":
+        mode = "read" if m & 0o022 else "write"
+    if mode == "write":
+        shared = folder in _shared_locations(workspace)
+        mine = owner_of(folder, st) == _uid()
+        if mine and not shared:
+            os.chmod(folder, 0o700)
+            return ["tightened {} from mode {:o} to 700 (it holds {})".format(
+                folder, m, what)]
+        why = "a shared location" if shared else "not your own folder"
+        if m & 0o022:
+            raise SecretDirError(
+                "{} would go in {}, which is writable by group or others (mode {:o}) and "
+                "is {}, so its mode is not changed: put the file in a private folder "
+                "such as ~/.config/activity-overview".format(what, folder, m, why))
+        return ["{}'s folder {} is readable by group or others (mode {:o}) and is {}, "
+                "so its mode is not changed; a private folder such as "
+                "~/.config/activity-overview would hide the file's name too".format(
+                    what, folder, m, why)]
+    if m & 0o022:
+        raise SecretDirError(
+            "{} is in {}, which is writable by group or others (mode {:o}): anyone who "
+            "can write the folder can replace the file. Fix: `chmod 700 {}` if it is "
+            "your own private folder, or move the file to one such as "
+            "~/.config/activity-overview (mode 700)".format(what, folder, m, folder))
+    return ["{}'s folder {} is readable by group or others (mode {:o}); the file itself "
+            "is private, but `chmod 700 {}` (or a private folder) hides its name "
+            "too".format(what, folder, m, folder)]
+
+
+def _file_rule(real, st, what, readable):
+    """The rule for the resolved secret file (see the table): regular, the
+    user's own, never writable by group or others; readable by them refused
+    (`readable` "refuse") or warned about ("warn"). Returns warnings."""
     import stat as statmod
-    real, seen = verify_secret_chain(path, what)
-    if not statmod.S_ISREG(seen.st_mode):
-        raise _chain_error(what, path, "{} is not a regular file".format(real))
+    if not statmod.S_ISREG(st.st_mode):
+        raise _chain_error(what, real, "{} is not a regular file".format(real))
+    if owner_of(real, st) != _uid():
+        raise _chain_error(what, real, "{} is owned by uid {}, not you".format(
+            real, owner_of(real, st)))
+    m = st.st_mode & 0o777
+    if m & 0o022:
+        raise _chain_error(what, real, "{} is mode {:o}, writable by group or others: "
+                           "another user can overwrite it. Fix: `chmod 600` it (and "
+                           "check its content)".format(real, m))
+    if m & 0o055:
+        if readable == "warn":
+            return ["{} is mode {:o}, readable by others: `chmod 600` it, or delete it "
+                    "once it is no longer needed".format(real, m)]
+        raise _chain_error(what, real, "{} is mode {:o}, readable by group or others: "
+                           "`chmod 600` it".format(real, m))
+    return []
+
+
+def open_secret_file(path, what="the token", folder="read", readable="refuse",
+                     workspace=None, messages=None):
+    """Read a secret through the one resolution step: resolve the path, apply
+    the folder rule to the RESOLVED parent (`folder` "read", or "write" for
+    the import source), the file rule to the resolved file, then open the
+    resolved path once without following a final symlink and check the
+    handle (the same file the walk saw; the file rule again). Returns
+    (bytes, fstat); the folder and file messages go to `messages`."""
+    import stat as statmod
+    r = resolve_secret_path(path, what)
+    notes = _folder_rule(r.parent, r.parent_st, folder, workspace, what)
+    _file_rule(r.real, r.st, what, readable)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
-        fd = os.open(real, flags)
+        fd = os.open(r.real, flags)
     except OSError as exc:
         raise _chain_error(what, path, "{} cannot be opened: {}".format(
-            real, exc.strerror or exc))
+            r.real, exc.strerror or exc))
     try:
         st = os.fstat(fd)
-        if (st.st_dev, st.st_ino) != (seen.st_dev, seen.st_ino) or \
+        if (st.st_dev, st.st_ino) != (r.st.st_dev, r.st.st_ino) or \
                 not statmod.S_ISREG(st.st_mode):
-            raise _chain_error(what, path, "{} changed while it was being checked".format(real))
-        if owner_of(real, st) != _uid():
-            raise _chain_error(what, path, "{} is owned by uid {}, not you".format(
-                real, owner_of(real, st)))
+            raise _chain_error(what, path, "{} changed while it was being checked".format(
+                r.real))
+        notes += _file_rule(r.real, st, what, readable)
         chunks = []
         while True:
             block = os.read(fd, 65536)
             if not block:
                 break
             chunks.append(block)
-        return b"".join(chunks), st
     finally:
         os.close(fd)
+    if messages is not None:
+        messages.extend(notes)
+    return b"".join(chunks), st
 
 
-def env_file_for_wrapper(path):
-    """The env file's real path, its whole path verified: what a wrapper may
-    source. A missing file comes back as its real would-be path (the wrapper
-    then reports it missing); an existing one must be a regular file of the
-    user's own."""
-    import stat as statmod
-    real, st = verify_secret_chain(path, "the token", allow_missing=True)
-    if st is not None:
-        if not statmod.S_ISREG(st.st_mode):
-            raise _chain_error("the token", path, "{} is not a regular file".format(real))
-        if owner_of(real, st) != _uid():
-            raise _chain_error("the token", path, "{} is owned by uid {}, not you".format(
-                real, owner_of(real, st)))
-    return real
+def env_file_for_wrapper(path, messages=None):
+    """The env file's real path, for a wrapper to source: resolved, the read
+    folder rule on its resolved parent, the file rule (mode 600) on the
+    resolved file. A missing file comes back as its real would-be path (the
+    wrapper then reports it missing)."""
+    r = resolve_secret_path(path, "the token", allow_missing=True)
+    if r.parent_st is not None:
+        notes = _folder_rule(r.parent, r.parent_st, "read", None, "the token")
+        if messages is not None:
+            messages.extend(notes)
+    if r.st is not None:
+        _file_rule(r.real, r.st, "the token", "refuse")
+    return r.real
 
 
 def check_secret_dir(directory, workspace=None, what="the token"):
-    """Read paths: verify the whole path to `directory` (verify_secret_chain),
-    then raise SecretDirError when `directory` itself is group- or
-    other-writable (even with the sticky bit); return a warning (or None)
-    when it is only group- or other-readable."""
-    try:
-        directory, st = verify_secret_chain(directory, what, allow_missing=True)
-    except FileNotFoundError:
-        return None
-    if st is None:
+    """Read paths: resolve the folder, then apply the read folder rule to the
+    RESOLVED folder. Returns a warning (or None); raises SecretDirError."""
+    import stat as statmod
+    r = resolve_secret_path(directory, what, allow_missing=True, final="dir")
+    if r.st is None:
         return None                      # a missing folder: the file check says so
-    mode = st.st_mode & 0o777
-    if mode & 0o022:
-        raise SecretDirError(
-            "{} is in {}, which is writable by group or others (mode {:o}): anyone who "
-            "can write the folder can replace the file. Fix: `chmod 700 {}` if it is "
-            "your own private folder, or move the file to one such as "
-            "~/.config/activity-overview (mode 700)".format(what, directory, mode,
-                                                             directory))
-    if mode & 0o055:
-        return ("{}'s folder {} is readable by group or others (mode {:o}); the file "
-                "itself is private, but `chmod 700 {}` (or a private folder) hides its "
-                "name too".format(what, directory, mode, directory))
-    return None
+    if not statmod.S_ISDIR(r.st.st_mode):
+        raise _chain_error(what, r.real, "{} is not a directory".format(r.real))
+    notes = _folder_rule(r.real, r.st, "read", workspace, what)
+    return notes[0] if notes else None
+
+
+def _make_folders(folders):
+    for d in folders:
+        os.mkdir(d, 0o700)
+        os.chmod(d, 0o700)               # mkdir's mode is filtered by the umask
 
 
 def secure_secret_dir(directory, workspace=None, what="the token"):
-    """Write paths: create `directory` (700) if missing; tighten an existing
-    group/other-readable folder of the user's own to 700 unless it is a shared
-    location. Returns the notes to print; raises SecretDirError for a folder
-    that stays group/other-writable, and for any unsafe directory or symlink
-    on the way to it (verify_secret_chain; ancestors are never chmod-ed)."""
-    directory, st = verify_secret_chain(directory, what, allow_missing=True)
-    if st is None:
-        os.makedirs(directory, mode=0o700, exist_ok=True)
-        os.chmod(directory, 0o700)       # makedirs' mode is filtered by the umask
-        verify_secret_chain(directory, what)
-        return []
+    """Write paths: resolve the folder; create what is missing (700) inside a
+    folder that passes the directory rule; apply the write folder rule to the
+    RESOLVED folder (tighten when yours and not shared, else refuse a
+    writable one, warn about a readable one). Returns the messages."""
     import stat as statmod
-    if not statmod.S_ISDIR(st.st_mode):
-        raise _chain_error(what, directory, "{} is not a directory".format(directory))
-    mode = st.st_mode & 0o777
-    if not mode & 0o077:
+    r = resolve_secret_path(directory, what, allow_missing=True, final="dir")
+    if r.st is None:
+        _make_folders(r.to_create + [r.real])
+        resolve_secret_path(directory, what, final="dir")
         return []
-    shared = directory in _shared_locations(workspace)
-    mine = owner_of(directory, st) == _uid()
-    if mine and not shared:
-        os.chmod(directory, 0o700)
-        return ["tightened {} from mode {:o} to 700 (it holds {})".format(
-            directory, mode, what)]
-    why = ("a shared location" if shared else "not your own folder")
-    if mode & 0o022:
-        raise SecretDirError(
-            "{} would go in {}, which is writable by group or others (mode {:o}) and is "
-            "{}, so its mode is not changed: put the file in a private folder such as "
-            "~/.config/activity-overview".format(what, directory, mode, why))
-    return ["{}'s folder {} is readable by group or others (mode {:o}) and is {}, so "
-            "its mode is not changed; a private folder such as ~/.config/activity-overview "
-            "would hide the file's name too".format(what, directory, mode, why)]
+    if not statmod.S_ISDIR(r.st.st_mode):
+        raise _chain_error(what, r.real, "{} is not a directory".format(r.real))
+    return _folder_rule(r.real, r.st, "write", workspace, what)
 
 
 _warned_dirs = set()
@@ -1825,19 +1896,27 @@ def warn_once(message, key):
 
 
 def write_env_file(path, token, workspace=None):
-    """Replace the env file atomically: a new mode-600 file, fsynced, renamed
-    over the old one, in a folder made private first (secure_secret_dir: a
-    new folder is created 700; an existing group/other-readable one of the
-    user's own is tightened to 700; a group/other-writable one that cannot be
-    is refused before anything is written), after the whole path to it is
-    verified (verify_secret_chain: no directory or symlink on the way that
-    anyone but the user or root could swap). The file is written in the
-    folder's real path, so no symlink is followed between check and write.
-    Returns the notes to print."""
-    notes = secure_secret_dir(_dir_of(path), workspace, "the token")
-    real_dir, _st = verify_secret_chain(_dir_of(path), "the token")
-    path = os.path.join(real_dir, os.path.basename(path))
-    tmp = "{}.tmp-{}".format(path, os.getpid())
+    """Replace the env file atomically, through the one resolution step: the
+    path is resolved (missing folders created 700 inside a folder that
+    passes the directory rule), the write folder rule is applied to the
+    RESOLVED parent (tightened to 700 when yours and not shared, refused when
+    writable otherwise), an existing resolved file must pass the file rule's
+    owner and type checks, and the new mode-600 file is created O_EXCL and
+    O_NOFOLLOW in that resolved parent, its mode set on the handle, fsynced
+    and renamed over the resolved file. Returns the messages to print."""
+    import stat as statmod
+    r = resolve_secret_path(path, "the token", allow_missing=True)
+    if r.parent_st is None:
+        _make_folders(r.to_create)
+        r = resolve_secret_path(path, "the token", allow_missing=True)
+    notes = _folder_rule(r.parent, r.parent_st, "write", workspace, "the token")
+    if r.st is not None:
+        if not statmod.S_ISREG(r.st.st_mode):
+            raise _chain_error("the token", r.real, "{} is not a regular file".format(r.real))
+        if owner_of(r.real, r.st) != _uid():
+            raise _chain_error("the token", r.real, "{} is owned by uid {}, not you".format(
+                r.real, owner_of(r.real, r.st)))
+    tmp = os.path.join(r.parent, "{}.tmp-{}".format(os.path.basename(r.real), os.getpid()))
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
                  0o600)
     try:
@@ -1848,9 +1927,9 @@ def write_env_file(path, token, workspace=None):
             fh.write("GITHUB_TOKEN={}\n".format(token))
             fh.flush()
             os.fsync(fh.fileno())
-        # the rename and the cleanup work on names inside the verified,
-        # private real folder: neither follows a symlink at the target name
-        os.replace(tmp, path)
+        # the rename and the cleanup work on names inside the resolved,
+        # private parent: neither follows a symlink at the target name
+        os.replace(tmp, r.real)
     except BaseException:
         try:
             os.remove(tmp)
@@ -1926,20 +2005,18 @@ def keychain_write_checked(acct, svc, value, security=run_security):
         "unknown")
 
 
-def read_stored_token(settings, security=run_security):
+def read_stored_token(settings, security=run_security, messages=None):
     """The stored personal token, or None when there is none. The env file is
-    opened once after its whole path is verified (open_secret_file), and must
-    be mode 600 on the open handle, as the wrappers require; an unsafe path
-    or mode raises SecretDirError."""
+    read through the one resolution step (open_secret_file: the read folder
+    rule on its resolved parent, mode 600 on the resolved file and on the
+    open handle, as the wrappers require); an unsafe path, folder or mode
+    raises SecretDirError. Folder warnings go to `messages`."""
     if settings["store"] == "env-file":
         if not os.path.lexists(settings["env_file"]):
             return None
-        data, st = open_secret_file(settings["env_file"], "the token")
-        if st.st_mode & 0o077:
-            raise _chain_error("the token", settings["env_file"],
-                               "the file is mode {:o}, readable or writable by others: "
-                               "`chmod 600` it (token renew writes it 600)".format(
-                                   st.st_mode & 0o777))
+        data, _st = open_secret_file(settings["env_file"], "the token",
+                                     workspace=settings.get("workspace"),
+                                     messages=messages)
         for line in data.decode("utf-8", "replace").splitlines():
             name, sep, value = line.strip().partition("=")
             if sep and name.strip() in ("GITHUB_TOKEN", "GH_TOKEN"):
@@ -2097,37 +2174,36 @@ def _inside(path, folder):
 
 
 def load_app_key(settings, security=run_security, isdir=os.path.isdir):
-    """The app's private key, checked, as ("pem", bytes): from a mode-600 PEM
-    file outside the workspace and any synced folder, whose whole path is
-    verified and which is opened once (open_secret_file, so openssl never
-    reopens it by path), or from the keychain item (base64 of the PEM, see
-    `token app-key`)."""
+    """The app's private key, checked, as ("pem", bytes): from a PEM file read
+    through the one resolution step (open_secret_file: the read folder rule
+    on the RESOLVED parent, mode 600 on the resolved file and on the open
+    handle; openssl gets the bytes, never the path), whose resolved location
+    is outside the workspace and any synced folder; or from the keychain
+    item (base64 of the PEM, see `token app-key`)."""
     path = settings.get("private_key_file")
     if path:
         if not os.path.lexists(path):
             raise AuthError("the app's private key file {} does not exist".format(path))
-        if settings.get("workspace") and _inside(path, settings["workspace"]):
+        what = "the app's private key"
+        try:
+            real = resolve_secret_path(path, what).real
+        except SecretDirError as exc:
+            raise AuthError(str(exc))
+        if settings.get("workspace") and _inside(real, settings["workspace"]):
             raise AuthError("the app's private key file {} is inside the workspace; "
-                            "keep it outside (e.g. ~/.config/activity-overview/)".format(path))
-        reasons = synced_folder_reasons(os.path.dirname(path), isdir=isdir)
+                            "keep it outside (e.g. ~/.config/activity-overview/)".format(real))
+        reasons = synced_folder_reasons(os.path.dirname(real), isdir=isdir)
         if reasons:
             raise AuthError("the app's private key file {} looks synced ({}); keep it "
-                            "on a local, non-synced disk".format(path, "; ".join(reasons)))
+                            "on a local, non-synced disk".format(real, "; ".join(reasons)))
+        messages = []
         try:
-            warn = check_secret_dir(_dir_of(path), settings.get("workspace"),
-                                    "the app's private key")
+            pem, _st = open_secret_file(path, what, workspace=settings.get("workspace"),
+                                        messages=messages)
         except SecretDirError as exc:
             raise AuthError(str(exc))
-        if warn:
-            warn_once(warn, ("key-dir", _dir_of(path)))
-        try:
-            pem, st = open_secret_file(path, "the app's private key")
-        except SecretDirError as exc:
-            raise AuthError(str(exc))
-        mode = st.st_mode & 0o777
-        if mode & 0o077:
-            raise AuthError("the app's private key file {} is mode {:o}; it must be "
-                            "600 (chmod 600 it)".format(path, mode))
+        for m in messages:
+            warn_once(m, ("key", real, m))
         if b"PRIVATE KEY" not in pem[:64]:
             raise AuthError("{} is not a PEM private key".format(path))
         return ("pem", pem)
@@ -2367,33 +2443,30 @@ def app_key_import(settings, path, security=run_security):
                          "the streams file first\n")
         return EXIT_USAGE
     path = os.path.expanduser(path)
-    # the key's folder is made private first (a write path, like `token renew`)
-    try:
-        notes = secure_secret_dir(_dir_of(path), settings.get("workspace"),
-                                  "the app's private key")
-    except SecretDirError as exc:
-        sys.stderr.write("token app-key: {}\n".format(exc))
-        return EXIT_FAILED
-    for note in notes:
-        sys.stderr.write("token app-key: {}\n".format(note))
-    # the bytes that become the stored key are read through the verified
-    # helper: the whole path (a final symlink included) walked from /, the
-    # open handle checked; an unsafe source imports nothing
     if not os.path.lexists(path):
         sys.stderr.write("token app-key: {} does not exist\n".format(path))
         return EXIT_FAILED
+    # the bytes that become the stored key are read through the one
+    # resolution step: the import folder rule on the RESOLVED parent (refused
+    # when writable by others, as no later chmod makes such bytes
+    # trustworthy; made private when only readable, if it is yours and not
+    # shared), the file rule on the resolved file (never writable by others;
+    # readable by others only warned about, this being a one-off source), the
+    # open handle checked. An unsafe source imports nothing.
+    messages = []
     try:
-        pem, st = open_secret_file(path, "the app's private key")
+        pem, _st = open_secret_file(path, "the app's private key", folder="import",
+                                    readable="warn", workspace=settings.get("workspace"),
+                                    messages=messages)
     except SecretDirError as exc:
         sys.stderr.write("token app-key: {}. Nothing was imported. Fix: move the key file "
                          "into a private folder of your own (e.g. "
-                         "~/.config/activity-overview, mode 700) and import it from there "
-                         "(docs/SCHEDULING.md 7.1 step 2)\n".format(exc))
+                         "~/.config/activity-overview, mode 700), `chmod 600` it, and "
+                         "import it from there (docs/SCHEDULING.md 7.1 step 2)\n".format(exc))
         return EXIT_FAILED
-    if st.st_mode & 0o077:
-        sys.stderr.write("token app-key: warning: {} is mode {:o}, readable by others: "
-                         "`chmod 600` it, or delete it once the import is done\n".format(
-                             path, st.st_mode & 0o777))
+    for m in messages:
+        sys.stderr.write("token app-key: {}{}\n".format(
+            "" if m.startswith("tightened") else "warning: ", m))
     if b"PRIVATE KEY" not in pem:
         sys.stderr.write("token app-key: {} is not a PEM private key\n".format(path))
         return EXIT_FAILED
@@ -2429,16 +2502,17 @@ def cmd_token(cfg, args, http_get=None, prompt=None, open_browser=None,
         where = token_settings(cfg)
         value = where[WHERE_FIELDS[args.field]]
         if args.field == "env-file" and where["store"] == "env-file":
-            # the wrappers source the file right after this: its whole path is
-            # verified, and the real path (no symlink left) is what they get
+            # the wrappers source the file right after this: the one resolution
+            # step, the folder rule on the resolved parent, the file rule; the
+            # real path (no symlink left) is what they get
+            messages = []
             try:
-                warn = check_secret_dir(_dir_of(value), where["workspace"])
-                value = env_file_for_wrapper(value)
+                value = env_file_for_wrapper(value, messages)
             except SecretDirError as exc:
                 sys.stderr.write("schedule.py: error: {}\n".format(exc))
                 return EXIT_FAILED
-            if warn:
-                sys.stderr.write("warning: {}\n".format(warn))
+            for m in messages:
+                sys.stderr.write("warning: {}\n".format(m))
         out("{}\n".format(value))
         return EXIT_OK
     if args.token_cmd in ("app-check", "app-key") or (
@@ -2464,20 +2538,14 @@ def cmd_token(cfg, args, http_get=None, prompt=None, open_browser=None,
                          "token.store to match (docs/SCHEDULING.md 7.2)\n")
         return EXIT_USAGE
     if args.token_cmd == "status":
-        if settings["store"] == "env-file":
-            try:
-                warn = check_secret_dir(_dir_of(settings["env_file"]),
-                                        settings["workspace"])
-            except SecretDirError as exc:
-                out("token: REFUSED: {}\n".format(exc))
-                return EXIT_FAILED
-            if warn:
-                out("WARNING: {}\n".format(warn))
+        messages = []
         try:
-            token = read_stored_token(settings, security)
+            token = read_stored_token(settings, security, messages)
         except SecretDirError as exc:
             out("token: REFUSED: {}\n".format(exc))
             return EXIT_FAILED
+        for m in messages:
+            out("WARNING: {}\n".format(m))
         if not token:
             out("no stored token ({})\n".format(
                 settings["env_file"] if settings["store"] == "env-file"

@@ -299,37 +299,55 @@ history (and, for an external program, in the process list), whatever the mode o
 file it is then written to. Every way of entering one below reads a file or prompts; a test
 scans the docs and examples so a secret-on-the-command-line instruction cannot come back.
 
-**The folder that holds a secret** (the token env file, the app's private key file). The
-file's own mode 600 keeps its content private, but whoever can **write** its folder, or any
-folder above it, can replace or rename the file. A mode-700 `/shared/private` under a
-world-writable `/shared` can be renamed away, with another folder and token put in its
-place. So the **whole path** is checked, component by component from `/`, on every read
-path and before every write (the env file, the app key, and the wrappers through
-`token where`):
+**Secrets on disk: one resolution step, one policy** (the token env file, the app's private
+key file). The file's own mode 600 keeps its content private, but whoever can **write** its
+folder, or any folder above it, can replace or rename the file. A mode-700 `/shared/private`
+under a world-writable `/shared` can be renamed away, with another folder and token put in
+its place. So every secret path is first **resolved**, component by component from `/`:
+- the path is never normalised first: a relative path is only joined with the working
+  directory, so `..` is followed through the real folders after each symlink, as the
+  kernel does;
+- every symlink is followed with the checks below.
 
-- every directory on the way, `/` included, is owned by you or by root;
-- no directory on the way is writable by group or others, **except** one with the sticky
-  bit (like `/tmp`) where the next component down is owned by you or root: the sticky bit
-  lets only an entry's owner (or root) rename or remove it;
-- a **symlink** on the way is a substitution point too. Its folder is checked like any
-  other, the link must be owned by you or root, and its target is then walked from `/` the
-  same way (relative targets from the link's folder; `..` through the real folders);
-- the secret file is a regular file owned by you.
+Everything after that applies to the **resolved** location, never to the path as typed or
+to a symlink's folder: the real file, its real parent folder, and the open handle. That
+holds for every read path and before every write: the env file, the app key, the import
+source, and the wrappers through `token where`, which hands them the resolved path.
 
-A refusal names the offending component and the fix. Examples:
-- `/shared is writable by group or others (mode 777) without the sticky bit … Fix: chmod
-  go-w /shared if it is yours, or keep the file under folders only you and root can change`;
-- `… is owned by uid 501 (neither you nor root)`;
-- `… is a symlink owned by uid …`.
+*Read paths*: nightly runs, `token status`, `token app-check`, `token where` for the
+wrappers. *Write paths*: `token renew` (the env file is written fresh). *Import*:
+`token app-key --import` (its source bytes are about to be trusted).
 
-Ancestors are never chmod-ed. A missing folder is created only inside a folder that passes
-the same check.
+| Component | Owner | Group/other **write** | Group/other **read** | Sticky bit |
+|---|---|---|---|---|
+| A directory on the path, `/` included | yours or root's, else **refuse** | **refuse** (read, write, import), except sticky | accept | a group/other-writable directory with the sticky bit is accepted when the next entry is yours or root's, else **refuse** |
+| A symlink on the path (a final one too) | yours or root's, else **refuse** | — (a link's own mode means nothing; its folder is a directory on the path) | — | — |
+| The parent folder of the resolved file | yours or root's (as a directory on the path) | read: **refuse**; write: **tighten** to 700 if yours and not shared, else **refuse**; import: **refuse** | read: warn; write and import: **tighten** to 700 if yours and not shared, else warn | no exception: a sticky, group/other-writable parent counts as writable |
+| The resolved file | yours, else **refuse**; a regular file only, else **refuse** | **refuse** (read, import; a write replaces it with a fresh mode-600 file) | read: **refuse** (mode 600 required); import: warn | — |
+
+Further rules:
+- **Never chmod-ed:** shared folders (your home directory, `/`, the temporary directories,
+  the workspace), a folder that is not yours, and any directory above the parent.
+- **Missing folders:** a write creates them mode 700, only inside a folder that passes the
+  directory rule (a group/other-writable one only with the sticky bit).
+- **Opening:** a secret is opened once, without following a final symlink. The open handle
+  must be the file the walk saw (same device and inode), and the file rule is checked again
+  on it. The app key's bytes then go to `openssl` through a pipe, so it never reopens the
+  path.
+- **Every refusal names the component at fault and the fix.** Examples:
+  - `/shared is writable by group or others (mode 777) without the sticky bit … Fix: chmod
+    go-w /shared …`;
+  - `the token is in /tmp, which is writable by group or others (mode 1777) … Fix: chmod 700
+    …, or move the file to … ~/.config/activity-overview`;
+  - `… is mode 666, writable by group or others: another user can overwrite it`;
+  - `… is a symlink owned by uid …`.
 
 On macOS (reasoned from the standard layout, not run on a Mac):
 - `/Users` is root-owned, mode 755, and your home is yours: a key under
   `~/.config/activity-overview` passes;
-- `/tmp` is a root-owned symlink to `/private/tmp`, which is sticky and world-writable:
-  it passes when the next folder is yours;
+- `/tmp` is a root-owned symlink to `/private/tmp`, which is sticky and world-writable: a
+  folder of yours under it passes, but a secret placed directly in it is refused (its
+  parent is writable);
 - a group-writable folder such as one writable by `staff` or `admin` (e.g. an Intel
   Homebrew prefix) is refused;
 - ACLs, which macOS uses more often than Linux, are not read (below).
@@ -337,37 +355,12 @@ On macOS (reasoned from the standard layout, not run on a Mac):
 **What the check does not cover.**
 - Access control lists: only the mode bits and owners are read.
 - A root-owned directory that someone else administers: root is trusted on the whole path.
-- The time between check and use:
-  - The runner and `token status` open the file once, without following a final symlink,
-    and check the open handle (same file the walk saw, regular, yours) before reading. The
-    app key's bytes then go to `openssl` through a pipe, so it never reopens the path.
-  - The wrappers source the env file by path, but the path `token where` prints is the
-    real one, with no symlink left to swap.
-  - Changing a directory on a checked path needs its owner (you) or root, both already
-    trusted.
+- A change made by you or root after the check.
+- The wrappers' own read: they source the env file by the resolved path `token where`
+  prints (no symlink left in it), so the time between that check and their read remains.
 
-On top of the path, **the folder that directly holds the secret** has its own rule:
-
-- **Group- or other-writable folder** (even with the sticky bit):
-  - **Refused on every read path.** That means the runner and `token status` /
-    `token app-check` through the key, and the wrappers through `token where --field
-    env-file`. The message names the folder, its mode and the fix (`chmod 700 <folder>`, or
-    a private folder such as `~/.config/activity-overview`). A planted token or key is worse
-    than no run.
-  - **On a write path** (`token renew`, `token app-key`): **tightened to 700** when the
-    folder is your own and not a shared location, and the output says
-    `tightened <folder> from mode 775 to 700`. Otherwise it is **refused**, before anything
-    is written.
-- **Group- or other-readable (not writable) folder:**
-  - On a write path, tightened to 700 the same way (your own, not shared), and the output
-    says so.
-  - Otherwise, and on every read path, there is a warning only: the content stays private,
-    and the folder exposes just the file's name.
-- **Never chmod-ed:** a folder you do not own, or a shared location (your home directory,
-  `/`, the temporary directories, the workspace). A writable one is refused, a readable one
-  warned about, each with the fix.
-
-Read paths never change a mode; only the two write commands do, and they say so.
+Read paths never change a mode; only the write paths do, and they say so
+(`tightened <folder> from mode 775 to 700`).
 
 ### 7.1 The app route
 
@@ -423,22 +416,24 @@ gather invocation, never one per run.
    back and compares. After that, remove `private_key_file` from the token block and
    delete the file.
 
-   What the import requires of the file it reads: the same path check as every secret
-   (§7, "The folder that holds a secret"):
+   What the import requires of the file it reads: the "Import" column of the policy table
+   in §7 ("Secrets on disk"), applied to the **resolved** file:
    - every folder from `/` down is yours or root's and writable by nobody else (sticky
      folders excepted as described there);
-   - a symlink on the way, a final one included, is yours or root's and its target passes
+   - a symlink on the way, a final one included, is yours or root's, and its target passes
      the same check;
-   - the file is a regular file of your own, read once through the checked handle.
+   - the key's real parent folder is not writable by group or others. No chmod can make
+     bytes someone else could have written trustworthy, so it is refused, never tightened.
+     A readable-only parent is tightened to 700 if it is yours and not shared;
+   - the file is a regular file of your own, not writable by group or others (refused). If
+     only readable by others (a fresh download is often 644), it is imported with a warning
+     to `chmod 600` it or delete it. It is read once through the checked handle.
 
-   Its folder is made private like on any write path (tightened to 700 if it is yours and
-   not shared). An unsafe source imports **nothing**, and the message names the folder at
-   fault and the fix: move the key into a private folder such as
-   `~/.config/activity-overview` first. Importing straight from `~/Downloads` therefore
-   works only where that folder passes the check, and it would tighten `~/Downloads`
-   itself to 700. That is why the steps above move the key out of Downloads first. A key
-   file readable by others (a fresh download is often 644) is imported with a warning to
-   `chmod 600` it or delete it.
+   An unsafe source imports **nothing**, and the message names the component at fault and
+   the fix: move the key into a private folder such as `~/.config/activity-overview` and
+   `chmod 600` it first. Importing straight from `~/Downloads` therefore works only where
+   that folder passes the check, and a readable `~/Downloads` would be tightened to 700.
+   That is why the steps above move the key out of Downloads first.
 3. Install it: on the app's page, **Install App** → your account → **Only select
    repositories** (any one of your repositories) or **All repositories**. Neither choice
    gives access to the Azure repositories; reading them as public repositories is what

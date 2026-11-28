@@ -2742,12 +2742,14 @@ class TestSecretChain(SecretFolderCase):
         other = os.path.join(safe, "other.env")
         with open(other, "w") as fh:
             fh.write("x")
-        real_verify = schedule.verify_secret_chain
+        os.chmod(other, 0o600)
+        real_resolve = schedule.resolve_secret_path
 
-        def stale(path, what="the token", allow_missing=False):
-            real, _st = real_verify(path, what, allow_missing)
-            return real, os.lstat(other)                      # what the walk saw before
-        with mock.patch.object(schedule, "verify_secret_chain", stale):
+        def stale(path, what="the token", allow_missing=False, final="file"):
+            r = real_resolve(path, what, allow_missing, final)
+            r.st = os.lstat(other)                            # what the walk saw before
+            return r
+        with mock.patch.object(schedule, "resolve_secret_path", stale):
             with self.assertRaises(schedule.SecretDirError) as cm:
                 schedule.open_secret_file(target)
         self.assertIn("changed while it was being checked", str(cm.exception))
@@ -2849,8 +2851,9 @@ class TestSecretSourcesVerified(SecretFolderCase):
         self.assertEqual(code, 1)
         self.assertEqual(sec.items, {})                       # nothing written
         self.assertFalse(any(a == ["security", "-i"] for a, _s in sec.calls))
-        self.assertIn("{} is writable by group or others (mode 777) without the sticky "
-                      "bit".format(loose), err)
+        # refused at the RESOLVED parent of the key (not the link's folder)
+        self.assertIn("is in {}, which is writable by group or others (mode 777)".format(
+            loose), err)
         self.assertIn("Nothing was imported", err)
         self.assertIn("~/.config/activity-overview", err)
         self.assertEqual(self.mode(loose), 0o777)             # never chmod-ed
@@ -2907,6 +2910,280 @@ class TestSecretSourcesVerified(SecretFolderCase):
         self.assertEqual(code, 1)
         self.assertIn("REFUSED", out)
         self.assertIn("`chmod 600` it", out)
+
+
+class TestPolicyTable(SecretFolderCase):
+    """One test per cell of the secret-path policy table that refuses or
+    tightens (resolve_secret_path's docstring; SCHEDULING 7), each through a
+    read path (the key read, the env-file read, `token where`'s resolver) and
+    a write path (the env-file write, the import), with real temporary
+    directories; foreign owners through the ownership seam."""
+
+    def secret(self, folder, name="token.env", mode=0o600, text=None):
+        p = os.path.join(folder, name)
+        with open(p, "wb") as fh:
+            fh.write(text if text is not None else
+                     "GITHUB_TOKEN={}\n".format(NEW_TOKEN).encode())
+        os.chmod(p, mode)
+        return p
+
+    def refused_on_read(self, path, needle):
+        for name, read in (("open", lambda: schedule.open_secret_file(path)),
+                           ("wrapper", lambda: schedule.env_file_for_wrapper(path))):
+            with self.subTest(read=name):
+                with self.assertRaises(schedule.SecretDirError) as cm:
+                    read()
+                self.assertIn(needle, str(cm.exception))
+
+    def refused_on_write(self, path, needle):
+        with self.assertRaises(schedule.SecretDirError) as cm:
+            schedule.write_env_file(path, NEW_TOKEN)
+        self.assertIn(needle, str(cm.exception))
+
+    def refused_on_import(self, path, needle):
+        sec = FakeSecurity()
+        cfg = self.app_cfg(private_key_keychain_service="app-key")
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = schedule.main(["token", "app-key", "--streams", cfg, "--import", path],
+                                 security=sec)
+        self.assertEqual(code, 1, err.getvalue())
+        self.assertEqual(sec.items, {})
+        self.assertIn(needle, err.getvalue())
+        self.assertIn("Nothing was imported", err.getvalue())
+
+    # --- directory on the path -------------------------------------------------
+
+    def test_directory_owner_foreign_refused(self):
+        theirs = self.folder("theirs", 0o755)
+        inner = os.path.join(theirs, "inner")
+        os.makedirs(inner)
+        os.chmod(inner, 0o700)
+        target = self.secret(inner)
+        with self.owned_as({theirs: FOREIGN_UID}):
+            needle = "{} is owned by uid {} (neither you nor root)".format(
+                theirs, FOREIGN_UID)
+            self.refused_on_read(target, needle)
+            self.refused_on_write(target, needle)
+
+    def test_directory_writable_without_sticky_refused(self):
+        loose = self.folder("loose", 0o777)
+        self.addCleanup(os.chmod, loose, 0o700)
+        inner = os.path.join(loose, "inner")
+        os.makedirs(inner)
+        os.chmod(inner, 0o700)
+        target = self.secret(inner)
+        needle = "{} is writable by group or others (mode 777) without the sticky".format(loose)
+        self.refused_on_read(target, needle)
+        self.refused_on_write(target, needle)
+        self.assertEqual(self.mode(loose), 0o777)
+
+    def test_directory_sticky_with_a_foreign_next_entry_refused(self):
+        sticky = self.folder("sticky", 0o1777)
+        inner = os.path.join(sticky, "inner")
+        os.makedirs(inner)
+        os.chmod(inner, 0o700)
+        target = self.secret(inner)
+        with self.owned_as({inner: FOREIGN_UID}):
+            needle = "protects only entries owned by you or root, but {}".format(inner)
+            self.refused_on_read(target, needle)
+            self.refused_on_write(target, needle)
+
+    # --- symlink on the path ------------------------------------------------------
+
+    def test_symlink_owner_foreign_refused(self):
+        safe = self.folder("safe", 0o700)
+        self.secret(safe)
+        links = self.folder("links", 0o700)
+        link = os.path.join(links, "cfg")
+        os.symlink(safe, link)
+        with self.owned_as({link: FOREIGN_UID}):
+            needle = "{} is a symlink owned by uid {}".format(link, FOREIGN_UID)
+            self.refused_on_read(os.path.join(link, "token.env"), needle)
+            self.refused_on_write(os.path.join(link, "token.env"), needle)
+
+    def test_symlink_in_a_writable_folder_refused(self):
+        safe = self.folder("safe", 0o700)
+        self.secret(safe)
+        loose = self.folder("loose", 0o777)
+        self.addCleanup(os.chmod, loose, 0o700)
+        os.symlink(os.path.join(safe, "token.env"), os.path.join(loose, "token.env"))
+        needle = "another user can rename {}".format(os.path.join(loose, "token.env"))
+        self.refused_on_read(os.path.join(loose, "token.env"), needle)
+        self.refused_on_write(os.path.join(loose, "token.env"), needle)
+
+    # --- the parent of the resolved file ----------------------------------------
+
+    def test_parent_writable_refused_on_read_tightened_on_write_refused_on_import(self):
+        parent = self.folder("parent", 0o777)
+        target = self.secret(parent)
+        self.refused_on_read(target, "is in {}, which is writable by group or others "
+                                     "(mode 777)".format(parent))
+        self.refused_on_import(self.secret(parent, "app.pem", text=KEY_TEXT),
+                               "is in {}, which is writable".format(parent))
+        notes = schedule.write_env_file(target, NEW_TOKEN)
+        self.assertEqual(self.mode(parent), 0o700)
+        self.assertIn("tightened {} from mode 777 to 700".format(parent), notes[0])
+
+    def test_parent_writable_and_shared_refused_on_write(self):
+        home = self.folder("home", 0o777)
+        self.addCleanup(os.chmod, home, 0o700)
+        with mock.patch.dict(os.environ, {"HOME": home}):
+            self.refused_on_write(os.path.join(home, "token.env"),
+                                  "is a shared location, so its mode is not changed")
+        self.assertEqual(self.mode(home), 0o777)
+
+    def test_parent_sticky_and_writable_counts_as_writable(self):
+        """Finding 2's cell: no sticky exception for the resolved parent."""
+        sticky = self.folder("sticky", 0o1777)
+        target = self.secret(sticky)
+        self.refused_on_read(target, "is in {}, which is writable".format(sticky))
+        self.refused_on_import(self.secret(sticky, "app.pem", text=KEY_TEXT),
+                               "is in {}, which is writable".format(sticky))
+        notes = schedule.write_env_file(target, NEW_TOKEN)   # yours, not shared
+        self.assertIn("tightened", notes[0])
+
+    def test_parent_readable_tightened_on_write_and_import(self):
+        parent = self.folder("parent", 0o755)
+        target = self.secret(parent)
+        messages = []
+        schedule.open_secret_file(target, messages=messages)   # read: a warning only
+        self.assertIn("readable by group or others", messages[0])
+        self.assertEqual(self.mode(parent), 0o755)
+        schedule.write_env_file(target, NEW_TOKEN)
+        self.assertEqual(self.mode(parent), 0o700)
+        other = self.folder("other", 0o755)
+        key = self.secret(other, "app.pem", text=KEY_TEXT)
+        cfg = self.app_cfg(private_key_keychain_service="app-key")
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            code = schedule.main(["token", "app-key", "--streams", cfg, "--import", key],
+                                 security=FakeSecurity())
+        self.assertEqual(code, 0)
+        self.assertEqual(self.mode(other), 0o700)
+
+    # --- the resolved file ------------------------------------------------------
+
+    def test_file_owner_foreign_refused(self):
+        safe = self.folder("safe", 0o700)
+        target = self.secret(safe)
+        with self.owned_as({target: FOREIGN_UID}):
+            needle = "owned by uid {}, not you".format(FOREIGN_UID)
+            self.refused_on_read(target, needle)
+            self.refused_on_write(target, needle)
+            self.refused_on_import(target, needle)
+
+    def test_file_writable_by_others_refused(self):
+        """Finding 3's cell, read and import."""
+        safe = self.folder("safe", 0o700)
+        target = self.secret(safe, mode=0o666)
+        key = self.secret(safe, "app.pem", mode=0o666, text=KEY_TEXT)
+        self.refused_on_read(target, "mode 666, writable by group or others")
+        self.refused_on_import(key, "mode 666, writable by group or others")
+
+    def test_file_readable_by_others_refused_on_read_warned_on_import(self):
+        safe = self.folder("safe", 0o700)
+        target = self.secret(safe, mode=0o644)
+        self.refused_on_read(target, "mode 644, readable by group or others")
+        key = self.secret(safe, "app.pem", mode=0o644, text=KEY_TEXT)
+        cfg = self.app_cfg(private_key_keychain_service="app-key")
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = schedule.main(["token", "app-key", "--streams", cfg, "--import", key],
+                                 security=FakeSecurity())
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertIn("is mode 644, readable by others", err.getvalue())
+
+    def test_file_not_regular_refused(self):
+        safe = self.folder("safe", 0o700)
+        d = os.path.join(safe, "token.env")
+        os.makedirs(d)
+        self.refused_on_read(d, "is not a regular file")
+        self.refused_on_write(d, "is not a regular file")
+
+
+class TestReviewFindingsRound3(SecretFolderCase):
+    """The three findings, each on the paths it named."""
+
+    def test_dotdot_follows_the_symlink_not_the_typed_path(self):
+        """`a/hop/../app.pem` with a/hop -> b/child reads b/app.pem, and a
+        write there tightens b, never a."""
+        a = self.folder("a", 0o755)
+        b = self.folder("b", 0o755)
+        os.makedirs(os.path.join(b, "child"))
+        os.symlink(os.path.join(b, "child"), os.path.join(a, "hop"))
+        with open(os.path.join(a, "app.pem"), "wb") as fh:
+            fh.write(b"-----BEGIN PRIVATE KEY-----\ndecoy\n-----END PRIVATE KEY-----\n")
+        os.chmod(os.path.join(a, "app.pem"), 0o600)
+        with open(os.path.join(b, "app.pem"), "wb") as fh:
+            fh.write(KEY_TEXT)
+        os.chmod(os.path.join(b, "app.pem"), 0o600)
+        typed = os.path.join(a, "hop", "..", "app.pem")
+        r = schedule.resolve_secret_path(typed)
+        self.assertEqual((r.real, r.parent), (os.path.join(b, "app.pem"), b))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(schedule.load_app_key({"private_key_file": typed},
+                                                   isdir=lambda p: False),
+                             ("pem", KEY_TEXT))
+        # relative to the working directory, joined, never normalised
+        old = os.getcwd()
+        os.chdir(a)
+        self.addCleanup(os.chdir, old)
+        self.assertEqual(schedule.resolve_secret_path("hop/../app.pem").real,
+                         os.path.join(b, "app.pem"))
+        schedule.write_env_file(os.path.join(a, "hop", "..", "token.env"), NEW_TOKEN)
+        self.assertTrue(os.path.isfile(os.path.join(b, "token.env")))
+        self.assertFalse(os.path.exists(os.path.join(a, "token.env")))
+        self.assertEqual((self.mode(a), self.mode(b)), (0o755, 0o700))
+
+    def test_a_final_symlink_into_a_sticky_folder_is_judged_by_the_real_parent(self):
+        sticky = self.folder("sticky", 0o1777)                 # like /tmp
+        key = os.path.join(sticky, "app.pem")
+        with open(key, "wb") as fh:
+            fh.write(KEY_TEXT)
+        os.chmod(key, 0o600)
+        env = os.path.join(sticky, "token.env")
+        with open(env, "w") as fh:
+            fh.write("GITHUB_TOKEN={}\n".format(NEW_TOKEN))
+        os.chmod(env, 0o600)
+        private = self.folder("private", 0o700)
+        os.symlink(key, os.path.join(private, "app.pem"))
+        os.symlink(env, os.path.join(private, "token.env"))
+        # key read (runs, app-check)
+        with self.assertRaises(schedule.AuthError) as cm:
+            schedule.load_app_key({"private_key_file": os.path.join(private, "app.pem")},
+                                  isdir=lambda p: False)
+        self.assertIn("is in {}, which is writable".format(sticky), str(cm.exception))
+        # token status and the wrappers
+        path = streams_file(self.tmp, token={"store": "env-file",
+                                             "env_file": os.path.join(private, "token.env")})
+        code, out, _err = self.run_cli(["token", "status", "--streams", path],
+                                       http_get=FakeAPI())
+        self.assertEqual(code, 1)
+        self.assertIn("is in {}, which is writable".format(sticky), out)
+        code, out, err = self.run_cli(["token", "where", "--streams", path,
+                                       "--field", "env-file"])
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("is in {}, which is writable".format(sticky), err)
+        self.assertEqual(os.stat(sticky).st_mode & 0o7777, 0o1777)   # never chmod-ed
+
+    def test_a_writable_key_in_a_shared_folder_is_not_imported(self):
+        home = self.folder("home", 0o755)
+        key = os.path.join(home, "app.pem")
+        with open(key, "wb") as fh:
+            fh.write(KEY_TEXT)
+        os.chmod(key, 0o666)
+        sec = FakeSecurity()
+        cfg = self.app_cfg(private_key_keychain_service="app-key")
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"HOME": home}), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = schedule.main(["token", "app-key", "--streams", cfg, "--import", key],
+                                 security=sec)
+        self.assertEqual(code, 1)
+        self.assertEqual(sec.items, {})
+        self.assertIn("mode 666, writable by group or others", err.getvalue())
+        self.assertEqual(self.mode(home), 0o755)                # shared: never chmod-ed
 
 
 class TestOwnersStreams(unittest.TestCase):
