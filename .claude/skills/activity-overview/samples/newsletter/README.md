@@ -78,6 +78,22 @@ notice quoted, the twelve deprecation notices said once as one text, six propose
 what each is, for whom the coding agent opened each PR, and Jared Holgate's 44 merged pull
 requests broken down by theme.
 
+**How the work connects (store recomputed with the relation layer).** The issue gained a
+`### How the work connects` part at the end of the Stories section (the chain #7529 → #7374 →
+#7553, the stacked work carried over, closed work that landed elsewhere, follow-ups and a cause,
+links outside the repository), the dependency of #7374 on #7553 in the #6001 story, follow-ups
+named where the change is told (#7457 → #7455, #7506 → #7505), and the closing words of seven
+pipeline PRs and #7510, which the record now holds ("Superseded by …", "Consolidated into …").
+Every such sentence is checked against the relation layer (`relations_not_in_view`).
+
+**Relation claims through the shared parser (store re-linked).** With the store re-linked by the
+evidence-based relation layer, every relation sentence is read by the data side's parser and
+judged by its predicate. "#7529 still waits on #7374" stands: "waits on" is the generic waiting
+claim, held by the record's shared commits (`stacked_on`) with both pull requests still open.
+The two sentences saying "#7374, in the Stalled story of issue #6001, depended on #7553" now
+name #7374 right before the cue, so the claim's subject is #7374, not #6001. The issue, every plumbing theme and the week-41 posts pass their checks against the
+re-linked store.
+
 The store, the view (105 MB), the work package and the slices are not kept here. All numbers
 come from that one October store; no month-over-month comparison is made. The "New modules"
 section is omitted with its reason, because no module was new in October 2026.

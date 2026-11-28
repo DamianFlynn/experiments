@@ -1,6 +1,6 @@
 # Daily social posts — October 2026 (sample drafts)
 
-Drafts for the owner to approve, written neutral from the record of Azure/bicep-registry-modules for October 2026 (store recomputed on 27 November 2026). Nothing here is scheduled or published. One post per story, at the first event a reader can act on; plumbing rolls into one weekly item per theme. The rules are in `reference/social.md`; the checkable drafts are `avm-bicep-2026-10-week41.posts.md`.
+Drafts for the owner to approve, written neutral from the record of Azure/bicep-registry-modules for October 2026 (store recomputed on 27 November 2026). Nothing here is scheduled or published. One post per story, at the first event a reader can act on; plumbing rolls into one weekly post per ISO week, covering every theme with activity that week. The rules are in `reference/social.md`; the checkable drafts are `avm-bicep-2026-10-week41.posts.md`.
 
 ## Posts per day, October 2026
 

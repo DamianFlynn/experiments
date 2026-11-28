@@ -1777,6 +1777,75 @@ def _module_ownership_problem(value):
     return None
 
 
+STORY_ITEM_SHAPE = ("obj", {"repo": ("str", True), "number": ("int", True),
+                            "type": ("str", False), "url": ("str", False)})
+# one evidence pair behind an edge or an inner relation (link.relation_holds)
+STORY_EVIDENCE_SHAPE = ("obj", {
+    "from_item": (STORY_ITEM_SHAPE, True), "to_item": (STORY_ITEM_SHAPE, True),
+    "relation": ("str", True), "as_of": (("str", "null"), True),
+    "basis": (("obj", {"kind": ("str", True)}), True),
+    "from_state": (("str", "null"), False), "to_state": (("str", "null"), False),
+    "task_done": ("bool", False), "text_current": ("bool", False),
+    "waiting_eligible": ("bool", True), "waiting": ("bool", False)})
+STORY_EDGE_SHAPE = ("obj", {
+    "from": ("str", True), "to": (("str", ("obj", {"repo": ("str", True),
+                                                  "number": ("int", True),
+                                                  "url": ("str", False)})), True),
+    "relation": ("str", True), "basis": (("obj", {"kind": ("str", True)}), True),
+    "as_of": (("str", "null"), False), "target_kind": ("str", True),
+    "target_state": ("str", False), "waiting": ("bool", False),
+    "external": ("bool", False), "cross_member": ("bool", False),
+    "bases": ("int", False), "from_item": (STORY_ITEM_SHAPE, False),
+    "evidence": (("list", STORY_EVIDENCE_SHAPE), False),
+    "evidence_omitted": ("int", False)})
+
+
+def story_graph_problem(view):
+    """Why a linked view's relation layer is not what link writes, or None:
+    `story_graph.edges` of the typed edge shape with a relation of
+    link.RELATION_KINDS (a waiting flag only on a waiting relation; an
+    external target never with a state or `waiting`; a `cross_member`
+    target a story key), chains of story keys, `stories.all[].relations`
+    rows with a known relation."""
+    import link
+    g = (view or {}).get("story_graph")
+    if g is None:
+        return None
+    if not isinstance(g, dict) or not _typed(g.get("edges"), ("list", STORY_EDGE_SHAPE)):
+        return "story_graph.edges has an edge link does not write"
+    for e in g["edges"]:
+        if e["relation"] not in link.RELATION_KINDS:
+            return "story_graph has a relation link does not write: {}".format(e["relation"])
+        if "waiting" in e and e["relation"] not in link.WAITING_RELATIONS:
+            return "story_graph marks a non-waiting relation as waiting"
+        if e.get("external") and ("target_state" in e or "waiting" in e
+                                  or not isinstance(e["to"], dict)):
+            return "story_graph claims a state of an external target"
+        if e.get("cross_member") and not isinstance(e["to"], str):
+            return "story_graph has a cross-member edge without a story key"
+        if e["relation"] == "blocked_by" and e["basis"].get("kind") == "text" and \
+                not e["basis"].get("quote"):
+            return "story_graph has a blocked_by edge without its quote"
+        ev = e.get("evidence")
+        if ev is not None:
+            # the summary is derived from the evidence, never collapsed
+            if not ev or any(p["relation"] != e["relation"] for p in ev):
+                return "story_graph has an edge whose evidence is not its relation"
+            if e.get("as_of") != min(ev, key=lambda p: p["as_of"] or "")["as_of"]:
+                return "story_graph has an edge not dated by its earliest evidence"
+            if bool(e.get("waiting")) != any(p.get("waiting") for p in ev) \
+                    and "waiting" in e:
+                return "story_graph has an edge whose waiting is not its evidence's"
+    if not _typed(g.get("chains", []), ("list", ("list", "str"))):
+        return "story_graph.chains is not a list of story-key paths"
+    for r in ((view.get("stories") or {}).get("all") or []):
+        for rel in r.get("relations") or []:
+            if not isinstance(rel, dict) or rel.get("relation") not in link.RELATION_KINDS:
+                return "stories.all[{}].relations has a relation link does not write".format(
+                    r.get("id"))
+    return None
+
+
 def _fact_shape_problem(key, value):
     """Why a stored fact value cannot be the value of WINDOW_FACT_KEYS `key`,
     or None: it is not a JSON object (code_owners: an object or a rule list),

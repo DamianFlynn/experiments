@@ -1783,6 +1783,261 @@ derived once in link and carried on every row that needs it:
   removed}]}` — what a PR changed as a whole (gather `pr_net_files`), beside its
   description.
 
+### How stories depend on each other: `story_graph`, `stories.all[].relations`
+
+A relation between two trains comes from the explicit record only, never from
+similarity (`link.build_story_relations`), as of the view's end:
+
+- **Text next to a reference** (`link.parse_relation_claims`, the one parser — see
+  "The relation API" below): in a PR / issue body (the
+  body as gathered: `basis.text_as_last_gathered` when it was edited after the window)
+  and in comments, review comments and reviews written by the view's end. References
+  are atomic: a Markdown link to an item is ONE reference resolved from its destination
+  (`Blocked by [#5](https://github.com/o/b/pull/5)` is o/b#5 only — its label is never
+  scanned); a bare item URL, `owner/repo#N` and `#N` are references; a link to a
+  comment, review, commit or event is evidence, not an item, and transparent between
+  references (unless its label names that same item); a link to another host is plain
+  text. A cue right
+  before a reference — at most two words between, in the same sentence or clause (split
+  at sentence ends, line breaks and semicolons; never across) —
+  gives the relation of the TEXT's item towards the referenced one: `blocked_by`
+  ("blocked by / on", "wait / waiting for / on", "on hold until" — a written wait is
+  stored as `blocked_by`; a reader checks it with the generic `waits_on`, below),
+  `blocks` ("blocking", "blocks"), `stacked_on` ("stacked on", "stacked on top of",
+  "built on top of", "on top of", "based on #N's branch", "based on the branch of #N"),
+  `depends_on` ("depends on", "requires", "needs", "prerequisite", "built
+  on"), `needed_by` ("needed by", "required by", "prerequisite for"),
+  `follow_up_of` ("follow-up to / of", "continuation of", "split from"), `followed_by`
+  ("follow-up in", "followed by", "continued in", "tracked in", "will be addressed in"),
+  `caused_by` ("caused by", "regression from", "broken by", "introduced by", "due to",
+  "because of"), `content_landed_in` ("superseded by", "replaced by", "consolidated
+  into"). Targets are joined by commas / and / & / or and stop at the first other text.
+  An opening parenthesis may stand before a reference ("blocked by (#4)").
+  A negated cue ("not blocked by #2", "no longer depends on") is no relation (a
+  `mentions` with `basis.negated`); "not blocked by #2 but by #3" affirms #3. A
+  cue whose subject is another reference ("#2 is blocked by #3", "#12 is needed by
+  #30", "#8, which is blocking #9") is that item's relation, not the text's item's
+  (`basis.subject`); subjects join like targets ("#30 and #31 depended on #12": a pair
+  for each); the subject
+  carries across coordinated predicates ("#31 is a follow-up to #11 and was caused by
+  #12": both are #31's; `basis.tense` past). Code (fences, inline code), HTML comments
+  and quoted blocks (lines starting with `>`: someone else's words) are not read.
+  "See #N", "fixes / closes #N" are `mentions`. A cue that ends its line with a colon
+  ("Depends on:", "**Blocked by:**", "#30 depended on:") carries into the list right
+  below it: each bullet or numbered item, up to the first line that is not an item or
+  a blank line, is a target by the references that open it (after its task box, whose
+  state `basis.task_done` takes), with the colon line's subjects, and the quote is the
+  colon line plus the item; an item with its own cue keeps its own relation; items
+  nested deeper than the first are details of their parent and targets of nothing (a
+  colon cue that is itself an item carries into its own sub-items only); a colon line
+  without a cue ("Changes:") carries nothing. A task-list line
+  naming an item (`- [ ] #N`, `- [ ] https://github.com/o/r/pull/N`) is `depends_on`,
+  with `basis.task_done` (its box ticked: a
+  ticked task waits on nothing). Any other reference is `mentions` — a bare reference is
+  never a dependency. `basis.text_current` is false for a body edited after the window
+  (the store keeps the last version only: what changed is not known). Each edge is
+  stored from the waiting side: `blocks` / `needed_by` / `followed_by` texts become the
+  other item's `blocked_by` / `depends_on` / `follow_up_of` (`basis.inverse_of` says so)
+  — when the other item is a story of the view (or of the stream); towards an external
+  item the edge stays as written.
+- **Structure**: `stacked_on` (the PR's commits belong to another PR opened first:
+  `belongs_to_pr`, basis `stacked_commits`; not when either PR closed unmerged — then
+  its content landed in the other), `content_landed_in` (a closed PR's
+  `closed_unmerged.content_landed_in`).
+- A reference to an item created after the window's end is not used; a comment written
+  after it is not read; `target_state` is the target's state at the end (`open` /
+  `closed` / `merged`), and `waiting` (on `blocked_by` / `depends_on` / `stacked_on`)
+  is true only while both the waiting item and its target are still open, the task is
+  not ticked and the text is current (`link.evidence_holds`, the rule behind
+  `relation_holds`).
+- **Across repositories**: `owner/repo#N` and github.com links to another repository
+  are kept as `external` edges (`to` `{repo, number, url}`, no state claimed). In a
+  stream's digest (`digest.build_project_view`) `link.join_member_relations` resolves a
+  reference to another MEMBER to that member's train: `to` becomes its story key
+  `owner/repo:train-id`, `cross_member: true`, with its kind and state. A cue written
+  from the other side ("this blocks o/b#5") becomes the OTHER member's edge from the
+  waiting side (as the local path does); `waiting` is decided per evidence pair (both
+  items of THAT pair open, not ticked, text current). The join re-reads every member's
+  own record against all members at once and republishes every member's graph, rows and
+  inner relations, so it is safe, idempotent and order-free on separately linked member
+  views (a view without its record, or an older edge without `evidence`, is re-resolved
+  from what it holds). A repository outside the stream stays `external` (kept as
+  written: "blocks o/x#1" is this item's `blocks`). `link.stream_story_graph(members)`
+  gives the stream's one graph (chains and most-blocking over every member).
+
+`story_graph` `{edges: [{from, to, relation, basis {kind: text | stacked_commits |
+content_landed_in, quote?, item {repo, number, type, url}, author?, at?, url?,
+inverse_of?, subject?, task_done?, text_current?, tense?, negated?}, as_of, from_item,
+target_kind, target_item, target_state?, waiting?, evidence [pair], evidence_omitted?,
+items [{from_item, to_item, waiting?, as_of}], external?, ref?, written_relation?,
+cross_member?, bases}], chains (paths of at least two waiting edges,
+as story keys; the walk is bounded — depth `STORY_CHAIN_MAX_DEPTH` 8, at most
+`STORY_CHAIN_MAX` 200 candidate paths — and `chains_capped` says when it stopped),
+most_blocking [{story, waiting_stories, stories}], external [{repo, number, url, from,
+relation}], rule}`; story keys are `owner/repo:train-id`. A train edge keeps EVERY
+evidence pair behind it, never collapsed: `evidence` `[{from_item, to_item, relation,
+as_of, basis, from_state, to_state, task_done?, text_current?, waiting_eligible,
+waiting?, written, origin}]` (items `{repo, number, type?, url?}`). Its summary is
+derived: `waiting` when ANY pair waits; `basis`, `from_item`, `target_item`,
+`target_state` are the earliest waiting pair's, else the earliest's; `as_of` is the
+EARLIEST evidence's date; `bases` counts every pair. A bounded edge (at most
+`STORY_EDGE_EVIDENCE_MAX` 20 pairs) always keeps the earliest pair and every waiting
+pair (`evidence_omitted` counts the rest); `items` is the kept pairs' endpoints for older
+readers. Relations between items of the SAME story are `stories.all[].
+inner_relations` `[{from_item, to_item, relation, quote, author, as_of, url, waiting?,
+task_done?, text_current?, inverse_of?, evidence [pair], evidence_omitted?}]`, one row
+per (from item, to item, relation) of the story — a repeat adds its pair, the row keeps
+the earliest date — read by the same parser ("#7526 … which is blocking #7472" is a
+checked fact there).
+`target_kind` (`link.relation_target_kind`) says what the other story is:
+`new_module_proposed`, a plumbing theme id (`ci_workflows`, `pipeline_utilities`,
+`test_environment`, `docs_generation`, ...) or `plumbing`, `docs`, `module_change`,
+`issue_request`, `other`, `external`. Every `stories.all[]` row with any relation
+carries `relations` `[{relation, other, other_kind?, basis, as_of, waiting?,
+other_state?, other_item?, external?, cross_member?}]` from its own side (the inverse
+for the other end: `blocks`, `needed_by`, `followed_by`, `causes`, `stacked_under`,
+`content_from`, `mentioned_by`), strongest first; a slice's `outcome.relations` is the
+same list. A story blocked by an item still open at the end adds "waits on PR / issue
+#N (blocked by it: "<quote>")" to its `status_reason`, and its outcome ball follows
+**R9 blocked by an open item** — when the rule that fired is R2 / R3 / R4 / R7 / R8,
+`awaiting blocker` with `waits_on` `[{story, item, quote, url}]` and `replaces_rule`
+(failing checks, an outstanding change request and a named person stand). Group
+assignment does not change. `validate.story_graph_problem(view)` checks the shapes.
+
+What the store holds today: bodies, comments, review comments and reviews (text cues,
+task lists), closing and cross references (`closes`, `crossref_issues`: they join
+trains, so they relate items of one train), PR label history, PR histories (stacked
+commits), closed PRs' landed content. Not gathered: GitHub's tracked-by / sub-issue
+links (a gather change and a re-gather would add them); labels meaning "blocked" give
+no edge without a text naming the item.
+
+#### The relation API (for readers that check claims against the view)
+
+One implementation each; the view's `waiting`, `status_reason`, R9 and the stream join
+are computed through them, so a reader that uses them agrees with the view.
+
+`link.parse_relation_claims(text, own_slug=None, default_subject=None) -> [claim]` — the
+one reference-and-cue parser. A claim is `{subject, subjects, relation, query_kind,
+targets, tense, negated, task, span, quote}`: `relation` as written (an inverse cue
+stays `blocks` / `needed_by` / `followed_by`; a bare reference is `mentions`),
+`query_kind` the kind to pass to `relation_holds` (the relation, or the generic
+`waits_on` for "waits on / waiting for / waited on"), refs `{slug, number, url?}`
+(`slug` None: `own_slug`'s repository), `subjects` the explicit references before the
+cue (joined by and / commas; kept on a negated claim; carried across coordinated
+predicates) else `[default_subject]` — one claim per subject, `subject` its own —
+`tense` `present` / `past`, `negated` for not / never / no longer, `task` `open` /
+`done` on a task-list line, `span` the clause's `(start, end)` in `text`.
+
+    link.parse_relation_claims(
+        "#31 is a follow-up to [#11](https://github.com/o/r/pull/11) and was caused by o/x#12.",
+        "o/r", {"slug": None, "number": 40})
+    # [{"subject": {"slug": None, "number": 31}, "relation": "follow_up_of",
+    #   "targets": [{"slug": None, "number": 11, "url": "https://github.com/o/r/pull/11"}],
+    #   "tense": "present", "negated": False, "task": None, "span": (0, 85), "quote": ...},
+    #  {"subject": {"slug": None, "number": 31}, "relation": "caused_by",
+    #   "targets": [{"slug": "o/x", "number": 12}], "tense": "past", ...}]
+
+`link.relation_clauses(text) -> [(start, clause)]` — the clauses the parser reads (code
+fences, inline code, HTML comments and quoted blocks blanked; split at sentence ends,
+line breaks, semicolons).
+
+    link.relation_clauses("Blocked by #2. See #3")   # [(0, "Blocked by #2."), (15, "See #3")]
+
+`link.item_refs(text, own_slug=None) -> [ref]` — the one reference resolver (the parser's
+own): every issue / PR reference in order, `{repo, slug, number, url?, span (start,
+end), evidence, form, sha?}`. `repo` is the repository (`own_slug` for `#N`), `slug`
+None for `own_slug`'s; a Markdown link is one reference resolved from its destination
+(`form` `markdown`), bare URLs `url`, `owner/repo#N` `short`, `#N` `local`; `evidence`
+true for a link to a comment / review / event (its item's number) or a commit (`number`
+None, `sha`); a link to another host is not a reference; code, HTML comments and quoted
+blocks are not read.
+
+    link.item_refs("Blocked by [#5](https://github.com/o/b/pull/5) and #7 "
+                   "([c](https://github.com/o/r/pull/7#issuecomment-1))", "o/r")
+    # [{"repo": "o/b", "slug": "o/b", "number": 5, "span": (11, 46), "evidence": False,
+    #   "form": "markdown", "url": "https://github.com/o/b/pull/5"},
+    #  {"repo": "o/r", "slug": None, "number": 7, "span": (51, 53), "evidence": False,
+    #   "form": "local"},
+    #  {"repo": "o/r", "slug": None, "number": 7, ..., "evidence": True, "form": "markdown"}]
+
+`link.item_state(record, day=None) -> "open" | "closed" | "merged" | "not_created" |
+None` — the one state projection and lifecycle replay of an issue / PR record at the
+end of `day` (`YYYY-MM-DD` or an instant; None: as recorded): `not_created` before
+`created_at`, then the latest of its recorded lifecycle events through the day
+(`closed`, `reopened`, `merged`) and its dated fields (`closed_at` of a closed record,
+`merged_at`) — a merge is final; with no events recorded the dated fields alone decide.
+Relation ends and PR-state claims both use it.
+
+    link.item_state({"state": "open", "created_at": "2026-05-01T00:00:00Z",
+                     "lifecycle": [{"event": "closed", "created_at": "2026-05-05T00:00:00Z"},
+                                   {"event": "reopened", "created_at": "2026-05-10T00:00:00Z"}]},
+                    "2026-05-06")   # "closed" ("open" on 2026-05-12)
+
+`link.relation_holds(view_or_members, from_item, to_item, kind, day=None, present=False)
+-> {"holds": True, "evidence": [pair]} | {"holds": False, "reason", "evidence"}` — the
+one predicate. `view_or_members`: a linked view, or a stream's members `[{"repo",
+"bundle"}]` (or their bundles) — in-story, cross-story and cross-member evidence alike.
+Items: `{"repo", "number"}`, `"owner/repo#N"` or a number (the first view's repository).
+`kind` as claimed: an inverse (`blocks`, `needed_by`, `followed_by`, `causes`,
+`stacked_under`, `content_from`, `mentioned_by`) is checked from the waiting side, also
+against an external target stored as written. A generic word
+(`link.GENERIC_RELATIONS`) accepts several relations: `waits_on` holds on a
+`blocked_by`, `depends_on` or `stacked_on` pair ("#7529 still waits on #7374" holds
+when the record's link is shared commits), `waited_on_by` on `blocks`, `needed_by`
+or `stacked_under` (the same pairs from the other end); every other kind accepts only
+itself (and its written inverse). `day` (default: the first view's end):
+only evidence dated on or before it. `present`: still in force on the day — not a
+ticked task, not a body edited after the window, both items open on the day by
+`item_state`. `reason`: `no_evidence`, `after_day`, `task_done`, `text_not_current`,
+`source_not_open`, `target_not_open`, `state_unknown` (an item no view holds, e.g.
+outside the stream). Each pair's `from_item` is the item the relation is of (the source
+endpoint), never `basis.item` (the text's item).
+
+    v = linked view of o/a whose PR 2 says "This blocks o/x#1."
+    link.relation_holds(v, "o/x#1", "o/a#2", "blocked_by")
+    # {"holds": True, "evidence": [{"from_item": {"repo": "o/a", "number": 2, ...},
+    #   "to_item": {"repo": "o/x", "number": 1}, "relation": "blocks", ...}]}
+    link.relation_holds(v, "o/x#1", "o/a#2", "blocked_by", present=True)
+    # {"holds": False, "reason": "state_unknown", "evidence": [...]}
+
+`link.evidence_holds(pair, day=None, present=False, state_of=None) -> (bool, reason)` —
+the rule `relation_holds` applies to one pair (`state_of(item) -> state`).
+
+    link.evidence_holds({"as_of": "2026-05-02", "task_done": True}, "2026-05-31", True)
+    # (False, "task_done")
+
+`link.join_member_relations(members) -> members` — the stream join (above), in place.
+
+    link.join_member_relations([{"repo": "o/a", "bundle": a}, {"repo": "o/b", "bundle": b}])
+
+`link.stream_story_graph(members) -> story_graph` — after the join: every member's
+edges, de-duplicated, with chains and most-blocking over the whole stream (bounded as a
+view's): A -> B -> C across three members is one chain; two members waiting on a third
+count as two.
+
+    link.stream_story_graph(members)["chains"]
+    # [["o/a:train-pr-1", "o/b:train-pr-2", "o/c:train-pr-3"]]
+
+`link.record_superseded(view_or_members, item, by, day=None) -> {"holds", "evidence"?,
+"reason"?}` — the one answer to "does the record say #A was superseded by #B". It reads
+the item's own close reason, `closed_unmerged.superseded_by` (`link.close_reason`: the
+item's own comments, reviews and closing event, latest first, with the wider wording
+"superseded / replaced / consolidated / continued / covered / moved ... by / in #N",
+up to six words between; `{superseded_by, named_in, by, quote, at}`); the statement
+must be written by `day` and the item closed unmerged on it. Reasons: `no_record`,
+`not_stated`, `other_item`, `after_day`, `not_closed`. How the two relate: the parser
+reads "superseded by / replaced by / consolidated in #B" anywhere as the relation
+`content_landed_in` (an edge with a text basis), and shared commits give
+`content_landed_in` too (`closed_unmerged.content_landed_in`: where content went, never
+a supersession). Only `superseded_by` says "superseded".
+
+    link.record_superseded(v, 1, 2)
+    # {"holds": True, "evidence": {"item": {"repo": "o/r", "number": 1}, "superseded_by": 2,
+    #   "quote": "Superseded by #2", "named_in": ..., "by": "m", "at": "2026-05-10T00:00:00Z"}}
+
+`link.relation_mentions(text, own_slug=None)` remains: `parse_relation_claims` flattened
+per target (negated claims as `mentions`).
+
 ### What a story can name (story-layer views)
 
 - **Linked items outside the window** — the per-window fact `linked_items`

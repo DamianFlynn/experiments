@@ -1011,6 +1011,158 @@ def _theme_index(view, multi):
 
 STORY_KINDS = ("new", "changed", "breaking")
 
+# The relations a story can state as a dependency (from its own side), and
+# their inverses; `mentions` is never one. `waiting` relations can be "still
+# waiting" while both ends are open.
+DEPENDENCY_RELATIONS = ("blocked_by", "depends_on", "stacked_on", "follow_up_of", "caused_by",
+                        "content_landed_in")
+INVERSE_RELATIONS = {"blocks": "blocked_by", "needed_by": "depends_on",
+                     "stacked_under": "stacked_on", "followed_by": "follow_up_of",
+                     "causes": "caused_by", "content_from": "content_landed_in"}
+WAITING_RELATIONS = ("blocked_by", "depends_on", "stacked_on")
+PLUMBING_KINDS = ("plumbing", "ci_workflows", "pipeline_utilities", "test_environment",
+                  "docs_generation", "dependency_updates", "repository_policy",
+                  "other_plumbing")
+
+
+def _story_ref(key, rows_by_key, multi, trains=None):
+    """{key, title, group, state, url, in_issue} of a story key of the
+    relation layer (`owner/repo:train-id`), in the outline's own key form; a
+    train the issue does not tell (carried over past the idle limit) is
+    named by its root item, `in_issue: false`."""
+    local = key if multi or not isinstance(key, str) else key.split(":", 1)[-1]
+    row = rows_by_key.get(local)
+    if row:
+        return {"key": local, "title": row.get("title"), "group": row.get("group"),
+                "state": row.get("state"), "url": row.get("url"), "in_issue": True}
+    t = (trains or {}).get(key) or (trains or {}).get(local) or {}
+    return {"key": local, "title": t.get("title"), "group": None, "state": t.get("state"),
+            "url": t.get("url"), "in_issue": False}
+
+
+def connect_stories(views, stories_sec, plumbing_sec, multi=False):
+    """How the work connects, from the view's relation layer (`story_graph`,
+    `stories.all[].relations`): every story row gains `relations` (its
+    non-mention relations, each with the quote, the item, and the other
+    story's title, group, state and link, or the external item), a module
+    story `waited_on_plumbing`, every plumbing theme `needed_by` / `caused`
+    (the module stories that waited on it or that it caused), and the
+    stories section a `connections` part (chains, the items most stories
+    wait on, external targets, counts per relation)."""
+    rows_by_key = {r["key"]: r for r in stories_sec.get("all") or []}
+    trains = {}
+    for v in views:
+        items = {("pr", p.get("number")): p for p in v.get("prs") or []}
+        items.update({("issue", i.get("number")): i for i in v.get("issues") or []})
+        for t in v.get("trains") or []:
+            root = items.get(("issue", t.get("root_issue"))) if t.get("root_issue") else None
+            root = root or items.get(("pr", (t.get("prs") or [None])[0])) or \
+                items.get(("issue", (t.get("issues") or [None])[0])) or {}
+            trains["{}:{}".format(_slug(v), t["id"])] = {
+                "title": root.get("title"), "url": root.get("url"),
+                "state": "merged" if root.get("merged") else root.get("state")}
+    theme_of = {}
+    for th in plumbing_sec.get("themes") or []:
+        for k in th.get("stories") or []:
+            theme_of[k] = th.get("id")
+    theme_ids = {th.get("id") for v in views for th in v.get("plumbing_themes") or []} - {None}
+    view_rows = {}
+    for v in views:
+        for e in (v.get("stories") or {}).get("all") or []:
+            view_rows[story_key(v, e["id"], multi)] = e
+    for key, row in rows_by_key.items():
+        rels = []
+        for rel in (view_rows.get(key) or {}).get("relations") or []:
+            kind = rel.get("relation")
+            if kind in ("mentions", "mentioned_by"):
+                continue
+            item = {"relation": kind, "basis": {k: (rel.get("basis") or {}).get(k)
+                                                for k in ("quote", "item", "author", "at", "url",
+                                                          "kind", "inverse_of", "subject",
+                                                          "task_done", "text_current")
+                                                if (rel.get("basis") or {}).get(k) is not None},
+                    "other_kind": rel.get("other_kind"), "other_item": rel.get("other_item"),
+                    "other_state": rel.get("other_state"), "waiting": rel.get("waiting"),
+                    "as_of": rel.get("as_of")}
+            if rel.get("external") or isinstance(rel.get("other"), dict):
+                item["external"] = rel.get("other") if isinstance(rel.get("other"), dict) else True
+                item["other_state"] = None      # another repository: no state claimed
+            else:
+                item["other"] = _story_ref(rel.get("other"), rows_by_key, multi, trains)
+                # another member's story: link it within the issue
+                own = key.split(":", 1)[0] if multi else None
+                if rel.get("cross_member") or (own and isinstance(rel.get("other"), str)
+                                               and rel["other"].split(":", 1)[0] != own):
+                    item["cross_member"] = True
+            rels.append(item)
+        inner_rows = [x for x in (view_rows.get(key) or {}).get("inner_relations") or []
+                      if x.get("relation") != "mentions"]
+        if inner_rows:
+            row["inner_relations"] = inner_rows
+        if rels:
+            row["relations"] = rels
+            # a plumbing target: a plumbing kind or theme id, or a plumbing story
+            waited = [x for x in rels if x["relation"] in WAITING_RELATIONS
+                      and (x.get("other_kind") in PLUMBING_KINDS or x.get("other_kind") in theme_ids
+                           or (x.get("other") or {}).get("group") == "plumbing")]
+            if waited and row.get("group") != "plumbing":
+                row["waited_on_plumbing"] = waited
+    # plumbing themes: the module stories they were needed by, or that they caused
+    for th in plumbing_sec.get("themes") or []:
+        mine = set(th.get("stories") or [])
+        needed, caused = [], []
+        for key, row in rows_by_key.items():
+            if row.get("group") == "plumbing" or key in mine:
+                continue
+            for x in row.get("relations") or []:
+                other = (x.get("other") or {}).get("key")
+                if other in mine and x["relation"] in WAITING_RELATIONS:
+                    needed.append({"story": key, "title": row.get("title"), "url": row.get("url"),
+                                   "relation": x["relation"], "via": other,
+                                   "quote": x["basis"].get("quote")})
+                if other in mine and x["relation"] == "caused_by":
+                    caused.append({"story": key, "title": row.get("title"), "url": row.get("url"),
+                                   "via": other, "quote": x["basis"].get("quote")})
+        if needed:
+            th["needed_by"] = needed
+        if caused:
+            th["caused"] = caused
+    # the connections part
+    # one graph: a single view's own, or the stream's (link.stream_story_graph)
+    # so a chain or a most-blocking count across members is computed over the
+    # whole stream, not member by member
+    chains, most, external, counts, capped = [], [], [], {}, False
+    if len(views) > 1:
+        graphs = [link.stream_story_graph(
+            [{"repo": _slug(v), "bundle": v} for v in join_members(views)])]
+    else:
+        graphs = [v.get("story_graph") or {} for v in views]
+    for g in graphs:
+        capped = capped or bool(g.get("chains_capped"))
+        for ch in g.get("chains") or []:
+            chains.append([_story_ref(k, rows_by_key, multi, trains) for k in ch])
+        for m in g.get("most_blocking") or []:
+            most.append(dict(_story_ref(m.get("story"), rows_by_key, multi, trains),
+                             waiting_stories=m.get("waiting_stories"),
+                             stories=[_story_ref(k, rows_by_key, multi, trains)
+                                      for k in m.get("stories") or []]))
+        for e in g.get("edges") or []:
+            counts[e.get("relation")] = counts.get(e.get("relation"), 0) + 1
+            if e.get("external") and e.get("relation") != "mentions":
+                b_ = e.get("basis") or {}
+                external.append({"from": _story_ref(e.get("from"), rows_by_key, multi, trains),
+                                 "relation": e.get("relation"), "target": e.get("to"),
+                                 "quote": b_.get("quote"),
+                                 **{k: b_[k] for k in ("task_done", "text_current") if k in b_}})
+    stories_sec["connections"] = {
+        "chains": chains, "most_blocking": [m for m in most if (m.get("waiting_stories") or 0) > 1],
+        "external": external, "counts": counts,
+        # the data side's bounded walk stopped: say "chains were capped"
+        "chains_capped": capped,
+        # omitted only when the record holds no relation but bare mentions
+        "omit": None if any(k != "mentions" for k in counts) else
+        "no relation between stories"}
+
 
 def section_stories(views, caps, multi=False):
     """Every story of the window, grouped by state (STORY_GROUPS), with the
@@ -1995,7 +2147,7 @@ def outline(views, cadence=None, automation=()):
     them. `automation` names accounts to treat as automation beyond the
     view's own marking. `cadence` None picks it from the window
     (auto_cadence). Raises ValueError for an unknown cadence."""
-    views = list(views)
+    views = join_members(views)
     auto, days = auto_cadence(views)
     cadence_source = "caller" if cadence else "window"
     cadence = cadence or auto
@@ -2071,11 +2223,13 @@ def outline(views, cadence=None, automation=()):
     plumbing["prs"].sort(key=lambda r: (-r["areas"], r["number"]))
     plumbing["prs_omitted"] = max(0, len(plumbing["prs"]) - caps["plumbing_prs"])
     plumbing["prs"] = plumbing["prs"][:caps["plumbing_prs"]]
+    stories_sec = section_stories(views, caps, multi)
+    connect_stories(views, stories_sec, plumbing, multi)
     sections = [
         {"id": "new_modules", **new_mods},
         {"id": "module_changes", **changes},
         {"id": "breaking", **breaking},
-        {"id": "stories", **section_stories(views, caps, multi)},
+        {"id": "stories", **stories_sec},
         {"id": "ownership", **ownership},
         {"id": "people", **section_people(views, caps, multi, automation)},
         {"id": "coming", **coming},
@@ -2152,7 +2306,6 @@ _PATHY_RE = re.compile(r"^[\w.-]+(?:/[\w.-]+)+$")
 # a version may end a sentence ("... 0.7.4."), but not continue as a longer
 # dotted number ("0.47.16.16243")
 _VERSION_RE = re.compile(r"(?<![\w.])v?(\d+\.\d+\.\d+)(?!\w|\.\d|-\w)")
-_ITEM_RE = re.compile(r"(?<![\w/.&])#(\d+)\b")
 _LOGIN_RE = re.compile(
     r"(?<![\w/.@`])@([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\[bot\])?)(?![\w-])")
 _LINK_RE = re.compile(r"(!?)\[([^\]\n]*)\]\(([^)\s]*)\)")
@@ -2174,6 +2327,28 @@ RELEASE_SECTIONS = ("new_modules", "module_changes", "people")
 def _delink(text):
     """Markdown links and images replaced by their text (same lines)."""
     return _LINK_RE.sub(lambda m: m.group(2), text)
+
+
+def _delink_items(text, repo):
+    """`_delink`, but a link to an issue / PR (link.item_refs; not a comment or
+    commit link) keeps the item it names after its text: "[the bump](.../pull/12)"
+    reads "the bump (#12)", so a sentence naming an item by a link with other
+    text still names it."""
+    out, pos = [], 0
+    for r in link.item_refs(text, repo):
+        if r["form"] != "markdown" or r["evidence"] or r["number"] is None:
+            continue
+        a, _b = r["span"]
+        m = _LINK_RE.match(text, a)
+        if not m or a < pos:
+            continue
+        ref = "{}#{}".format(r["slug"], r["number"]) if r["slug"] else "#{}".format(r["number"])
+        label = m.group(2)
+        out.append(text[pos:a])
+        out.append(label if ref in label else "{} ({})".format(label, ref))
+        pos = m.end()
+    out.append(text[pos:])
+    return _delink("".join(out))
 
 
 def _urls_in(obj, out):
@@ -2387,7 +2562,6 @@ def _module_index(views):
 
 
 _REPO_LINK_RE = re.compile(r"https?://github\.com/([\w.-]+/[\w.-]+)/")
-_ITEM_LINK_RE = re.compile(r"\[#(\d+)\]\(https?://github\.com/([\w.-]+/[\w.-]+)/")
 
 
 def _scoped_paragraphs(text, slugs):
@@ -2468,7 +2642,7 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence=None
     its slice (link.py --slice output); a story block without one is listed
     in `stories_not_checked`. `registry_names` maps a do_not_name login to a
     name the registry holds for it (that name must not appear). Pure."""
-    views = list(views)
+    views = join_members(views)
     text = (text or "").replace("\r\n", "\n")
     out_l = outline(views, cadence=cadence, automation=automation)
     sec = {s["id"]: s for s in out_l["sections"]}
@@ -2658,24 +2832,19 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence=None
     item_text = {}
     for v in views:
         for x in (v.get("prs") or []) + (v.get("issues") or []):
-            if x.get("url"):
-                item_text[x["url"]] = "{}\n{}".format(x.get("title") or "", x.get("body") or "")
-
-    item_text_by_number = {}
-    if not multi:
-        for x in (views[0].get("prs") or []) + (views[0].get("issues") or []):
             if x.get("number") is not None:
-                item_text_by_number[x["number"]] = "{}\n{}".format(x.get("title") or "",
-                                                                  x.get("body") or "")
+                item_text[(slug_key(_slug(v)), x["number"])] = "{}\n{}".format(
+                    x.get("title") or "", x.get("body") or "")
 
-    def linked_text(par):
-        """The titles and descriptions of the view's items a paragraph links,
-        or (one repository) names as a bare `#N`."""
+    def linked_text(par, repo=None):
+        """The titles and descriptions of the view's items a paragraph names
+        (link.item_refs: links, comment links to them, owner/repo#N, and a
+        bare `#N` in the paragraph's repository, or the only one)."""
+        own = repo or (slugs[0] if not multi else None)
         out = []
-        for u in re.findall(r"https://github\.com/[\w.-]+/[\w.-]+/(?:pull|issues)/\d+", par):
-            out.append(item_text.get(u, ""))
-        for n in set(_ITEM_RE.findall(_strip(par, code=True))):
-            out.append(item_text_by_number.get(int(n), ""))
+        for r in link.item_refs(par, own):
+            if r["number"] is not None and r["repo"]:
+                out.append(item_text.get((slug_key(r["repo"]), r["number"]), ""))
         return "\n".join(out)
 
     def resolve(repo, what, **row):
@@ -2769,7 +2938,7 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence=None
     for par, repo in scoped:
         par_c = _strip(_delink(par), code=False)
         toks = areas_named(_delink(par), None)
-        cited_text = linked_text(par)
+        cited_text = linked_text(par, repo)
         par_mods = {}
         for tok in toks:
             if tok not in named_mods:
@@ -2822,19 +2991,29 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence=None
                 row = tag({"module": None, "version": ver}, repo)
             if not ok and row not in bad_versions:
                 bad_versions.append(row)
-        # #N: a link's own repository, else the paragraph's
-        par_p = _strip(par, code=True)
+        # items, by the shared resolver (link.item_refs): a link's or an
+        # owner/repo#N's own repository, else (#N) the paragraph's. An item of
+        # a repository outside the views is not checked here (its link is
+        # checked as a URL); a link to a comment, review or commit is evidence
+        refs = [r for r in link.item_refs(par, repo) if not r["evidence"]
+                and r["number"] is not None]
         linked_nums = []
-        for m in _ITEM_LINK_RE.finditer(par):
-            n, sl = int(m.group(1)), m.group(2)
-            sl = next((x for x in slugs if slug_key(x) == slug_key(sl)), sl)
+        for r in refs:
+            if r["form"] == "local":
+                continue
+            sl = next((x for x in slugs if slug_key(x) == slug_key(r["repo"] or "")), None)
+            if sl is None:
+                continue
+            n = r["number"]
             linked_nums.append(n)
             if n not in items.get(sl, set()):
                 row = tag({"number": n}, sl) if multi else n
                 if row not in bad_items:
                     bad_items.append(row)
-        for raw in _ITEM_RE.findall(par_p):
-            n = int(raw)
+        for r in refs:
+            if r["form"] != "local":
+                continue
+            n = r["number"]
             if n in linked_nums:
                 continue
             if re.search(r"#{}\b|/(?:pull|issues)/{}\b".format(n, n), cited_text):
@@ -2977,7 +3156,8 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence=None
                 for i, snt in enumerate(sents):
                     # a sentence about a particular PR or module (it names an
                     # item or a module path) that says it landed
-                    about = _ITEM_RE.search(_strip(snt, code=True)) or _AVM_PATH_RE.search(snt)
+                    about = any(r["number"] is not None for r in link.item_refs(snt)) or \
+                        _AVM_PATH_RE.search(snt)
                     if about and _LANDED_WORD_RE.search(snt) and not any(
                             _RELEASE_STATUS_RE.search(x) for x in sents[i:i + 2]):
                         no_status.append({"section": sid, "sentence": " ".join(snt.split())[:200]})
@@ -3007,6 +3187,7 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence=None
     # one state per fact: a PR's review state, its open/merged/closed state and
     # a version's release status read the same in every section
     res.update(state_claims(views, text))
+    res.update(relation_claims(views, text))
 
     # dates carry the year
     no_year = []
@@ -3025,7 +3206,11 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence=None
     num_prose = re.sub(r"\b\d+\.\d+(?:\.\d+)*\b", lambda m: m.group(0)
                        if m.group(0).replace(".", "", 1).isdigit() else " " * len(m.group(0)),
                        num_prose)
-    num_prose = _ITEM_RE.sub(lambda m: " " * len(m.group(0)), num_prose)
+    # an item reference (#N, owner/repo#N) is not a count
+    for r in link.item_refs(num_prose):
+        if r["form"] in ("local", "short"):
+            a_, b_ = r["span"]
+            num_prose = num_prose[:a_] + " " * (b_ - a_) + num_prose[b_:]
     num_prose = re.sub(r"^\s*\d+\.\s", lambda m: " " * len(m.group(0)), num_prose,
                        flags=re.M)
     bad_nums = []
@@ -3041,7 +3226,8 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence=None
         cited_par = linked_text(no_quotes[a:b])
         toks_ = set(re.findall(r"\d[\d,]*(?:\.\d+)?", cited_par))
         toks_ = {x.replace(",", "") for x in toks_}
-        n_items = len(set(re.findall(r"/(?:pull|issues)/(\d+)", no_quotes[a:b])))
+        n_items = len({(r["repo"], r["number"]) for r in link.item_refs(no_quotes[a:b])
+                       if r.get("url") and r["number"] is not None})
         if n_items:
             toks_.add(str(n_items))
         local.append((a, b, toks_))
@@ -3067,7 +3253,8 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence=None
                  "versions_not_linked", "release_status_missing", "ownership_not_in_view",
                  "automation_as_person",
                  "review_state_mismatch", "pr_state_mismatch", "release_status_mismatch",
-                 "superseded_not_in_view",
+                 "superseded_not_in_view", "relations_not_in_view",
+                 "relation_denials_contradicted",
                  "markers_malformed",
                  "sections_missing",
                  "omitted_section_present", "sections_out_of_order", "title_missing",
@@ -3178,28 +3365,17 @@ def _instant(day):
     return "{}T23:59:59Z".format(day)
 
 
-def pr_state_on(pr, day):
-    """A PR's state at the end of `day` (YYYY-MM-DD), replayed from the
-    record: `not_opened` before `created_at`; then its recorded lifecycle
-    events through the day (closed / reopened / merged, in time order);
-    `merged_at` / `closed_at` stand in when no event is recorded. One of
-    not_opened, open, merged, closed_unmerged; None without the record."""
-    if not pr or not pr.get("created_at"):
-        return None
-    if _day(pr["created_at"]) > day:
-        return "not_opened"
-    if pr.get("merged") and pr.get("merged_at") and _day(pr["merged_at"]) <= day:
-        return "merged"
-    events = sorted((e for e in pr.get("lifecycle") or [] if isinstance(e, dict)
-                     and e.get("event") in ("closed", "reopened", "merged")
-                     and e.get("created_at") and _day(e["created_at"]) <= day),
-                    key=lambda e: e["created_at"])
-    if events:
-        last = events[-1]["event"]
-        return {"closed": "closed_unmerged", "reopened": "open", "merged": "merged"}[last]
-    if pr.get("closed_at") and _day(pr["closed_at"]) <= day and not pr.get("merged"):
-        return "closed_unmerged"
-    return "open"
+# a PR's state in the words the issue's state claims use (`closed_unmerged`
+# is the record's own name for a PR closed without merging)
+_PR_STATE_NAMES = {"not_created": "not_opened", "closed": "closed_unmerged"}
+
+
+def pr_state_on(pr, day=None):
+    """A PR's state at the end of `day` (None: as recorded) by THE lifecycle
+    replay, `link.item_state`, renamed for PR claims: not_opened, open,
+    merged, closed_unmerged; None without the record."""
+    st = link.item_state(pr, day) if pr else None
+    return _PR_STATE_NAMES.get(st, st)
 
 
 def release_on(view, module, version, day):
@@ -3241,6 +3417,227 @@ def release_on(view, module, version, day):
     return "declared_not_published"
 
 
+# --- relation claims -----------------------------------------------------------
+#
+# No second parser and no second "does it hold" rule: the claims are read by
+# link.parse_relation_claims and judged by link.relation_holds, the functions
+# the view itself is built with. What stays here is prose scope: which
+# repository a paragraph speaks for, which story a sentence sits in, the day
+# judged, and how a failure is reported.
+
+# the relations a present-tense claim asserts are still in force
+_PRESENT_KINDS = ("blocked_by", "depends_on", "stacked_on", "blocks", "needed_by",
+                  "stacked_under") + tuple(link.GENERIC_RELATIONS)
+_REASON_TEXT = {"no_evidence": "no such relation in the record",
+                "after_day": "stated in the record only after the day",
+                "task_done": "the blocker is no longer open",
+                "text_not_current": "the blocker is no longer open",
+                "source_not_open": "the blocker is no longer open",
+                "target_not_open": "the blocker is no longer open",
+                "state_unknown": "an end the record does not hold"}
+
+
+def join_members(views):
+    """The stream's member views with their relations joined
+    (`link.join_member_relations`): a reference from one member to another
+    member's issue / PR becomes a cross-member edge to that member's story.
+    The scheduled path links each member on its own, so every reader joins
+    them here. Pure: the views given are not changed (the joined parts are
+    copies); a single view, or members already joined, come back as they
+    are."""
+    views = list(views)
+    if len(views) < 2 or all(v.get("_members_joined") for v in views):
+        return views
+    slugs = {_slug(v).lower() for v in views}
+    need = any(isinstance(e.get("to"), dict) and (e["to"].get("repo") or "").lower() in slugs
+               for v in views for e in (v.get("story_graph") or {}).get("edges") or [])
+    if not need:
+        return views
+    import copy
+    out = []
+    for v in views:
+        c = dict(v)
+        for k in ("story_graph", "stories"):
+            if k in v:
+                c[k] = copy.deepcopy(v[k])
+        c["_members_joined"] = True
+        out.append(c)
+    link.join_member_relations([{"bundle": c, "repo": _slug(c)} for c in out])
+    return out
+
+
+def _root_item(view, train_id):
+    """The item a story is about (its root issue, else its first PR / issue):
+    the default subject of a sentence inside its block or post."""
+    t = next((x for x in view.get("trains") or [] if x.get("id") == train_id), None)
+    if not t:
+        return None
+    n = t.get("root_issue") or (t.get("prs") or [None])[0] or (t.get("issues") or [None])[0]
+    return {"slug": _slug(view), "number": n} if n is not None else None
+
+
+_EMPHASIS_RE = re.compile(r"\*\*|__")
+_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+")
+
+
+def _claim_scope(views, text, subject_story=None):
+    """The prose scope every claim check reads with the shared parser:
+    [(section id, paragraph, the paragraph as written, repository, default
+    subject)] — a paragraph's repository (its links or the nearest
+    repository heading; the only one for one view), its default subject (the
+    root item of the story block it sits in, else a post's own story
+    `subject_story`). Comments (but story markers), fences and quoted text
+    are blanked in `paragraph`; `the paragraph as written` keeps the quotes."""
+    slugs = [_slug(v) for v in views]
+    low = {x.lower(): x for x in slugs}
+    by_slug = {_slug(v): v for v in views}
+    blank = lambda m: re.sub(r"[^\n]", " ", m.group(0))   # noqa: E731
+    t = _COMMENT_RE.sub(lambda m: m.group(0) if m.group(0).lstrip("<!- ").startswith(
+        ("story:", "/story")) else blank(m), text)
+    t = _FENCE_RE.sub(blank, t)
+    quoted = link._QUOTE_RE.sub(blank, t)        # the record's words are not our claims
+    blocks = [(m.start(), m.end(), m.group(1)) for m in _STORY_BLOCK_RE.finditer(t)]
+
+    def default_subject(par_pos, repo):
+        for a, b, key in blocks:
+            if a <= par_pos < b:
+                sl, _, tid = key.rpartition(":") if ":" in key else (repo, "", key)
+                v = by_slug.get(low.get((sl or repo or "").lower(), sl)) or \
+                    (views[0] if len(views) == 1 else None)
+                return _root_item(v, tid) if v else None
+        if subject_story:
+            sl, _, tid = subject_story.rpartition(":")
+            v = by_slug.get(low.get(sl.lower(), sl))
+            return _root_item(v, tid) if v else None
+        return None
+
+    out, pos = [], 0
+    for sid, chunk in _section_chunks(quoted):
+        start = quoted.index(chunk, pos) if chunk else pos
+        pos = start + len(chunk)
+        # a heading is prose too ("### #30 depends on #13" claims a relation)
+        pars, cur = [], start
+        for par, repo in _scoped_paragraphs(chunk, slugs):
+            at = quoted.find(par, cur)
+            if at >= 0:
+                cur = at + len(par)
+            pars.append([par, repo, at])
+        # a line ending in a colon hands the list right below it (no blank
+        # line between) to the parser with it: "#30 depended on:" + "- #12"
+        merged = []
+        for par, repo, at in pars:
+            prev = merged[-1] if merged else None
+            if prev and prev[2] >= 0 and at >= 0 and prev[3] and \
+                    _LIST_ITEM_RE.match(par) and \
+                    quoted[prev[2] + len(prev[0]):at].strip(" \t") == "\n":
+                prev[0] = quoted[prev[2]:at + len(par)]
+                continue
+            merged.append([par, repo, at, par.rstrip().endswith(":")])
+        for par, repo, par_pos, _colon in merged:
+            repo = repo if repo is not None else (slugs[0] if len(slugs) == 1 else None)
+            if repo is None:
+                continue
+            orig_par = t[par_pos:par_pos + len(par)] if par_pos >= 0 else par
+            # emphasis marks are layout, not words: "#30 **depended on** #13"
+            # is read as "#30 depended on #13" (offsets kept)
+            par = _EMPHASIS_RE.sub(lambda m: " " * len(m.group(0)), par)
+            out.append((sid, par, orig_par, repo, default_subject(par_pos, repo)))
+    return out
+
+
+def _claim_item(ref, repo, slugs):
+    """A parser reference as {"repo", "number"} in the views' spelling."""
+    low = {x.lower(): x for x in slugs}
+    sl = ref.get("slug") or repo
+    return {"repo": low.get((sl or "").lower(), sl), "number": ref["number"]}
+
+
+def relation_claims(views, text, as_of=None, subject_story=None):
+    """Every relation a sentence asserts, read by `link.parse_relation_claims`
+    and judged by `link.relation_holds` with the claim's `query_kind` (the
+    generic "waits_on" for waits on / waiting for) — evidence per (subject,
+    target) pair, of the kind claimed (an inverse cue from the waiting
+    side), dated on or before the day judged (`as_of`, else the window's
+    end); a present-tense waiting claim also needs the relation still in
+    force that day (both ends open by `link.item_state`, not a ticked task,
+    the text current). In-story, cross-story and cross-member evidence
+    alike. Scope is ours (`_claim_scope`).
+
+    A negated claim ("is not blocked by", "no longer waits on") asserts
+    nothing to check, but one that denies a relation the record holds is a
+    contradiction (`relation_denials_contradicted`), judged like the claim it
+    denies: a present-tense waiting denial against the relation in force on
+    the day, any other ("never depended on", "is not a follow-up to")
+    against the record as stated by then.
+    For a view without the in-story layer (no `inner_relations` anywhere), a
+    pair inside one story passes on a quote in the same sentence that the
+    shared parser reads as the same relation to the same target.
+
+    Returns {"relations_not_in_view": [...], "relation_denials_contradicted": [...]}."""
+    views = join_members(views)
+    slugs = [_slug(v) for v in views]
+    target = views[0] if len(views) == 1 else [{"repo": _slug(v), "bundle": v} for v in views]
+    by_slug = {_slug(v): v for v in views}
+    inner_layer = {_slug(v) for v in views
+                   if any("inner_relations" in r for r in (v.get("stories") or {}).get("all") or [])}
+    story_of = {}
+    for v in views:
+        for t in v.get("trains") or []:
+            for n in list(t.get("prs") or []) + list(t.get("issues") or []):
+                story_of.setdefault((_slug(v), n), set()).add(t["id"])
+    bad, denied = [], []
+
+    def quoted_says(orig, kind, tgt, repo):
+        for qm in link._QUOTE_RE.finditer(orig):
+            for c in link.parse_relation_claims(qm.group(1) or qm.group(2), repo):
+                if c["query_kind"] == kind and not c["negated"] and any(
+                        x["number"] == tgt["number"] for x in c["targets"]):
+                    return True
+        return False
+
+    for _sid, par, orig_par, repo, dflt in _claim_scope(views, text, subject_story):
+        day = as_of or _period(by_slug.get(repo) or views[0])[1]
+        for c in link.parse_relation_claims(par, repo, dflt):
+            if c["relation"] in ("mentions", "mentioned_by") or not c["subject"]:
+                continue
+            kind = c["query_kind"]
+            subj = _claim_item(c["subject"], repo, slugs)
+            present = c["tense"] == "present" and kind in _PRESENT_KINDS
+            snt = " ".join(par[c["span"][0]:c["span"][1]].split())[:200]
+            orig = orig_par[c["span"][0]:c["span"][1]]
+            for tgt in c["targets"]:
+                obj = _claim_item(tgt, repo, slugs)
+                # a denial is judged like the claim it denies: "no longer waits
+                # on" against the relation in force on the day; "never depended
+                # on" or "is not a follow-up to" against the record as stated
+                res = link.relation_holds(target, subj, obj, kind, day=day, present=present)
+                row = {"claim": kind, "subject": "{}#{}".format(*subj.values()),
+                       "target": "{}#{}".format(*obj.values()), "sentence": snt}
+                if c["negated"]:
+                    if res["holds"]:
+                        denied.append(dict(row, problem="denies a relation the record "
+                                                        "holds"))
+                    continue
+                if res["holds"]:
+                    continue
+                same = story_of.get((subj["repo"], subj["number"]), set()) & \
+                    story_of.get((obj["repo"], obj["number"]), set())
+                if same and res["reason"] == "no_evidence":
+                    if subj["repo"] not in inner_layer:
+                        if quoted_says(orig, kind, tgt, repo):
+                            continue
+                        bad.append(dict(row, reason="no_evidence",
+                                        problem="inside one story without a quote"))
+                    else:
+                        bad.append(dict(row, reason="no_evidence",
+                                        problem="inside one story, not in its inner "
+                                                "relations"))
+                    continue
+                bad.append(dict(row, reason=res["reason"],
+                                problem=_REASON_TEXT.get(res["reason"], res["reason"])))
+    return {"relations_not_in_view": bad, "relation_denials_contradicted": denied}
+
+
 class RecordAsOf:
     """ONE projection of the record as of a day, for every state, review and
     publication claim of a post: PR state (replayed close / reopen / merge
@@ -3273,7 +3670,7 @@ class RecordAsOf:
         return release_on(v, module, version, self.day) if v is not None else "unknown"
 
 
-def state_claims(views, text, as_of=None):
+def state_claims(views, text, as_of=None, subject_story=None):
     """One state per fact: every sentence of the issue (stories, quotes and
     comments blanked of quoted text only) that names exactly ONE pull
     request and states its review state, or its open/merged/closed state, or
@@ -3296,9 +3693,8 @@ def state_claims(views, text, as_of=None):
             n = pr.get("number")
             if n is None:
                 continue
-            st = "merged" if pr.get("merged") else (
-                "open" if pr.get("state") == "open" else
-                "closed_unmerged" if pr.get("state") == "closed" else None)
+            st = pr_state_on(pr)
+            st = st if st != "not_opened" else None
             rs = pr.get("review_state")
             prs[(sl, n)] = {"review": rs.get("state") if isinstance(rs, dict) else None,
                             "state": st}
@@ -3329,11 +3725,12 @@ def state_claims(views, text, as_of=None):
             repo = repo if repo is not None else (slugs[0] if len(slugs) == 1 else None)
             if repo is None:
                 continue
-            plain = _strip(_delink(par), code=False)
+            plain = _strip(_delink_items(par, repo), code=False)
             for snt in _sentences(plain):
                 snt_c = _CODE_SPAN_RE.sub(lambda m: m.group(0).strip("`"), snt)
-                nums = sorted({int(x) for x in _ITEM_RE.findall(snt_c)
-                               if (repo, int(x)) in prs})
+                nums = sorted({r["number"] for r in link.item_refs(snt_c, repo)
+                               if not r["evidence"] and (repo, r["number"]) in prs
+                               and slug_key(r["repo"] or "") == slug_key(repo)})
                 # a conditional, or a count of many PRs ("10 were closed without
                 # merging and one, #N, is open"), states nothing about one PR
                 cond = bool(_CONDITIONAL_RE.search(snt_c) or _COUNT_SUBJECT_RE.search(snt_c))
@@ -3383,29 +3780,44 @@ def state_claims(views, text, as_of=None):
                     row.pop("repo")
                 out.append(row)
         return out
-    # "superseded" / "replaced by" only where the record says so (`superseded_by`);
-    # work that landed elsewhere (`content_landed_in`) is said with its basis
+    # "superseded" / "replaced by" only where the record says so: each such
+    # claim read by the shared parser (subject, the item it names) and
+    # answered by link.record_superseded; work that landed elsewhere
+    # (`content_landed_in`) is said with its basis instead
     supersede = []
-    unstated = {k for k, x in closed.items() if x is not None and not x.get("superseded_by")}
-    for sid, chunk in _section_chunks(t):
-        for par, repo in _scoped_paragraphs(chunk, slugs):
-            repo = repo if repo is not None else (slugs[0] if len(slugs) == 1 else None)
-            if repo is None:
+    members = views[0] if len(views) == 1 else [{"repo": sl, "bundle": v}
+                                                for sl, v in zip(slugs, views)]
+    for sid, par, _orig, repo, dflt in _claim_scope(views, text, subject_story):
+        for c in link.parse_relation_claims(par, repo, dflt):
+            # the parser reads superseded / replaced / consolidated as one
+            # relation; only the first two words claim a supersession
+            if not _SUPERSEDE_RE.search(c["quote"]) or c["negated"]:
                 continue
-            for snt in _sentences(_strip(_delink(par), code=False)):
-                snt_c = _CODE_SPAN_RE.sub(lambda m: m.group(0).strip("`"), snt)
-                if not _SUPERSEDE_RE.search(snt_c):
+            snt = " ".join(par[c["span"][0]:c["span"][1]].split())[:160]
+            if c["relation"] == "content_landed_in" and c["subject"]:
+                pairs = [(_claim_item(c["subject"], repo, slugs), _claim_item(x, repo, slugs))
+                         for x in c["targets"]]
+            elif c["relation"] == "mentions":
+                # "#22 was superseded": an item said superseded, by nothing named
+                pairs = [(_claim_item(x, repo, slugs), None) for x in c["targets"]]
+            else:
+                continue
+            for it, by in pairs:
+                if (it["repo"], it["number"]) not in closed:
+                    continue        # not a PR closed without merging: no such claim
+                res = link.record_superseded(members, it, by or it, day=as_of)
+                if res["holds"] or (by is None and res["reason"] == "other_item"):
                     continue
-                nums = [int(x) for x in _ITEM_RE.findall(snt_c) if (repo, int(x)) in prs]
-                said = [n for n in nums if (repo, n) in closed and closed[(repo, n)]
-                        and closed[(repo, n)].get("superseded_by")]
-                bad = [n for n in nums if (repo, n) in unstated]
-                if bad and not said:
-                    row = {"pr": bad[0], "section": sid,
-                           "sentence": " ".join(snt.split())[:160]}
-                    landed = (closed[(repo, bad[0])] or {}).get("content_landed_in")
-                    if landed:
-                        row["content_landed_in"] = [x.get("pr") for x in landed]
+                row = {"pr": it["number"], "section": sid, "sentence": snt,
+                       "reason": res["reason"]}
+                if by is not None:
+                    row["by"] = by["number"]
+                if len(slugs) > 1:
+                    row["repo"] = it["repo"]
+                landed = (closed[(it["repo"], it["number"])] or {}).get("content_landed_in")
+                if landed:
+                    row["content_landed_in"] = [x.get("pr") for x in landed]
+                if row not in supersede:
                     supersede.append(row)
     return {
         "superseded_not_in_view": supersede,
@@ -3422,7 +3834,9 @@ THEME_CHECK_KEYS = (
     "items_not_in_view", "modules_not_in_view", "versions_not_in_view", "people_not_in_view",
     "name_mismatch", "do_not_name_named", "affiliation_mismatch", "automation_as_person",
     "review_state_mismatch", "pr_state_mismatch", "release_status_mismatch",
-    "superseded_not_in_view", "candidates_worded_as_declared", "dates_without_year", "numbers_not_in_view",
+    "superseded_not_in_view", "relations_not_in_view", "relation_denials_contradicted",
+    "candidates_worded_as_declared",
+    "dates_without_year", "numbers_not_in_view",
     "characterising_words", "modules_not_linked", "versions_not_linked", "markers_malformed")
 
 
@@ -3498,7 +3912,7 @@ CANNOT_CHECK = (
 # --- daily social posts (drafts for the owner to approve) ----------------------
 #
 # One post per story, at the first event a reader can act on; plumbing rolls
-# into one weekly item per theme with activity. reference/social.md has the
+# into ONE weekly post per repository, covering every theme with activity. reference/social.md has the
 # rules, the ledger and what the posting step needs. Nothing here schedules or
 # publishes anything: the outline lists what became postable on a day.
 
@@ -3693,7 +4107,7 @@ def social_candidates(views, hold_days=SOCIAL_HOLD_DAYS, automation=()):
     exclusion folds it into the weekly count (`excluded`). Ownership and
     lifecycle events: one post per module and kind. Plumbing: ONE weekly post
     per week covering every theme with activity, biggest first (`weekly`)."""
-    views = list(views)
+    views = join_members(views)
     multi = len(views) > 1
     out_l = outline(views, automation=automation)
     sec = {x["id"]: x for x in out_l["sections"]}
@@ -3907,8 +4321,9 @@ def social_candidates(views, hold_days=SOCIAL_HOLD_DAYS, automation=()):
                                                  v, replacements[e["module"]].get("module"))[0])
                                              if replacements.get(e["module"]) else None)}
                                             if e["kind"] == "deprecated" else {})}})
-        # plumbing: ONE weekly post per week, on the week's last day inside the
-        # window, covering every theme with activity that week, biggest first
+        # plumbing: ONE weekly post per week, due on the week's Sunday (pending
+        # until the coverage reaches it), covering every theme with activity
+        # that week, biggest first
         weeks = {}
         for th in sec["plumbing"].get("themes") or []:
             if multi and th.get("repo") != sl:
@@ -4017,7 +4432,9 @@ POST_CHECK_KEYS = (  # plus release_claimed_while_unknown, set per post
     "urls_not_in_view", "quotes_not_in_view", "items_not_in_view", "modules_not_in_view",
     "versions_not_in_view", "people_not_in_view", "do_not_name_named", "affiliation_mismatch",
     "automation_as_person", "review_state_mismatch", "pr_state_mismatch",
-    "release_status_mismatch", "superseded_not_in_view", "candidates_worded_as_declared",
+    "release_status_mismatch", "superseded_not_in_view", "relations_not_in_view",
+    "relation_denials_contradicted",
+    "candidates_worded_as_declared",
     "dates_without_year", "numbers_not_in_view", "characterising_words")
 
 
@@ -4087,8 +4504,14 @@ def post_facts(text, names=None):
     dates = sorted({m.group(0) for m in link._DATE_IN_PROSE_RE.finditer(t2)})
     t3 = link._DATE_IN_PROSE_RE.sub(" ", t2)
     versions = sorted(set(_VERSION_RE.findall(t3)))
-    items = sorted(set(_ITEM_RE.findall(t3)))
-    t4 = _ITEM_RE.sub(" ", _VERSION_RE.sub(" ", t3))
+    # item references by the shared resolver (#N; owner/repo#N kept whole)
+    refs = [r for r in link.item_refs(t3) if r["form"] in ("local", "short")]
+    items = sorted({("{}#{}".format(r["slug"], r["number"]) if r["slug"] else str(r["number"]))
+                    for r in refs})
+    for r in refs:
+        a_, b_ = r["span"]
+        t3 = t3[:a_] + " " * (b_ - a_) + t3[b_:]
+    t4 = _VERSION_RE.sub(" ", t3)
     numbers = sorted(set(x.replace(",", "") for x, _ in _NUMBER_RE.findall(t4)))
     handles = sorted(set(_HANDLE_RE.findall(t2)))
     modules = sorted({m.group(0).rstrip("/.-") for m in _AVM_PATH_RE.finditer(t2)})
@@ -4138,7 +4561,7 @@ def check_posts(views, text, registry=None, against=None, hold_days=SOCIAL_HOLD_
     registry confirms them for the channel. `against` (an earlier version of
     the same file) adds the voice-pass rule: the facts of each post must be
     unchanged (`facts_changed`). Pure."""
-    views = list(views)
+    views = join_members(views)
     cand = candidates or social_candidates(views, hold_days=hold_days, automation=automation)
     by_id = {p["post_id"]: p for p in cand["posts"] + cand["weekly"]}
     registry_names = None
@@ -4332,7 +4755,7 @@ def check_posts(views, text, registry=None, against=None, hold_days=SOCIAL_HOLD_
         allowed = set()
         _social_numbers(row.get("must_state") if row else None, allowed)
         if full.get("numbers_not_in_view"):
-            # a count the row itself gives (a weekly item's PRs) is a fact too
+            # a count the row itself gives (a weekly post's PRs) is a fact too
             full["numbers_not_in_view"] = [x for x in full["numbers_not_in_view"]
                                            if x not in allowed]
         if full.get("urls_not_in_view"):
@@ -4342,7 +4765,10 @@ def check_posts(views, text, registry=None, against=None, hold_days=SOCIAL_HOLD_
                                         if u.rstrip("/").lower() not in roots]
         # every state, review and publication claim against the record as of
         # the post's day (one projection, not the window's end)
-        full.update(state_claims(views, issue, as_of=day))
+        own_story = ("{}:{}".format(pid.split(":")[1], pid.split(":")[2])
+                     if pid.startswith("story:") and pid.count(":") >= 2 else None)
+        full.update(state_claims(views, issue, as_of=day, subject_story=own_story))
+        full.update(relation_claims(views, issue, as_of=day, subject_story=own_story))
         for snt in _sentences(_URL_RE.sub(" ", plain)):
             if not re.search(r"\bcommunity\b", snt, re.I):
                 continue
@@ -4439,6 +4865,22 @@ WORK_PACKAGE_RULES = """
    description that names the issue, or "a closing reference GitHub records") and **what a PR
    changed as a whole** (`net_files`: files, lines added / removed, own commits) may be said;
    an automation account works for the person `author_on_behalf_of` names on that PR.
+14. **How the work connects.** `relations` in the row file are the story's links to other
+   stories from the record (never a bare mention): say what it waits on (`blocked_by`,
+   `depends_on`, `stacked_on` with `waiting`) in "Where it stands", and what it unblocked,
+   followed up (`follow_up_of`), was caused by (`caused_by`) or where its content landed
+   (`content_landed_in`) where the change is told — with the quote's substance and a link to
+   the other item. A target with `waiting: false` is no longer waited on: say it was waited
+   on, not that it still is. An external target (another repository) is named with its link
+   and no state. A relation between two items of the same story is not in `relations`; it is in
+   `inner_relations` in the row file (from the waiting item): state those as facts, with a link,
+   no quote needed. Only when the row has no `inner_relations` key at all (a view without that
+   layer) is an in-story dependency stated with the slice's own quote. The issue check fails a
+   dependency the record does not hold (`relations_not_in_view`) and a denial ("no longer waits
+   on") of one it holds in force (`relation_denials_contradicted`). A relation whose basis is a ticked task (`task_done`) or text edited after the window
+   (`text_current: false`) is not waited on any more: say the task is ticked or the text changed,
+   never that it still waits. When `connections.chains_capped` is set, say the chains were
+   capped (the record's walk stopped before their end).
 """
 
 
@@ -4450,7 +4892,7 @@ def work_package(views, out_dir, skill_dir=None, cadence=None, automation=(), vi
     batches of at most WORK_PACKAGE_BATCH stories and WORK_PACKAGE_BYTES of
     slices, of roughly equal slice size; one batch per plumbing theme), each
     with `BATCH.md` and `STORY_BRIEF.md`. Returns the manifest."""
-    views = list(views)
+    views = join_members(views)
     multi = len(views) > 1
     skill_dir = skill_dir or os.path.dirname(os.path.abspath(__file__))
     out = outline(views, cadence=cadence, automation=automation)

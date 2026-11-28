@@ -108,8 +108,9 @@ The AI group's home organisations include `Azure-Samples` (stream `home` and man
 **Groups are manifest streams.** The owner thinks in groups ("Enterprise Landing Zones",
 "AI related Landing Zones") and wants one newsletter per group. A manifest stream is the
 skill's existing form for "one logical project, several repositories": one store and one
-project per group, so cross-repository references between the members become trains and the
-people of the group are one project; `latest --stream ai-lz` answers for the whole group and
+project per group, so cross-repository references between the members become project trains
+(in the digest's project view; the newsletter tells each member's trains as separate stories,
+`reference/newsletter.md`) and the people of the group are one project; `latest --stream ai-lz` answers for the whole group and
 its `next` commands already view every member and pass all the views to `newsletter.py`
 (the documented multi-repository newsletter). One stream per repository with a `group`
 label would need a new group reader that collects views from several stores, and would lose
@@ -298,6 +299,69 @@ history (and, for an external program, in the process list), whatever the mode o
 file it is then written to. Every way of entering one below reads a file or prompts; a test
 scans the docs and examples so a secret-on-the-command-line instruction cannot come back.
 
+**Secrets on disk: one resolution step, one policy** (the token env file, the app's private
+key file). The file's own mode 600 keeps its content private, but whoever can **write** its
+folder, or any folder above it, can replace or rename the file. A mode-700 `/shared/private`
+under a world-writable `/shared` can be renamed away, with another folder and token put in
+its place. So every secret path is first **resolved**, component by component from `/`:
+- the path is never normalised first: a relative path is only joined with the working
+  directory, so `..` is followed through the real folders after each symlink, as the
+  kernel does;
+- every symlink is followed with the checks below.
+
+Everything after that applies to the **resolved** location, never to the path as typed or
+to a symlink's folder: the real file, its real parent folder, and the open handle. That
+holds for every read path and before every write: the env file, the app key, the import
+source, and the wrappers through `token where`, which hands them the resolved path.
+
+*Read paths*: nightly runs, `token status`, `token app-check`, `token where` for the
+wrappers. *Write paths*: `token renew` (the env file is written fresh). *Import*:
+`token app-key --import` (its source bytes are about to be trusted).
+
+| Component | Owner | Group/other **write** | Group/other **read** | Sticky bit |
+|---|---|---|---|---|
+| A directory on the path, `/` included | yours or root's, else **refuse** | **refuse** (read, write, import), except sticky | accept | a group/other-writable directory with the sticky bit is accepted when the next entry is yours or root's, else **refuse** |
+| A symlink on the path (a final one too) | yours or root's, else **refuse** | — (a link's own mode means nothing; its folder is a directory on the path) | — | — |
+| The parent folder of the resolved file | yours or root's (as a directory on the path) | read: **refuse**; write: **tighten** to 700 if yours and not shared, else **refuse**; import: **refuse** | read: warn; write and import: **tighten** to 700 if yours and not shared, else warn | no exception: a sticky, group/other-writable parent counts as writable |
+| The resolved file | yours, else **refuse**; a regular file only, else **refuse** | **refuse** (read, import; a write replaces it with a fresh mode-600 file) | read: **refuse** (mode 600 required); import: warn | — |
+
+Further rules:
+- **Never chmod-ed:** shared folders (your home directory, `/`, the temporary directories,
+  the workspace), a folder that is not yours, and any directory above the parent.
+- **Missing folders:** a write creates them mode 700, only inside a folder that passes the
+  directory rule (a group/other-writable one only with the sticky bit).
+- **Opening:** a secret is opened once, without following a final symlink. The open handle
+  must be the file the walk saw (same device and inode), and the file rule is checked again
+  on it. The app key's bytes then go to `openssl` through a pipe, so it never reopens the
+  path.
+- **Every refusal names the component at fault and the fix.** Examples:
+  - `/shared is writable by group or others (mode 777) without the sticky bit … Fix: chmod
+    go-w /shared …`;
+  - `the token is in /tmp, which is writable by group or others (mode 1777) … Fix: chmod 700
+    …, or move the file to … ~/.config/activity-overview`;
+  - `… is mode 666, writable by group or others: another user can overwrite it`;
+  - `… is a symlink owned by uid …`.
+
+On macOS (reasoned from the standard layout, not run on a Mac):
+- `/Users` is root-owned, mode 755, and your home is yours: a key under
+  `~/.config/activity-overview` passes;
+- `/tmp` is a root-owned symlink to `/private/tmp`, which is sticky and world-writable: a
+  folder of yours under it passes, but a secret placed directly in it is refused (its
+  parent is writable);
+- a group-writable folder such as one writable by `staff` or `admin` (e.g. an Intel
+  Homebrew prefix) is refused;
+- ACLs, which macOS uses more often than Linux, are not read (below).
+
+**What the check does not cover.**
+- Access control lists: only the mode bits and owners are read.
+- A root-owned directory that someone else administers: root is trusted on the whole path.
+- A change made by you or root after the check.
+- The wrappers' own read: they source the env file by the resolved path `token where`
+  prints (no symlink left in it), so the time between that check and their read remains.
+
+Read paths never change a mode; only the write paths do, and they say so
+(`tightened <folder> from mode 775 to 700`).
+
 ### 7.1 The app route
 
 **How it works.** For each gather (each stream and window, and each `--resume` pass), the
@@ -351,6 +415,25 @@ gather invocation, never one per run.
    This stores the key base64-encoded through `security -i` (standard input), then reads it
    back and compares. After that, remove `private_key_file` from the token block and
    delete the file.
+
+   What the import requires of the file it reads: the "Import" column of the policy table
+   in §7 ("Secrets on disk"), applied to the **resolved** file:
+   - every folder from `/` down is yours or root's and writable by nobody else (sticky
+     folders excepted as described there);
+   - a symlink on the way, a final one included, is yours or root's, and its target passes
+     the same check;
+   - the key's real parent folder is not writable by group or others. No chmod can make
+     bytes someone else could have written trustworthy, so it is refused, never tightened.
+     A readable-only parent is tightened to 700 if it is yours and not shared;
+   - the file is a regular file of your own, not writable by group or others (refused). If
+     only readable by others (a fresh download is often 644), it is imported with a warning
+     to `chmod 600` it or delete it. It is read once through the checked handle.
+
+   An unsafe source imports **nothing**, and the message names the component at fault and
+   the fix: move the key into a private folder such as `~/.config/activity-overview` and
+   `chmod 600` it first. Importing straight from `~/Downloads` therefore works only where
+   that folder passes the check, and a readable `~/Downloads` would be tightened to 700.
+   That is why the steps above move the key out of Downloads first.
 3. Install it: on the app's page, **Install App** → your account → **Only select
    repositories** (any one of your repositories) or **All repositories**. Neither choice
    gives access to the Azure repositories; reading them as public repositories is what
@@ -449,7 +532,11 @@ Under the app route the advice is never `token renew`, which refuses while
     on the app's page.
   - LibreSSL, which macOS ships, documents `openssl dgst [-digest] -sign file` with
     standard input when no file is given (the OpenBSD manual).
-- *Tested here* (Linux, OpenSSL 3.0, the network and `security` replaced by seams):
+- *Tested here* (Linux, OpenSSL 3.0, the network and `security` replaced by seams; the
+  whole suite run both as root and as an ordinary user (uid 1001, on a checkout it owns,
+  with `/tmp` sticky and world-writable as on CI). Foreign ownership is simulated through
+  one ownership seam, so those cases run as either user. Their real-`chown` twins need
+  root and are reported as skipped otherwise, never as passes):
   - JWTs signed with a real throwaway RSA key (PKCS#8, and the PKCS#1 form GitHub
     downloads), from the file and through the pipe; signatures verified with
     `openssl dgst -verify`; claims checked;
@@ -554,9 +641,15 @@ python3 $AO/schedule.py token renew --streams $W/streams.json --kick
    - possibly a different or partial value, to check with `token status`.
 
    It never claims the old token is still there unless that was read back. `token app-key`
-   writes the app's key the same way. The env file is written as a new mode-600 file in a
-   mode-700 directory, fsynced and renamed over the old one: until that rename, the old file
-   is untouched.
+   writes the app's key the same way. The env file is written as a new mode-600 file in its
+   directory, fsynced and renamed over the old one: until that rename, the old file is
+   untouched. Its directory is made private first, by the rule in §7 ("The folder that
+   holds a secret"):
+   - a missing directory is created mode 700;
+   - an existing one of your own that group or others can read is tightened to 700, and
+     `token renew` says so;
+   - a group- or other-writable directory that cannot be tightened (a shared location, or
+     not yours) is refused before anything is written, and the old token stays.
 5. `--kick` then starts a run: on macOS `launchctl kickstart gui/<uid>/local.activity-overview.gather`
    (the scheduled job, which reads the new token where the streams file says). If
    `launchctl` exits non-zero, `token renew` says the job was **not** started (e.g. it is not

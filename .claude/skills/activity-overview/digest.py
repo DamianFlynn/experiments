@@ -663,6 +663,9 @@ def build_project_view(conn, project, repos, ts_from, ts_to, *, backfill=None,
     members = member_bundles(conn, project, repos, ts_from, ts_to,
                              backfill=backfill, backfill_budget=backfill_budget,
                              warn=warn, ref_date=ref_date)
+    # how stories depend on each other ACROSS members: a member's reference
+    # to another member's issue / PR resolves to that member's story key
+    link_mod.join_member_relations(members)
     comps = link_components(conn, project, members, window_components(
         conn, project, members,
         spine_components(conn, project, repos, ts_from, ts_to,

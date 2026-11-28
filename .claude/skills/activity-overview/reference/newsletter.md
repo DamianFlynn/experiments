@@ -159,6 +159,28 @@ is acknowledged with `<!-- story pending: <key> — <reason> -->`; a theme narra
 written with `<!-- theme pending: <theme id> — <reason> -->` (both listed as pending; anything
 neither written nor pending fails the check).
 
+**How the work connects.** From the view's relation layer (`story_graph`,
+`stories.all[].relations`; BUNDLE.md "How stories depend on each other"), every story row carries
+`relations`: its links to other stories that are not a bare mention (`blocked_by`, `depends_on`,
+`stacked_on`, `follow_up_of`, `caused_by`, `content_landed_in` and their inverses), each with the
+record's quote and item, and the other story's title, group, state and link (`in_issue: false`
+for a train the issue does not tell), or, for another repository, the external item with no
+state. A module story adds `waited_on_plumbing` (the plumbing it waited on); a plumbing theme
+adds `needed_by` (module stories that waited on its work) and `caused` — where "what was
+engineered" meets "why". The Stories section ends with a `### How the work connects` part from
+`connections`: the chains of waiting stories, the items most stories wait on
+(`most_blocking`), external targets, and the counts per relation. Story rows also carry `inner_relations` (links between items of the same story) to be told as
+facts; a relation basis keeps `task_done` (a task-list line: true when ticked, so not waited on)
+and `text_current` (false when the text was edited after the window). When
+`connections.chains_capped` is set, the part says the chains were capped. Write it in a few
+bullets:
+what waits on what and whether it still does, closed work that landed elsewhere, follow-ups and
+causes, and links outside the repository (named with their link, no state). The relation layer
+holds edges BETWEEN stories; a dependency between two items of one story is in the row's
+`inner_relations` and is told as a fact. Only a view without that layer (no `inner_relations`
+key on any story row) leaves an in-story dependency to the slice text, stated with the slice's
+quote.
+
 **Writing many stories in parallel.** A month can hold dozens of `full` stories.
 
 ```bash
@@ -343,6 +365,17 @@ repositories (one Terraform module per repository); people counts stay per repos
 (`numbers.by_repo`); stream totals add only additive counts. A member's GitHub release notes
 (`versions.releases`) stand in for a changelog.
 
+**A story never spans repositories.** A story is one member's train, and `link.py` builds
+trains per repository: PRs join only through the issues of their own repository that they
+close. Work that crosses members (a PR in one repository closing or citing an issue in
+another) is told as one story per member, each under its own qualified key, with nothing in
+the outline joining them; the project trains of `digest.py` (`ptrain-…`, BUNDLE.md) are not
+read here. A story may name another member's item by link or `owner/repo#N`; the story check
+treats such an item as outside its slice (never covered). Outside story blocks, a
+paragraph's repository is the one its github.com links name when they name exactly one
+member, else the one the nearest heading above it names (`owner/repo`, or a repository name
+no other member shares); `#N`, module areas and quotes are resolved in that repository.
+
 ## Inputs (view keys)
 
 `module_changes` (summary, modules with `url`, `display_name`, `description`,
@@ -369,13 +402,15 @@ It fails (exit 1) and lists:
 | `modules_not_linked` / `versions_not_linked` | in New modules, What changed, Breaking, Module ownership, People and Coming up: a module path the view knows (a module or a versioned child) that is not inside a link's text; a published version written right after a module path that is not a link |
 | `release_status_missing` | in New modules, What changed and People: a sentence that names a PR or module and says landed / merged / shipped, with no release status ("released as", "published", "not yet published", "declared in the changelog", "no version change", "release status not known") in it or the next sentence |
 | `ownership_not_in_view` | a module named in the Module ownership section that `module_ownership` does not hold (events, without an owner now or at the start, deprecated, stub, labelled) |
-| `superseded_not_in_view` | a sentence saying "superseded" or "replaced by" about a PR closed without merging whose record holds no `superseded_by` (work that landed elsewhere, `content_landed_in`, is said with its basis instead) |
+| `superseded_not_in_view` | a claim that a PR closed without merging was "superseded" or "replaced by" another (read by the shared parser, with the story block's or post's root item as the subject when the sentence names none) that `link.record_superseded` does not hold: the item's own close reason names no successor (`not_stated`), names another one (`other_item`), was written after the day, or the PR was not closed then; the reason is reported. Work that landed elsewhere (`content_landed_in`) is said with its basis instead |
+| `relations_not_in_view` | every relation a sentence asserts, read by the shared parser (`link.parse_relation_claims`: subject, relation as written, each target, tense, negated; the subject carried across coordinated predicates, else the sentence's default subject — the root item of the story block it is in, a post's own story; a line ending in a colon is read together with the list right below it, so "#30 depended on:" claims each list item) and judged per (subject, target) pair by the shared predicate (`link.relation_holds` with the claim's `query_kind`: "waits on / waiting for / waited on" is the generic `waits_on`, held by any waiting relation; the rule the view itself is built with): evidence of that kind (an inverse cue from the waiting side, also to an external target stored as written) dated on or before the day judged (the window's end, a post's day); a present-tense waiting claim also needs it still in force that day (not a ticked task, its text current, both ends open by `link.item_state`). The reason code is reported (`no_evidence`, `after_day`, `task_done`, `text_not_current`, `source_not_open`, `target_not_open`, `state_unknown` — an end no view holds, such as an external item, so a present-tense claim about one fails while a past-tense one holds). In-story pairs are judged against `inner_relations` like any other evidence; a view without that layer (no `inner_relations` key on any story row) passes an in-story pair only on a quote in the same sentence that the shared parser reads as the same relation to the same target. A bare mention never counts; quoted text is not read for claims; member views of a stream are joined first (`join_members`: `link.join_member_relations` on copies) |
+| `relation_denials_contradicted` | a negated claim ("is not blocked by", "no longer needs") asserts nothing to check, but one that denies a relation the record holds contradicts it, judged like the claim it denies (`link.relation_holds` with the claim's `query_kind`): a present-tense waiting denial against the relation in force on the day judged, any other ("never depended on", "is not a follow-up to") against the record as stated by then |
 | `heading_missing` (theme check only) | a theme narrative whose first line is not `### <title_hint>` of its theme |
 | `review_state_mismatch` / `pr_state_mismatch` / `release_status_mismatch` | **one state per fact**, over the whole issue including story blocks (quoted text and comments blanked): a sentence that names exactly one PR and states its review state ("approved", "approved before …", "changes requested", "waiting for a first review", "reviewed only by automation", "ready to merge") that the PR's `review_state` does not hold, or that another section's sentence about the same PR contradicts; the same for a PR's open / merged / closed-without-merging state, and for a module version said to be published or not yet published against its release status. A conditional sentence ("once", "if", "until"), or one counting many PRs ("10 were closed without merging and one, #N, is open"), states nothing about one PR |
 | `automation_as_person` | an automation account written as "Name (@login)", or mentioned in a sentence without the marker word "automation" |
 | `modules_not_in_view` | a module path that is not a module, child, code area, path the view's changelogs / PR titles name, or the module an issue form names |
 | `versions_not_in_view` | a version that does not belong to its module (versions indexed by the module they belong to; a version right after a module path is that module's; any other must belong to a module the paragraph names, a named child or a child of a named parent) |
-| `items_not_in_view` / `urls_not_in_view` | a `#N` that is not a PR or issue of the view; a URL that is neither in the view nor one the outline or the module / tag link rule gives |
+| `items_not_in_view` / `urls_not_in_view` | an item reference (`link.item_refs`: `#N` in the paragraph's repository, `owner/repo#N`, an item link whatever its text) of one of the views' repositories that is not a PR or issue of that view (an item of another repository is checked as a URL; a comment, review or commit link is evidence); a URL that is neither in the view nor one the outline or the module / tag link rule gives |
 | `repository_unresolved` | multi-repo only: a module area or `#N` several members know, in a paragraph whose repository is not resolved |
 | `quotes_not_in_view` | a quoted text that is not verbatim in a view text (of the paragraph's repository when resolved) |
 | `people_not_in_view` / `name_mismatch` / `do_not_name_named` | an `@login` the view does not know; a "Name (@login)" whose name is not the view's; a do_not_name person anywhere in the complete issue |

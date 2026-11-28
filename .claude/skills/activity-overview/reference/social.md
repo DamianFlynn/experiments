@@ -60,10 +60,13 @@ theme counts.
 The earliest trigger of a story wins; a later event never makes a second post (except the
 closing post above). Stories that are only in flight or stalled without one of these events get
 no post (there is nothing for a reader to do yet). **Plumbing gets no daily post**: ONE weekly
-post per ISO week ("what was engineered"), due on that week's Sunday and pending until the
+post per ISO week **per repository** ("what was engineered"), due on that week's Sunday and pending until the
 view covers that day (never drafted from part of a week), covering every plumbing theme with a PR merged or opened that week, biggest first
 (`must_state.themes`, by merged then opened), plus the closures not posted
-(`closures_not_posted`): `post_id` `weekly:<repo>:<YYYY>-W<ww>`. The LinkedIn form may use its
+(`closures_not_posted`, each in the week of its closing day): `post_id` `weekly:<repo>:<YYYY>-W<ww>`. A
+week with folded closures but no plumbing activity still gets its post. In a multi-repository
+stream each member has its own weekly post, holding only that member's themes and closures;
+the members' posts are not merged into one. The LinkedIn form may use its
 full length; the X form names the one or two main things and links the repository or the main
 pull request.
 
@@ -105,6 +108,11 @@ Both forms state the same facts; neither adds one.
   at their full length), plain text, at most `LINKEDIN_HASHTAGS` (3) hashtags.
 - **URLs** are read once (`_post_urls`): trailing sentence punctuation is not part of a link,
   for the length, the required links and the voice-pass facts alike.
+- **Dependencies**: a post for a story that waits on another item may say so in the LinkedIn
+  form, from the story's `relations` (not required on X); the check applies the issue's relation
+  rule (`relations_not_in_view`, `relation_denials_contradicted`: the shared parser and
+  `link.relation_holds`) as of the post's day, with the post's own story as the subject of a
+  sentence that names none.
 - **Plain text** in both: no markdown links, bold, code spans or headings. A quote of record
   text that holds code spans is written without the backticks; the check matches it against
   the record with the record's backticks dropped.
