@@ -3,12 +3,18 @@
 # (local.activity-overview.gather.plist) runs. docs/SCHEDULING.md explains it.
 #
 # Copy it next to your streams file (e.g. ~/activity-data/bin/), edit the two
-# paths below, `chmod 700` it. It reads the token for THIS process only, from
-# the login keychain; nothing is written to disk.
+# paths below, `chmod 700` it. The token follows the `token` block of the
+# streams file (docs/SCHEDULING.md 7): with `"store": "app"` (the example's
+# setting) each gather gets its own short-lived token and nothing below is
+# needed; check it with
+#     python3 __SKILL_DIR__/schedule.py token app-check --streams __WORKSPACE__/streams.json
 #
-#   store (and every week replace) the token with the script, which opens the
-#   new-token page, reads the token at a hidden prompt, checks it, then stores
-#   it in the keychain item below (docs/SCHEDULING.md 7.1):
+# Personal-token fallback (docs/SCHEDULING.md 7.2): FIRST set
+# `"store": "keychain"` in the streams file's `token` block, so this wrapper
+# reads the login keychain for THIS process only (nothing is written to disk).
+#   Then store (and every week replace) the token with the script, which opens
+#   the new-token page, reads the token at a hidden prompt, checks it, then
+#   stores it in the keychain item named there:
 #     python3 __SKILL_DIR__/schedule.py token renew --streams __WORKSPACE__/streams.json
 #   or by hand: `-w` given LAST with no value makes `security` prompt for the
 #   password (security(1)); never write the token after -w:

@@ -2,11 +2,17 @@
 # Nightly gather for the activity-overview streams on Linux (cron), or on
 # macOS without the keychain. docs/SCHEDULING.md explains it.
 #
-# The token comes from an env file only this user can read. Store (and every
-# week replace) it with the script, which opens the new-token page, reads the
-# token at a hidden prompt, checks it, then writes the file atomically, mode 600
-# (docs/SCHEDULING.md 7.1):
-#   python3 __SKILL_DIR__/schedule.py token renew --streams __WORKSPACE__/streams.json --store env-file
+# The token follows the `token` block of the streams file (docs/SCHEDULING.md 7):
+# with `"store": "app"` (the example's setting) each gather gets its own
+# short-lived token and nothing below is needed; check it with
+#   python3 __SKILL_DIR__/schedule.py token app-check --streams __WORKSPACE__/streams.json
+#
+# Personal-token fallback (docs/SCHEDULING.md 7.2): FIRST set `"store": "env-file"`
+# in the streams file's `token` block, so this wrapper reads the env file. Then
+# store (and every week replace) the token with the script, which opens the
+# new-token page, reads the token at a hidden prompt, checks it, then writes the
+# file atomically, mode 600:
+#   python3 __SKILL_DIR__/schedule.py token renew --streams __WORKSPACE__/streams.json
 # Or by hand, without the token ever appearing on a command line (so not in
 # shell history either): in bash (type `bash` first if your shell is another
 # one), paste the token at the silent prompt of `read -rs`; printf is a bash
