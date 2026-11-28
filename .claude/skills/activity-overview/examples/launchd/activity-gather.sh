@@ -6,17 +6,31 @@
 # paths below, `chmod 700` it. It reads the token for THIS process only, from
 # the login keychain; nothing is written to disk.
 #
-#   one-time, in Terminal. `-w` given LAST with no value makes `security`
-#   prompt for the password (security(1)), so the token is typed at a prompt and
-#   never appears on the command line or in shell history; never write it after
-#   -w. -U updates an existing item; -T lets the `security` tool read it later
-#   without a dialog:
-#   security add-generic-password -a "$USER" -s activity-gh-token -T /usr/bin/security -U -w
+#   store (and every week replace) the token with the script, which opens the
+#   new-token page, reads the token at a hidden prompt, checks it, then stores
+#   it in the keychain item below (docs/SCHEDULING.md 7.1):
+#     python3 __SKILL_DIR__/schedule.py token renew --streams __WORKSPACE__/streams.json
+#   or by hand: `-w` given LAST with no value makes `security` prompt for the
+#   password (security(1)); never write the token after -w:
+#     security add-generic-password -a "$USER" -s activity-gh-token -T /usr/bin/security -U -w
+#
+# Reminder: after each run it asks `schedule.py token remind` whether the token
+# expires within 2 days or was refused, and if so posts a macOS notification
+# (osascript; the message is passed as an argument, never spliced into the
+# script). Set NOTIFY=0 to turn that off.
 set -eu
 
 SKILL_DIR="__SKILL_DIR__"                        # the skill directory (USAGE 2: $AO)
 STREAMS="__WORKSPACE__/streams.json"             # your streams file
 KEYCHAIN_SERVICE="activity-gh-token"
+NOTIFY="${NOTIFY:-1}"
+
+notify() {
+  [ "$NOTIFY" = "1" ] || return 0
+  /usr/bin/osascript -e 'on run argv' \
+    -e 'display notification (item 1 of argv) with title "Activity gather"' \
+    -e 'end run' "$1" >/dev/null 2>&1 || true
+}
 
 # launchd starts jobs with a minimal PATH: add Homebrew (Apple silicon, Intel)
 # so python3 and git resolve the same way they do in Terminal.
@@ -37,9 +51,18 @@ command -v git >/dev/null 2>&1 || { echo "activity-gather: git not found" >&2; e
 GITHUB_TOKEN="$(security find-generic-password -a "$USER" -s "$KEYCHAIN_SERVICE" -w 2>/dev/null || true)"
 if [ -z "$GITHUB_TOKEN" ]; then
   echo "activity-gather: no token in the keychain item '$KEYCHAIN_SERVICE' (is the login keychain unlocked?)" >&2
+  notify "No token in the keychain: run schedule.py token renew"
   exit 2
 fi
 export GITHUB_TOKEN
 
 # Low priority; any extra arguments (e.g. --stream ID, --dry-run) pass through.
-exec nice -n 10 "$PY" "$SKILL_DIR/schedule.py" run --streams "$STREAMS" "$@"
+rc=0
+nice -n 10 "$PY" "$SKILL_DIR/schedule.py" run --streams "$STREAMS" "$@" || rc=$?
+unset GITHUB_TOKEN
+MSG="$("$PY" "$SKILL_DIR/schedule.py" token remind --streams "$STREAMS" 2>/dev/null || true)"
+if [ -n "$MSG" ]; then
+  echo "activity-gather: $MSG" >&2
+  notify "$MSG"
+fi
+exit "$rc"

@@ -250,6 +250,34 @@ def _int(value, what, minimum=0, default=None, allow_none=False):
     return value
 
 
+def _check_token_settings(value):
+    """The streams file's optional `token` block: where `token renew` stores
+    the token and which repository it reads to prove it (never the token)."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigError("streams file: 'token' must be an object")
+    allowed = {"store", "env_file", "keychain_service", "probe_repo"}
+    extra = sorted(set(value) - allowed)
+    if extra:
+        raise ConfigError("streams file: token: unknown key(s) {} (allowed: {}; the "
+                          "token itself never goes in this file)".format(
+                              ", ".join(extra), ", ".join(sorted(allowed))))
+    if value.get("store", "auto") not in ("auto", "keychain", "env-file"):
+        raise ConfigError("streams file: token.store must be auto, keychain or env-file")
+    for key in ("env_file", "keychain_service", "probe_repo"):
+        if key in value and (not isinstance(value[key], str) or not value[key].strip()):
+            raise ConfigError("streams file: token.{} must be a non-empty string".format(key))
+    if "probe_repo" in value:
+        owner, _sep, repo = value["probe_repo"].partition("/")
+        try:
+            manifest_mod.check_owner(owner, "token.probe_repo owner")
+            manifest_mod.check_repo(repo, "token.probe_repo repo")
+        except ValueError as exc:
+            raise ConfigError("streams file: {}".format(exc))
+    return dict(value)
+
+
 def load_streams(path):
     """Read + check the streams file. Returns a dict with absolute paths:
     {path, workspace, people, regather_days, stale_hours, lock_stale_hours,
@@ -294,6 +322,7 @@ def load_streams(path):
                                  "retention.store_months", 1, allow_none=True),
         },
         "env": _check_env(raw.get("env"), "env"),
+        "token": _check_token_settings(raw.get("token")),
         "streams": [],
     }
     streams = raw.get("streams")
@@ -1048,7 +1077,7 @@ def select_streams(cfg, ids):
 
 def cmd_run(cfg, args, run=run_subprocess, now=utc_now, clock=time.monotonic,
             version_of=code_version, gather_script=None, base_env=None,
-            isdir=os.path.isdir):
+            isdir=os.path.isdir, http_get=None):
     started = now()
     today = args.today or started.date()
     streams = select_streams(cfg, args.stream)
@@ -1105,6 +1134,14 @@ def cmd_run(cfg, args, run=run_subprocess, now=utc_now, clock=time.monotonic,
             run_id, len(plans), today, (version or {}).get("sha")))
         for w in warnings:
             log("warning: " + w)
+        # One identity call: the token's expiry (and an early word when GitHub
+        # refuses it). A failure here never stops the run: gather decides.
+        token = check_token(env.get("GITHUB_TOKEN") or env.get("GH_TOKEN"),
+                            http_get or default_http_get, now=now)
+        rollup["token"] = token
+        rollup["token_expires_at"] = token.get("expires_at")
+        rollup["token_days_left"] = token.get("days_left")
+        log("token: " + describe_token(token))
         for s, plan in plans:
             records = []
             senv = stream_env(cfg, s, env)
@@ -1173,6 +1210,341 @@ def cmd_run(cfg, args, run=run_subprocess, now=utc_now, clock=time.monotonic,
     return code
 
 
+# --- the token: expiry, renewal, reminder -----------------------------------------
+#
+# A personal access token cannot be created through the API, so `token renew`
+# scripts everything around the one manual step: it opens GitHub's
+# new-token page prefilled through its DOCUMENTED query parameters (fine
+# grained page: name, description, expires_in; no permission is needed, as
+# every token reads public repositories; the classic page documents none, so
+# none are passed), reads the new token at a hidden prompt, checks it with
+# the API, and only then replaces the stored one. The token never appears in
+# argv, a log or a status file.
+
+API = "https://api.github.com"
+TOKEN_PAGE = "https://github.com/settings/personal-access-tokens/new"
+CLASSIC_TOKEN_PAGE = "https://github.com/settings/tokens/new"
+TOKEN_NAME = "activity-overview read-only"
+TOKEN_DESCRIPTION = ("Nightly activity gather: reads public repositories only. "
+                     "Replaced every week (docs/SCHEDULING.md 7.1).")
+TOKEN_DAYS = 7
+TOKEN_WARN_DAYS = 2
+DEFAULT_ENV_FILE = "~/.config/activity-overview/token.env"
+DEFAULT_KEYCHAIN_SERVICE = "activity-gh-token"
+LAUNCH_LABEL = "local.activity-overview.gather"
+_TOKEN_RE = re.compile(r"^[A-Za-z0-9_]{20,255}$")
+
+
+def token_page_url(days=TOKEN_DAYS, classic=False):
+    if classic:
+        return CLASSIC_TOKEN_PAGE
+    return TOKEN_PAGE + "?" + urllib.parse.urlencode(
+        {"name": TOKEN_NAME, "description": TOKEN_DESCRIPTION, "expires_in": days})
+
+
+def parse_expiry(value):
+    """The `github-authentication-token-expiration` header as a UTC datetime,
+    or None. Its format is not documented; observed forms are
+    `YYYY-MM-DD HH:MM:SS UTC` and `YYYY-MM-DD HH:MM:SS +0000` (any offset), and an
+    ISO timestamp is accepted too."""
+    text = (value or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S %Z", "%Y-%m-%d %H:%M:%S %z"):
+        try:
+            dt = datetime.datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.astimezone(datetime.timezone.utc)
+    return parse_iso(text.replace(" ", "T", 1) if "T" not in text else text)
+
+
+def default_http_get(url, token, timeout=20):
+    """One authenticated GET to api.github.com: (status, headers, body text);
+    (None, {}, reason) when it could not be sent."""
+    import urllib.error
+    import urllib.request
+    if not url.startswith(API + "/"):
+        raise ValueError("the token is only sent to " + API)
+    req = urllib.request.Request(url, headers={
+        "Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
+        "User-Agent": "activity-overview-schedule", "X-GitHub-Api-Version": "2022-11-28"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return (resp.status, {k.lower(): v for k, v in resp.headers.items()},
+                    resp.read(65536).decode("utf-8", "replace"))
+    except urllib.error.HTTPError as err:
+        return (err.code, {k.lower(): v for k, v in (err.headers or {}).items()},
+                err.read(65536).decode("utf-8", "replace"))
+    except (OSError, ValueError) as exc:
+        return None, {}, str(exc)
+
+
+def _api_message(body):
+    try:
+        return (json.loads(body) or {}).get("message") or ""
+    except (ValueError, AttributeError):
+        return (body or "")[:200]
+
+
+def check_token(token, http_get, probe=None, now=utc_now):
+    """Ask GitHub about a token: identity and expiry (one call), and with
+    `probe` ('owner/repo') a read of that repository, so an organisation's
+    lifetime policy refuses it at once. Never returns the token.
+    {ok, login, expires_at, days_left, error, probe, checked_at}."""
+    out = {"ok": False, "login": None, "expires_at": None, "days_left": None,
+           "error": None, "probe": None, "checked_at": iso(now())}
+    if not token:
+        out["error"] = "no token"
+        return out
+    status, headers, body = http_get(API + "/user", token)
+    if status is None:
+        out["error"] = "GitHub could not be reached ({})".format(body)
+        return out
+    if status != 200:
+        out["error"] = "GitHub refused the token ({}{})".format(
+            status, ": " + _api_message(body) if _api_message(body) else "")
+        return out
+    try:
+        out["login"] = (json.loads(body) or {}).get("login")
+    except ValueError:
+        pass
+    expires = parse_expiry(headers.get("github-authentication-token-expiration"))
+    if expires:
+        out["expires_at"] = iso(expires)
+        out["days_left"] = round((expires - now()).total_seconds() / 86400.0, 1)
+    if probe:
+        status, _h, body = http_get("{}/repos/{}".format(API, probe), token)
+        out["probe"] = {"repo": probe, "status": status}
+        if status != 200:
+            out["error"] = "reading {} failed ({}{})".format(
+                probe, status, ": " + _api_message(body) if _api_message(body) else "")
+            return out
+    out["ok"] = True
+    return out
+
+
+def describe_token(info):
+    if info.get("error"):
+        return info["error"]
+    if info.get("expires_at"):
+        return "{} - expires {} ({} day(s) left)".format(
+            info.get("login"), info["expires_at"], info["days_left"])
+    return "{} - no expiry reported".format(info.get("login"))
+
+
+def token_warning(info):
+    """A one-line warning when the token is refused or expires within
+    TOKEN_WARN_DAYS days, else None."""
+    if not info:
+        return None
+    if info.get("error") and "refused" in info["error"]:
+        return "the token was refused: {} - run `schedule.py token renew`".format(
+            info["error"])
+    left = info.get("days_left")
+    if left is not None and left <= TOKEN_WARN_DAYS:
+        return ("the token expires {} ({} day(s) left) - run `schedule.py token "
+                "renew` before then".format(info.get("expires_at"), left))
+    return None
+
+
+def token_settings(cfg, args=None):
+    """Where the token is kept: {store: keychain|env-file, env_file,
+    keychain_service, account}."""
+    t = dict(cfg.get("token") or {})
+    store = getattr(args, "store", None) or t.get("store", "auto")
+    if store == "auto":
+        store = "keychain" if sys.platform == "darwin" else "env-file"
+    return {"store": store,
+            "env_file": os.path.expanduser(getattr(args, "env_file", None)
+                                           or t.get("env_file") or DEFAULT_ENV_FILE),
+            "keychain_service": t.get("keychain_service") or DEFAULT_KEYCHAIN_SERVICE,
+            "account": os.environ.get("USER") or os.environ.get("LOGNAME") or "user"}
+
+
+def run_security(argv, stdin_text=None):
+    """The `security` seam: (exit code, stdout). Its stdout is captured, never
+    echoed."""
+    proc = subprocess.run(argv, input=stdin_text, capture_output=True, text=True)
+    return proc.returncode, proc.stdout
+
+
+def write_env_file(path, token):
+    """Replace the env file atomically: a new mode-600 file in the same
+    directory (mode 700), fsynced, renamed over the old one."""
+    d = os.path.dirname(path)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    tmp = "{}.tmp-{}".format(path, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("GITHUB_TOKEN={}\n".format(token))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def store_token(settings, token, security=run_security):
+    """Store the (already validated) token. The keychain is written through
+    `security -i`, which reads its command from stdin: the token goes through
+    a pipe, never into an argv or a process listing; it is then read back and
+    compared."""
+    if settings["store"] == "env-file":
+        write_env_file(settings["env_file"], token)
+        return
+    acct, svc = settings["account"], settings["keychain_service"]
+    for name, value in (("account", acct), ("keychain service", svc)):
+        if not re.fullmatch(r"[A-Za-z0-9._@-]+", value):
+            raise ConfigError("the {} {!r} must be letters, digits, '.', '_', '@' "
+                              "or '-' to be stored safely".format(name, value))
+    command = "add-generic-password -U -a {} -s {} -T /usr/bin/security -w {}\n".format(
+        acct, svc, token)
+    code, _out = security(["security", "-i"], command)
+    if code != 0:
+        raise RuntimeError("security could not store the token (exit {})".format(code))
+    if read_stored_token(settings, security) != token:
+        raise RuntimeError("the keychain item {!r} did not read back as stored".format(svc))
+
+
+def read_stored_token(settings, security=run_security):
+    if settings["store"] == "env-file":
+        try:
+            with open(settings["env_file"], encoding="utf-8") as fh:
+                for line in fh:
+                    name, sep, value = line.strip().partition("=")
+                    if sep and name.strip() in ("GITHUB_TOKEN", "GH_TOKEN"):
+                        return value.strip().strip("'\"")
+        except OSError:
+            return None
+        return None
+    code, out = security(["security", "find-generic-password", "-a",
+                          settings["account"], "-s", settings["keychain_service"], "-w"])
+    return out.strip() if code == 0 and out.strip() else None
+
+
+def probe_repo(cfg):
+    """The repository `token renew` reads to prove the token is accepted:
+    the streams file's `token.probe_repo`, else the first enabled single
+    repository stream."""
+    t = cfg.get("token") or {}
+    if t.get("probe_repo"):
+        return t["probe_repo"]
+    for s in cfg["streams"]:
+        if s["enabled"] and s["kind"] == "repo":
+            return s["target"]
+    return None
+
+
+def default_open_browser(url):
+    import webbrowser
+    try:
+        return bool(webbrowser.open(url, new=2))
+    except Exception:  # noqa: BLE001 - no browser is a normal case
+        return False
+
+
+def default_prompt(text):
+    import getpass
+    return getpass.getpass(text)
+
+
+def default_spawn(argv, env):
+    """Start a detached process (the run after `token renew --kick`)."""
+    subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+def cmd_token(cfg, args, http_get=None, prompt=None, open_browser=None,
+              security=None, spawn=None, now=utc_now, **_ignored):
+    http_get = http_get or default_http_get
+    security = security or run_security
+    settings = token_settings(cfg, args)
+    out = sys.stdout.write
+    if args.token_cmd == "status":
+        token = read_stored_token(settings, security)
+        if not token:
+            out("no stored token ({})\n".format(
+                settings["env_file"] if settings["store"] == "env-file"
+                else "keychain item " + settings["keychain_service"]))
+            return EXIT_FAILED
+        info = check_token(token, http_get, now=now)
+        out("token: {}\n".format(describe_token(info)))
+        warn = token_warning(info)
+        if warn:
+            out("WARNING: {}\n".format(warn))
+        return EXIT_OK if info["ok"] else EXIT_FAILED
+    if args.token_cmd == "remind":
+        top = read_json(os.path.join(cfg["workspace"], "status.json"), {}) or {}
+        info = dict(top.get("token") or {})
+        refused = [sid for sid, e in (top.get("streams") or {}).items()
+                   if e.get("auth_error")]
+        msg = token_warning(info)
+        if not msg and refused:
+            msg = "GitHub refused the token for {} - run `schedule.py token renew`".format(
+                ", ".join(sorted(refused)))
+        if msg:
+            out(msg.replace('"', "'").replace("\\", "/") + "\n")
+        return EXIT_OK
+    # renew
+    url = token_page_url(args.days, classic=args.classic)
+    opened = (open_browser or default_open_browser)(url) if not args.no_browser else False
+    sys.stderr.write("{} the new-token page:\n  {}\n".format(
+        "Opened" if opened else "Open", url))
+    sys.stderr.write(
+        "Create the token there ({}): expiry {} days; {}. Then paste it here.\n".format(
+            "classic: note '{}', scopes public_repo and read:project".format(TOKEN_NAME)
+            if args.classic else "name and expiry are prefilled; resource owner: "
+            "your own account; no permission needs adding (every token reads "
+            "public repositories)", args.days,
+            "the old token stays in place until the new one is checked"))
+    token = (prompt or default_prompt)("New token (input hidden): ").strip()
+    if not _TOKEN_RE.fullmatch(token):
+        sys.stderr.write("token renew: that does not look like a token (letters, "
+                         "digits and '_' only); nothing changed\n")
+        return EXIT_FAILED
+    info = check_token(token, http_get, probe=probe_repo(cfg), now=now)
+    sys.stderr.write("token renew: {}\n".format(describe_token(info)))
+    if not info["ok"]:
+        sys.stderr.write("token renew: the new token was NOT stored; the old one "
+                         "stays in place\n")
+        return EXIT_FAILED
+    if info["days_left"] is not None and info["days_left"] > 8:
+        sys.stderr.write("token renew: warning: it lives {} days; organisations "
+                         "with an 8-day limit will refuse it\n".format(info["days_left"]))
+    try:
+        store_token(settings, token, security)
+    except (OSError, RuntimeError, ConfigError) as exc:
+        sys.stderr.write("token renew: storing failed: {}; the old token stays in "
+                         "place\n".format(redact(str(exc), [token])))
+        return EXIT_FAILED
+    sys.stderr.write("token renew: stored in {}\n".format(
+        settings["env_file"] if settings["store"] == "env-file"
+        else "the keychain item " + settings["keychain_service"]))
+    if args.kick:
+        if sys.platform == "darwin" and not args.kick_here:
+            (spawn or default_spawn)(["launchctl", "kickstart", "gui/{}/{}".format(
+                os.getuid(), LAUNCH_LABEL)], dict(os.environ))
+            sys.stderr.write("token renew: started the scheduled job ({})\n".format(
+                LAUNCH_LABEL))
+        else:
+            env = dict(os.environ, GITHUB_TOKEN=token)
+            (spawn or default_spawn)([sys.executable, os.path.abspath(__file__), "run",
+                                      "--streams", cfg["path"]], env)
+            sys.stderr.write("token renew: started a run in the background (its log: "
+                             "{})\n".format(os.path.join(cfg["workspace"], "logs")))
+    return EXIT_OK
+
+
 # --- offline recompute ------------------------------------------------------------
 
 # What `recompute --what` can redo, and the gather flag that does it (offline:
@@ -1201,7 +1573,7 @@ def recompute_commands(cfg, stream, what, windows, python=None, gather_script=No
 
 def cmd_recompute(cfg, args, run=run_subprocess, now=utc_now, clock=time.monotonic,
                   version_of=code_version, gather_script=None, base_env=None,
-                  isdir=os.path.isdir):
+                  isdir=os.path.isdir, **_ignored):
     """Recompute clone-derived facts of one month store after a code upgrade,
     on a copy, validated, then swapped in (exactly as a gather is)."""
     stream = select_streams(cfg, [args.stream])[0]
@@ -1398,6 +1770,9 @@ def latest(cfg, stream_id, lo, hi, now, max_age_hours=None, accept_stale=False,
         out["split_note"] = problems_split
     if out["single_store"]:
         out["next"] = next_commands(cfg, stream, used[0][1], lo, hi, cadence)
+    top = read_json(os.path.join(cfg["workspace"], "status.json"), {}) or {}
+    warn = token_warning(top.get("token"))
+    out["warnings"] = [warn] if warn else []
     if problems and not accept_stale:
         out["refusal"] = "; ".join(problems)
         return out
@@ -1476,6 +1851,11 @@ def cmd_status(cfg, args, now=utc_now):
     lines.append("last run: {} {} (exit {}), log {}".format(
         last.get("run_id", "never"), last.get("result", "-"),
         last.get("exit_code", "-"), last.get("log", "-")))
+    if top.get("token"):
+        lines.append("token: {}".format(describe_token(top["token"])))
+        warn = token_warning(top["token"])
+        if warn:
+            lines.append("TOKEN: " + warn)
     t = now()
     for s in cfg["streams"]:
         st = read_json(stream_status_path(cfg, s), {}) or {}
@@ -1533,6 +1913,10 @@ commands:
   latest ... [--cadence weekly|monthly]
   status --streams FILE [--json]
   check  --streams FILE
+  token renew  --streams FILE [--store keychain|env-file] [--env-file PATH] [--days N]
+               [--classic] [--no-browser] [--kick] [--kick-here]
+  token status --streams FILE [--store keychain|env-file] [--env-file PATH]
+  token remind --streams FILE
 """
 
 
@@ -1588,7 +1972,35 @@ def parse_args(argv):
     st = sub.add_parser("status", parents=[common], help="the last results")
     st.add_argument("--json", action="store_true")
     sub.add_parser("check", parents=[common], help="check the streams file")
+    tk = sub.add_parser("token", help="replace the stored token (weekly), show its "
+                                      "expiry, or print a reminder")
+    tks = tk.add_subparsers(dest="token_cmd", required=True)
+    for name, text in (("renew", "open the new-token page, read the token at a hidden "
+                                 "prompt, check it, then store it"),
+                       ("status", "the stored token's login, expiry and days left"),
+                       ("remind", "print a one-line reminder when the token expires "
+                                  "within 2 days or was refused (no network)")):
+        t = tks.add_parser(name, parents=[common], help=text)
+        t.add_argument("--store", choices=("keychain", "env-file"), default=None,
+                       help="where the token is kept (default: the streams file's "
+                            "token.store, else keychain on macOS, env-file elsewhere)")
+        t.add_argument("--env-file", default=None, metavar="PATH",
+                       help="the env file (default {})".format(DEFAULT_ENV_FILE))
+        if name == "renew":
+            t.add_argument("--days", type=int, default=TOKEN_DAYS, metavar="N",
+                           help="expiry prefilled on the page (default 7)")
+            t.add_argument("--classic", action="store_true",
+                           help="open the classic token page instead (nothing prefilled)")
+            t.add_argument("--no-browser", action="store_true",
+                           help="only print the page's address")
+            t.add_argument("--kick", action="store_true",
+                           help="start a run once the token is stored")
+            t.add_argument("--kick-here", action="store_true",
+                           help="with --kick on macOS: start the run from this "
+                                "process, not through the scheduled job")
     args = p.parse_args(argv)
+    if args.cmd == "token" and args.token_cmd == "renew" and not 1 <= args.days <= 366:
+        p.error("--days must be between 1 and 366")
     if args.cmd == "run" and args.max_minutes is not None and args.max_minutes < 1:
         p.error("--max-minutes must be at least 1")
     return args
@@ -1607,6 +2019,8 @@ def main(argv=None, **seams):
                                              if k == "now"})
         if args.cmd == "check":
             return cmd_check(cfg)
+        if args.cmd == "token":
+            return cmd_token(cfg, args, **seams)
         now = seams.get("now", utc_now)()
         today = args.today or now.date()
         lo, hi = reader_period(args, today)
@@ -1617,6 +2031,8 @@ def main(argv=None, **seams):
         sys.stderr.write("schedule.py: error: {}\n".format(exc))
         return EXIT_USAGE
     sys.stdout.write(json.dumps(out, indent=2, sort_keys=True) + "\n")
+    for w in out.get("warnings") or []:
+        sys.stderr.write("latest: WARNING: {}\n".format(w))
     if out["ok"]:
         sys.stderr.write("latest: ok, {} store(s) for {}..{}{}\n".format(
             len(out["stores"]), lo, hi,

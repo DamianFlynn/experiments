@@ -40,11 +40,15 @@ skill directory is only read (it can be read-only); the workspace can be anywher
     stores/2026-11.db               the month store the skill reads
     stores/2026-11.db.prev          the store before the last successful run (one generation)
     clone/                          gather's reused clone (manifest streams: clone/<owner>/<repo>)
-  avm-tf/
+  avm-tf/  enterprise-lz/  ai-lz/   manifest streams:
     manifest.json                   your manifest (members; its window is ignored)
     run/manifest.2026-11-01_2026-11-30.json   the manifest with the window filled in
     stores/  clone/  status.json
+  bicep/  deployment-stacks/        single-repository streams, laid out like avm-bicep/
 ```
+
+The token is not in the workspace: it lives in the macOS keychain item `activity-gh-token`
+or in `~/.config/activity-overview/token.env` (§7).
 
 Reports and views are not part of the schedule: write them wherever you like (the notes
 vault is fine for finished Markdown).
@@ -84,12 +88,44 @@ Per stream:
 | `stale_after_hours` | int | global | per-stream staleness threshold |
 | `enabled` | bool | `true` | a disabled stream is skipped unless named with `--stream` |
 
-[`examples/streams.json`](../examples/streams.json) follows the owner's streams: AVM Bicep
-(`Azure/bicep-registry-modules`, weekly + monthly, `--structural-iac`), AVM Terraform (a
-manifest), `Azure/bicep`, the AI hub gateway landing zone
-(`Azure-Samples/ai-hub-gateway-solution-accelerator`), and an enterprise-scale landing zone
-(disabled until its repository is confirmed). `python3 schedule.py check --streams FILE`
-prints how the file resolves.
+| `token` | object | `{}` | where `token renew` keeps the token, never the token itself: `store` (`auto`: keychain on macOS, env file elsewhere; or `keychain` / `env-file`), `env_file` (default `~/.config/activity-overview/token.env`), `keychain_service` (default `activity-gh-token`), `probe_repo` (`owner/repo` read to prove a new token; default the first enabled single-repository stream). §7.1 |
+
+[`examples/streams.json`](../examples/streams.json) is the owner's list, all enabled:
+
+| Stream | Kind | Repositories | Cadence | Newsletter |
+|---|---|---|---|---|
+| `avm-bicep` — AVM Bicep | repo, `--structural-iac` | `Azure/bicep-registry-modules` | weekly + monthly | one |
+| `avm-tf` — AVM Terraform | manifest (`avm-tf/manifest.json`, from `manifest_from_index.py`) | the AVM Terraform module repositories | monthly | one, all members |
+| `bicep` — Bicep | repo | `Azure/bicep` | weekly + monthly | one |
+| `deployment-stacks` — Deployment stacks | repo | `Azure/deployment-stacks` | monthly | one |
+| `enterprise-lz` — Enterprise Landing Zones | manifest ([`examples/manifests/enterprise-lz.json`](../examples/manifests/enterprise-lz.json)) | `Azure/Enterprise-Scale`, `Azure/alz-bicep-accelerator` | monthly | one per group |
+| `ai-lz` — AI Landing Zones | manifest ([`examples/manifests/ai-lz.json`](../examples/manifests/ai-lz.json)) | `Azure/AI-Landing-Zones`, `Azure/agent-landing-zone`, `Azure-Samples/ai-hub-gateway-solution-accelerator` | monthly | one per group |
+
+All seven new repositories' default branch is `main`, which the group manifests also name.
+The AI group's home organisations include `Azure-Samples` (stream `home` and manifest
+`affiliation`).
+
+**Groups are manifest streams.** The owner thinks in groups ("Enterprise Landing Zones",
+"AI related Landing Zones") and wants one newsletter per group. A manifest stream is the
+skill's existing form for "one logical project, several repositories": one store and one
+project per group, so cross-repository references between the members become trains and the
+people of the group are one project; `latest --stream ai-lz` answers for the whole group and
+its `next` commands already view every member and pass all the views to `newsletter.py`
+(the documented multi-repository newsletter). One stream per repository with a `group`
+label would need a new group reader that collects views from several stores, and would lose
+the cross-repository links; so no `group` field was added. What the manifest form costs, and
+when to choose otherwise:
+
+- a member that fails to gather blocks that night's swap for the whole group (validate's
+  `member_status`); the group keeps the previous store until the member gathers again;
+- `schedule.py recompute` works on single-repository streams only;
+- `gather_flags` and `home` apply to every member, and manifest members always get the
+  whole-tree module scan.
+
+If one repository of a group must be followed on its own (e.g. its own weekly issue), give
+it its own `repo` stream as well; the two stores are independent.
+
+`python3 schedule.py check --streams FILE` prints how the file resolves.
 
 ## 4. Which windows a run gathers
 
@@ -230,8 +266,10 @@ repository, the real gather and validate CLIs, the API stubbed empty; trimmed):
 
 `<workspace>/status.json` is the roll-up: `last_run` (`run_id`, `today`, `result`,
 `exit_code`, `log`, `max_minutes`, `skipped_time_budget`, `backfill`), `code_version`,
-`workspace_warnings`, and per stream `{result, windows: {month: result}, last_success_at,
-status}`. `python3 schedule.py status --streams FILE` prints the last three months of each
+`workspace_warnings`, `token` (`{ok, login, expires_at, days_left, error, checked_at}`,
+from one identity call at the start of the run; never the token), `token_expires_at`,
+`token_days_left`, and per stream `{result, windows: {month: result}, last_success_at,
+auth_error, status}`. `python3 schedule.py status --streams FILE` prints the last three months of each
 stream; `--json` prints the roll-up.
 
 ## 7. The token
@@ -248,21 +286,25 @@ look like credentials. Without a token `run` stops before doing anything (exit 2
 then written to. Every way of entering it below prompts for it instead; a test scans the
 docs and examples so a token-on-the-command-line instruction cannot come back.
 
+The usual way to store it, first time and every week, is `schedule.py token renew` (§7.1),
+which reads it at a hidden prompt, checks it, and writes it to one of these two places.
+By hand:
+
 - **macOS:** keep it in the login keychain; the wrapper reads it for the one process:
   ```bash
   security add-generic-password -a "$USER" -s activity-gh-token -T /usr/bin/security -U -w
   ```
-  `-w` given **last, with no value** makes `security` prompt for the password (as its manual
-  page, security(1), documents): paste the token at the prompt. Never write the token after
-  `-w`. `-U` updates an existing item (the weekly replacement, §7.1); `-T` lets the
-  `security` tool read it later without a dialog. A LaunchAgent runs in your login session,
-  so the login keychain is available once you have logged in after a reboot (enable
-  automatic login, or log in once, on a headless Mac mini).
+  `-w` given **last, with no value** makes `security` prompt for the password (the manual
+  page, security(1), says "Put at end of command to be prompted (recommended)"): paste the
+  token at the prompt. Never write the token after `-w`. `-U` updates an existing item;
+  `-T` lets the `security` tool read it later without a dialog. A LaunchAgent runs in your
+  login session, so the login keychain is available once you have logged in after a reboot
+  (enable automatic login, or log in once, on a headless Mac mini).
 - **Plain env file** (Linux, or macOS without the keychain): `~/.config/activity-overview/token.env`
-  holding one line `GITHUB_TOKEN=…`, mode **600**, outside the workspace, any synced folder
-  and any git checkout. Create it from a silent prompt in **bash** (type `bash` first if
-  your shell is another one); `printf` is a bash builtin, so the value is in no process
-  listing either:
+  holding one line `GITHUB_TOKEN=…`, mode **600** in a mode-700 directory, outside the
+  workspace, any synced folder and any git checkout. Create it from a silent prompt in
+  **bash** (type `bash` first if your shell is another one); `printf` is a bash builtin, so
+  the value is in no process listing either:
   ```bash
   mkdir -p ~/.config/activity-overview && chmod 700 ~/.config/activity-overview
   ( umask 077; printf 'token: ' >&2; IFS= read -rs t; echo >&2;
@@ -278,12 +320,74 @@ The enterprise that owns `Azure/*` refuses personal access tokens (classic or fi
 that live longer than **8 days** (USAGE §1.1), so a nightly job on a workstation needs a new
 token every week. There is no way around that with a personal token: plan for it.
 
-- **The weekly step** (a calendar reminder; about two minutes): create a token with a
-  7-day expiry and the scopes of USAGE §1.1, then replace the stored one: run the
-  `security add-generic-password … -U -w` command above again (it updates the item) or
-  re-create the env file. Next, `python3 $AO/schedule.py run --streams $W/streams.json
-  --dry-run` checks nothing but the plan; `launchctl kickstart …` (or the wrapper) proves the
-  token with a real run.
+A personal access token cannot be created through GitHub's API, so the one manual step,
+creating it on the web page, stays manual. `schedule.py token` scripts everything around it.
+
+**The weekly step** (about two minutes):
+
+```bash
+python3 $AO/schedule.py token renew --streams $W/streams.json --kick
+```
+
+1. It opens the browser on GitHub's fine-grained new-token page, prefilled through the
+   query parameters GitHub documents for that page: `name` (`activity-overview read-only`),
+   `description`, `expires_in=7`. No permission is added, and none is needed: GitHub states
+   that every token includes read-only access to all public repositories, which is all the
+   gather reads. Leave the resource owner as your own account (no organisation approval is
+   involved). Check the page and click *Generate token*. Without a browser (or with
+   `--no-browser`) it prints the address instead.
+   `--classic` opens the classic page instead; GitHub documents no query parameters for
+   that page, so nothing is prefilled there (set the note, 7 days, and the scopes
+   `public_repo` + `read:project`). Choose classic only if you need the Projects board
+   layer, which a public-only fine-grained token may not read (not verified here; without
+   it the board layer degrades to empty, SKILL.md step 1).
+2. It reads the token at a **hidden prompt** (`getpass`): never an argument, never echoed,
+   never logged. Anything that is not letters, digits and `_` is refused before any call.
+3. It checks the token with the API before touching the stored one: `GET /user` (the
+   login, and the expiry from the `github-authentication-token-expiration` response header;
+   GitHub does not document that header's format, so the forms `YYYY-MM-DD HH:MM:SS UTC`,
+   `… +0000` (any offset) and ISO are accepted), then a read of `token.probe_repo` (default
+   `Azure/bicep-registry-modules`), so the 8-day lifetime policy refuses a wrong token here
+   and now rather than at 02:40. A refusal prints GitHub's message and **the old token stays
+   in place**.
+4. Only then it stores it: in the keychain item `activity-gh-token` (macOS default) or the
+   env file (elsewhere, or `--store env-file`). The keychain is written with `security -i`,
+   which reads its commands from standard input (security(1): "Run security in interactive
+   mode … commands on stdin"), so the token goes through a pipe, not into `security`'s
+   argument list or the process listing; the item is then read back with
+   `find-generic-password -w` and compared. The env file is written as a new mode-600 file
+   in a mode-700 directory, fsynced and renamed over the old one.
+5. `--kick` then starts a run: on macOS `launchctl kickstart gui/<uid>/local.activity-overview.gather`
+   (the scheduled job, which reads the new token from the keychain); elsewhere a background
+   `schedule.py run` with the token in its environment only.
+
+```bash
+python3 $AO/schedule.py token status --streams $W/streams.json   # login, expiry, days left (one API call)
+```
+
+**Without a calendar.** Each nightly run makes one identity call and records
+`token_expires_at` and `token_days_left` in `status.json`; `schedule.py status` and
+`latest` print a warning when **2 days or fewer** remain or the token was refused.
+`schedule.py token remind` prints that warning as one line (no network, from
+`status.json`), and the wrappers call it after every run: the macOS wrapper posts it as a
+notification (`osascript … display notification`, the message passed as an argument), the
+cron wrapper writes it to the cron log. The identity call is the runner's only API call of
+its own; if GitHub cannot be reached the run carries on and records why.
+
+**What is verified and what is not.** Verified here (Linux, tests with the network and
+`security` replaced by seams): the page address and its parameters (against GitHub's
+documentation), the hidden prompt path, that a refused or malformed token leaves the old
+one untouched, the env-file write and its modes, that the token never reaches an argv, a
+log, a status file or the output, the expiry parsing, the warning thresholds, the reminder
+text, and the cron wrapper (with a stub runner). **Not tested on macOS** (no Mac was
+available): `security -i` storing the item from standard input (the man page documents
+interactive mode reading stdin, not how it quotes; the token's alphabet — letters, digits,
+`_` — needs no quoting), the read-back, the keychain dialog behaviour of `-T
+/usr/bin/security`, `launchctl kickstart`, and the `osascript` notification. Run
+`token renew` once in Terminal and `token status` after it to confirm on the Mac; if
+`security -i` misbehaves there, store the token by hand with the prompting
+`add-generic-password … -w` command of §7.
+
 - **How an expired token shows.** Each gather fails at its first API call; the attempt is
   `gather_failed`, and the runner reads gather's own error lines and records why in
   `auth_error` (the attempt, and the roll-up's stream entry): a 401 (expired, revoked or
@@ -338,15 +442,20 @@ workspace in your home directory (it is for `~/Desktop`, `~/Documents`, `~/Downl
 W=~/activity-data
 mkdir -p $W/bin $W/logs
 cp $AO/examples/streams.json $W/streams.json
-#   edit $W/streams.json: "workspace": "." (the file sits in the workspace), the streams you follow
-#   AVM Terraform: write its manifest ($W/avm-tf/manifest.json, e.g. with manifest_from_index.py)
+#   edit $W/streams.json: "workspace": "." (the file sits in the workspace)
+#   the group manifests, and the AVM Terraform one (e.g. from manifest_from_index.py):
+mkdir -p $W/enterprise-lz $W/ai-lz $W/avm-tf
+cp $AO/examples/manifests/enterprise-lz.json $W/enterprise-lz/manifest.json
+cp $AO/examples/manifests/ai-lz.json $W/ai-lz/manifest.json
+#   $W/avm-tf/manifest.json: write it before the first run (USAGE §7.3)
 python3 $AO/schedule.py check --streams $W/streams.json
 
-# 2 · the token (§7)
-security add-generic-password -a "$USER" -s activity-gh-token -T /usr/bin/security -U -w
+# 2 · the token (§7.1): opens the new-token page, hidden prompt, checked, then stored
+python3 $AO/schedule.py token renew --streams $W/streams.json
+python3 $AO/schedule.py token status --streams $W/streams.json
 
 # 3 · the wrapper
-sed -e "s#__SKILL_DIR__#$AO#" -e "s#__WORKSPACE__#$W#" \
+sed -e "s#__SKILL_DIR__#$AO#g" -e "s#__WORKSPACE__#$W#g" \
   $AO/examples/launchd/activity-gather.sh > $W/bin/activity-gather.sh
 chmod 700 $W/bin/activity-gather.sh
 $W/bin/activity-gather.sh --dry-run             # the plan and the exact commands
@@ -401,10 +510,14 @@ macOS specifics:
 ## 11. Linux (cron)
 
 Copy [`examples/cron/activity-gather.sh`](../examples/cron/activity-gather.sh) to
-`$W/bin/` (fill `__SKILL_DIR__` / `__WORKSPACE__` as above), create the mode-600 env file
-(§7), and add the line from [`examples/cron/crontab.txt`](../examples/cron/crontab.txt)
-with `crontab -e` (absolute paths). The runner is the same file on both systems; cron's
-time is local, the plan is by UTC date: keep the run well clear of midnight UTC.
+`$W/bin/` (fill `__SKILL_DIR__` / `__WORKSPACE__` as above), store the token in the
+mode-600 env file with `python3 $AO/schedule.py token renew --streams $W/streams.json`
+(the env file is the default off macOS; §7.1), and add the line from
+[`examples/cron/crontab.txt`](../examples/cron/crontab.txt) with `crontab -e` (absolute
+paths). On a machine without a browser, `token renew` prints the page's address to open
+elsewhere. The runner is the same file on both systems; cron's time is local, the plan is
+by UTC date: keep the run well clear of midnight UTC. After each run the wrapper prints the
+`token remind` line (if any) to the cron log.
 
 ## 12. In a CI schedule
 
