@@ -1526,18 +1526,22 @@ def run_security(argv, stdin_text=None):
 
 # --- the folder that holds a secret --------------------------------------------------
 #
-# The rule (token env file, app private key):
-#   * group- or other-WRITABLE folder: refused, on every path. Whoever can
+# The rule for the folder that directly holds the secret (token env file,
+# app private key); the whole path above it is checked by verify_secret_chain:
+#   * group- or other-WRITABLE folder (even with the sticky bit). Whoever can
 #     write the folder can replace or rename the file whatever its own mode
 #     (a planted token, or a planted key the runner would sign with).
+#       - read paths (runs, `token status`, `token app-check`, `token where`
+#         for the wrappers): refused;
+#       - write paths (`token renew`, `token app-key`): tightened to 700 when
+#         the folder is the user's own and not a shared location, and the
+#         output says so; refused otherwise, before anything is written.
 #   * group- or other-READABLE (not writable) folder: on a write path
-#     (`token renew`, `token app-key`) the folder is tightened to 700 when it
-#     is the user's own and not a shared location, and the output says so;
-#     otherwise, and on every read path, a warning: the file's own mode 600
-#     keeps its content private, the folder only exposes its names.
+#     tightened to 700 the same way (the user's own, not shared); otherwise,
+#     and on every read path, a warning: the file's own mode 600 keeps its
+#     content private, the folder only exposes its names.
 #   * never chmod a folder the user does not own, or a shared location (the
-#     home directory, /, the temporary directories, the workspace): a
-#     writable one is refused, a readable one warned about, with the fix.
+#     home directory, /, the temporary directories, the workspace).
 
 
 class SecretDirError(ValueError):
@@ -1838,10 +1842,14 @@ def write_env_file(path, token, workspace=None):
                  0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            # the mode is set on the handle (the umask may have narrowed it,
+            # never widened it); nothing below reopens the temp file by path
+            os.fchmod(fh.fileno(), 0o600)
             fh.write("GITHUB_TOKEN={}\n".format(token))
             fh.flush()
             os.fsync(fh.fileno())
-        os.chmod(tmp, 0o600)
+        # the rename and the cleanup work on names inside the verified,
+        # private real folder: neither follows a symlink at the target name
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -1920,12 +1928,18 @@ def keychain_write_checked(acct, svc, value, security=run_security):
 
 def read_stored_token(settings, security=run_security):
     """The stored personal token, or None when there is none. The env file is
-    opened once after its whole path is verified (open_secret_file); an
-    unsafe path raises SecretDirError."""
+    opened once after its whole path is verified (open_secret_file), and must
+    be mode 600 on the open handle, as the wrappers require; an unsafe path
+    or mode raises SecretDirError."""
     if settings["store"] == "env-file":
         if not os.path.lexists(settings["env_file"]):
             return None
-        data, _st = open_secret_file(settings["env_file"], "the token")
+        data, st = open_secret_file(settings["env_file"], "the token")
+        if st.st_mode & 0o077:
+            raise _chain_error("the token", settings["env_file"],
+                               "the file is mode {:o}, readable or writable by others: "
+                               "`chmod 600` it (token renew writes it 600)".format(
+                                   st.st_mode & 0o777))
         for line in data.decode("utf-8", "replace").splitlines():
             name, sep, value = line.strip().partition("=")
             if sep and name.strip() in ("GITHUB_TOKEN", "GH_TOKEN"):
@@ -2362,12 +2376,24 @@ def app_key_import(settings, path, security=run_security):
         return EXIT_FAILED
     for note in notes:
         sys.stderr.write("token app-key: {}\n".format(note))
-    try:
-        with open(path, "rb") as fh:
-            pem = fh.read()
-    except OSError as exc:
-        sys.stderr.write("token app-key: cannot read {}: {}\n".format(path, exc.strerror))
+    # the bytes that become the stored key are read through the verified
+    # helper: the whole path (a final symlink included) walked from /, the
+    # open handle checked; an unsafe source imports nothing
+    if not os.path.lexists(path):
+        sys.stderr.write("token app-key: {} does not exist\n".format(path))
         return EXIT_FAILED
+    try:
+        pem, st = open_secret_file(path, "the app's private key")
+    except SecretDirError as exc:
+        sys.stderr.write("token app-key: {}. Nothing was imported. Fix: move the key file "
+                         "into a private folder of your own (e.g. "
+                         "~/.config/activity-overview, mode 700) and import it from there "
+                         "(docs/SCHEDULING.md 7.1 step 2)\n".format(exc))
+        return EXIT_FAILED
+    if st.st_mode & 0o077:
+        sys.stderr.write("token app-key: warning: {} is mode {:o}, readable by others: "
+                         "`chmod 600` it, or delete it once the import is done\n".format(
+                             path, st.st_mode & 0o777))
     if b"PRIVATE KEY" not in pem:
         sys.stderr.write("token app-key: {} is not a PEM private key\n".format(path))
         return EXIT_FAILED

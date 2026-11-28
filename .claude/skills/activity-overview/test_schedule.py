@@ -2816,6 +2816,99 @@ class TestSecretChainOwnersBySeam(SecretFolderCase):
                       str(cm.exception))
 
 
+class TestSecretSourcesVerified(SecretFolderCase):
+    """Review (HIGH): every file that is or becomes a secret is read through
+    the verified helper. `token app-key --import` read its source with a
+    plain open, so a final symlink in a private folder could import a key
+    from under a world-writable folder."""
+
+    def import_key(self, source, security):
+        path = self.app_cfg(private_key_keychain_service="app-key")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = schedule.main(["token", "app-key", "--streams", path,
+                                  "--import", source], security=security)
+        return code, err.getvalue()
+
+    def write_key(self, folder, name="app.pem", mode=0o600):
+        p = os.path.join(folder, name)
+        with open(p, "wb") as fh:
+            fh.write(KEY_TEXT)
+        os.chmod(p, mode)
+        return p
+
+    def test_a_final_symlink_to_a_key_under_a_writable_folder_imports_nothing(self):
+        loose = self.folder("loose", 0o777)                  # not sticky
+        self.addCleanup(os.chmod, loose, 0o700)
+        planted = self.write_key(loose)
+        private = self.folder("private", 0o700)
+        link = os.path.join(private, "app.pem")
+        os.symlink(planted, link)
+        sec = FakeSecurity()
+        code, err = self.import_key(link, sec)
+        self.assertEqual(code, 1)
+        self.assertEqual(sec.items, {})                       # nothing written
+        self.assertFalse(any(a == ["security", "-i"] for a, _s in sec.calls))
+        self.assertIn("{} is writable by group or others (mode 777) without the sticky "
+                      "bit".format(loose), err)
+        self.assertIn("Nothing was imported", err)
+        self.assertIn("~/.config/activity-overview", err)
+        self.assertEqual(self.mode(loose), 0o777)             # never chmod-ed
+
+    def test_a_symlink_to_a_safe_key_imports_the_verified_bytes(self):
+        import base64
+        safe = self.folder("safe", 0o700)
+        key = self.write_key(safe)
+        links = self.folder("links", 0o700)
+        os.symlink(key, os.path.join(links, "k.pem"))
+        sec = FakeSecurity()
+        code, err = self.import_key(os.path.join(links, "k.pem"), sec)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(base64.b64decode(sec.items["app-key"]), KEY_TEXT)
+
+    def test_a_foreign_key_file_imports_nothing(self):
+        safe = self.folder("safe", 0o700)
+        key = self.write_key(safe)
+        sec = FakeSecurity()
+        with self.owned_as({key: FOREIGN_UID}):
+            code, err = self.import_key(key, sec)
+        self.assertEqual(code, 1)
+        self.assertEqual(sec.items, {})
+        self.assertIn("owned by uid {}, not you".format(FOREIGN_UID), err)
+
+    def test_a_readable_downloaded_key_imports_with_a_warning(self):
+        downloads = self.folder("Downloads", 0o700)
+        key = self.write_key(downloads, "x.private-key.pem", mode=0o644)
+        sec = FakeSecurity()
+        code, err = self.import_key(key, sec)
+        self.assertEqual(code, 0, err)
+        self.assertIn("is mode 644, readable by others: `chmod 600` it, or delete it", err)
+
+    def test_the_env_file_temp_is_never_reopened_by_path(self):
+        target = os.path.join(self.folder("cfg", 0o700), "token.env")
+        calls = []
+        real_chmod = os.chmod
+
+        def chmod(p, mode, *a, **kw):
+            calls.append(str(p))
+            return real_chmod(p, mode, *a, **kw)
+        with mock.patch.object(schedule.os, "chmod", chmod):
+            schedule.write_env_file(target, NEW_TOKEN)
+        self.assertFalse([c for c in calls if ".tmp-" in c], calls)
+        self.assertEqual(os.stat(target).st_mode & 0o777, 0o600)
+
+    def test_a_loose_env_file_is_refused_on_read(self):
+        target = os.path.join(self.folder("cfg", 0o700), "token.env")
+        schedule.write_env_file(target, NEW_TOKEN)
+        os.chmod(target, 0o644)
+        path = streams_file(self.tmp, token={"store": "env-file", "env_file": target})
+        code, out, _err = self.run_cli(["token", "status", "--streams", path],
+                                       http_get=FakeAPI())
+        self.assertEqual(code, 1)
+        self.assertIn("REFUSED", out)
+        self.assertIn("`chmod 600` it", out)
+
+
 class TestOwnersStreams(unittest.TestCase):
     """examples/streams.json is the owner's stream list; the group streams'
     manifests ship in examples/manifests/ and load as gather loads them."""

@@ -348,15 +348,19 @@ On macOS (reasoned from the standard layout, not run on a Mac):
 
 On top of the path, **the folder that directly holds the secret** has its own rule:
 
-- **Group- or other-writable folder: refused, on every path,** even with the sticky bit. That covers writing
-  (`token renew`, `token app-key`) and reading: the runner and `token status` /
-  `token app-check` through the key, and the wrappers through `token where --field env-file`.
-  The message names the folder, its mode and the fix (`chmod 700 <folder>`, or a private
-  folder such as `~/.config/activity-overview`). A planted token or key is worse than no
-  run.
+- **Group- or other-writable folder** (even with the sticky bit):
+  - **Refused on every read path.** That means the runner and `token status` /
+    `token app-check` through the key, and the wrappers through `token where --field
+    env-file`. The message names the folder, its mode and the fix (`chmod 700 <folder>`, or
+    a private folder such as `~/.config/activity-overview`). A planted token or key is worse
+    than no run.
+  - **On a write path** (`token renew`, `token app-key`): **tightened to 700** when the
+    folder is your own and not a shared location, and the output says
+    `tightened <folder> from mode 775 to 700`. Otherwise it is **refused**, before anything
+    is written.
 - **Group- or other-readable (not writable) folder:**
-  - On a write path, the folder is tightened to 700 when it is your own and not a shared
-    location, and the output says `tightened <folder> from mode 755 to 700`.
+  - On a write path, tightened to 700 the same way (your own, not shared), and the output
+    says so.
   - Otherwise, and on every read path, there is a warning only: the content stays private,
     and the folder exposes just the file's name.
 - **Never chmod-ed:** a folder you do not own, or a shared location (your home directory,
@@ -418,6 +422,23 @@ gather invocation, never one per run.
    This stores the key base64-encoded through `security -i` (standard input), then reads it
    back and compares. After that, remove `private_key_file` from the token block and
    delete the file.
+
+   What the import requires of the file it reads: the same path check as every secret
+   (§7, "The folder that holds a secret"):
+   - every folder from `/` down is yours or root's and writable by nobody else (sticky
+     folders excepted as described there);
+   - a symlink on the way, a final one included, is yours or root's and its target passes
+     the same check;
+   - the file is a regular file of your own, read once through the checked handle.
+
+   Its folder is made private like on any write path (tightened to 700 if it is yours and
+   not shared). An unsafe source imports **nothing**, and the message names the folder at
+   fault and the fix: move the key into a private folder such as
+   `~/.config/activity-overview` first. Importing straight from `~/Downloads` therefore
+   works only where that folder passes the check, and it would tighten `~/Downloads`
+   itself to 700. That is why the steps above move the key out of Downloads first. A key
+   file readable by others (a fresh download is often 644) is imported with a warning to
+   `chmod 600` it or delete it.
 3. Install it: on the app's page, **Install App** → your account → **Only select
    repositories** (any one of your repositories) or **All repositories**. Neither choice
    gives access to the Azure repositories; reading them as public repositories is what
